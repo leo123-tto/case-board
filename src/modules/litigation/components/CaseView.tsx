@@ -10,7 +10,11 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
-import { deleteDocument, globalExtractCase, reextractDocument } from "@/lib/api";
+import {
+  deleteDocument,
+  globalExtractCase,
+  reextractDocument,
+} from "@/lib/api";
 import { confirmDialog } from "@/lib/dialog";
 import { type Case, type Document } from "@/lib/types";
 import { formatRelativeTime, shortenPath } from "@/lib/format";

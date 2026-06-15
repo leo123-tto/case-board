@@ -1052,9 +1052,10 @@ fn build_initial_messages(req: &AgentLoopRequest) -> Vec<ApiMessage> {
     msgs
 }
 
-/// 把用户在 Settings 填的 cloud_llm_endpoint 自动补到 `/beta/chat/completions`(支持工具调用)。
-/// 已经以 `/beta/chat/completions` / `/v1/chat/completions` 结尾的不动 — 前者直接用,后者
-/// V0.2 chat 切到 beta(老 stream::run_chat 仍走 v1)。
+/// 把用户在 Settings 填的 cloud_llm_endpoint 归一成聊天 endpoint。
+///
+/// DeepSeek 的工具调用走专属 `/beta/chat/completions`;MiMo/GLM/Custom 这类 OpenAI-compatible
+/// 后端保留 `/v1/chat/completions`,不能强行改成 DeepSeek beta。
 fn beta_endpoint(current: &str) -> String {
     // 2026-06-15:MiniMax 自有协议路径(/v1/text/chatcompletion_v2)就是工具调用路径,
     // **绝不能**再加 /beta 后缀(会 404)。原样返回。
@@ -1066,7 +1067,17 @@ fn beta_endpoint(current: &str) -> String {
     }
     // 老的 /v1/chat/completions → 替换为 /beta/chat/completions
     if let Some(base) = current.strip_suffix("/v1/chat/completions") {
-        return format!("{}/beta/chat/completions", base);
+        if base.contains("api.deepseek.com") {
+            return format!("{}/beta/chat/completions", base);
+        }
+        return current.to_string();
+    }
+    if !current.contains("api.deepseek.com") {
+        let base = current.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            return format!("{}/chat/completions", base);
+        }
+        return format!("{}/v1/chat/completions", base);
     }
     if current.ends_with('/') {
         format!("{}beta/chat/completions", current)

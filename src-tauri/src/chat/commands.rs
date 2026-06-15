@@ -149,12 +149,22 @@ pub async fn case_chat_impl(
     if settings.effective_llm_provider() == "cloud" {
         let backend = settings.effective_cloud_llm_backend();
         let key_missing = if backend == "minimax" {
-            settings
-                .minimax_api_key
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .is_empty()
+            let provider_minimax = matches!(
+                settings.cloud_llm_provider.as_deref().map(str::trim),
+                Some("minimax")
+            );
+            let key = if provider_minimax {
+                settings
+                    .cloud_llm_api_key
+                    .as_deref()
+                    .or(settings.minimax_api_key.as_deref())
+            } else {
+                settings
+                    .minimax_api_key
+                    .as_deref()
+                    .or(settings.cloud_llm_api_key.as_deref())
+            };
+            key.map(str::trim).unwrap_or("").is_empty()
         } else {
             settings
                 .cloud_llm_api_key

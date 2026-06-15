@@ -370,9 +370,15 @@ export interface Settings {
   ocr_cloud_primary: string | null;
   ollama_endpoint: string | null;
   ollama_model: string | null;
+  /** 云端 LLM 提供商:"deepseek"/"mimo"/"glm"/"custom"，默认 deepseek */
+  cloud_llm_provider: string | null;
   cloud_llm_endpoint: string | null;
   cloud_llm_model: string | null;
   cloud_llm_api_key: string | null;
+  deepseek_api_key: string | null;
+  mimo_api_key: string | null;
+  glm_api_key: string | null;
+  custom_api_key: string | null;
   /** 2026-06-15:云端 LLM 后端 "deepseek"(默认/null)/ "minimax"。选 minimax 改读下面 minimax_* 字段。 */
   cloud_llm_backend: string | null;
   minimax_api_key: string | null;
@@ -397,6 +403,10 @@ export interface Settings {
   mineru_verified_at: string | null;
   /** DeepSeek key 验证通过时间。 */
   deepseek_verified_at: string | null;
+  /** MiMo / GLM / 自定义云端 LLM key 验证通过时间。 */
+  mimo_verified_at: string | null;
+  glm_verified_at: string | null;
+  custom_verified_at: string | null;
   /** 2026-05-25 V0.1.8:元典 key 验证通过时间。 */
   yuandian_verified_at: string | null;
 
@@ -431,6 +441,16 @@ export interface Settings {
   mcp_servers: McpServerConfig[];
   /** 团队版:本机团队身份;null/缺省 = 未加入团队。后端 team_* 命令直接写,设置表单不碰它。 */
   team?: TeamIdentity | null;
+
+  // ===== 法院一张网在线立案 =====
+  // ===== 飞书同步 =====
+  feishu_enabled?: boolean | null;
+  feishu_app_token?: string | null;
+  feishu_cases_table_id?: string | null;
+  feishu_calendar_table_id?: string | null;
+  feishu_notify_enabled?: boolean | null;
+  feishu_notify_user_id?: string | null;
+  feishu_notify_days_before?: number | null;
 }
 
 /** 外部 MCP server 配置项(对应 Rust chat::mcp_bridge::McpServerConfig)。
@@ -768,3 +788,81 @@ export type DocOcrStatusEvent = Extract<
   ProgressEvent,
   { stage: "doc_ocr_status" }
 >;
+
+// ===== 法院一张网在线立案 =====
+
+
+
+
+export interface LawyerProfile {
+  id: string;
+  name: string;
+  bar_number: string | null;
+  law_firm: string | null;
+  id_number: string | null;
+  phone: string | null;
+  address: string | null;
+  is_default: number;
+  created_at: string;
+  updated_at: string;
+}
+
+// ===== 云端 LLM 提供商 =====
+
+export const CLOUD_PROVIDERS = {
+  deepseek: {
+    label: "DeepSeek",
+    keyUrl: "https://platform.deepseek.com/api_keys",
+    flash: "deepseek-v4-flash",
+    pro: "deepseek-v4-pro",
+    thinking: "deepseek-v4-pro-thinking",
+    hasBalance: true,
+  },
+  mimo: {
+    label: "小米 MiMo",
+    keyUrl: "https://token-plan-cn.xiaomimimo.com",
+    flash: "mimo-v2.5",
+    pro: "mimo-v2.5-pro",
+    thinking: null,
+    hasBalance: false,
+  },
+  minimax: {
+    label: "MiniMax",
+    keyUrl: "https://platform.minimaxi.com/user-center/payment/token-plan",
+    flash: "MiniMax-M2",
+    pro: "MiniMax-M2",
+    thinking: null,
+    hasBalance: false,
+  },
+  glm: {
+    label: "智谱 GLM",
+    keyUrl: "https://open.bigmodel.cn/usercenter/apikeys",
+    flash: "glm-4.7",
+    pro: "glm-5.2",
+    thinking: "glm-5-turbo",
+    hasBalance: false,
+  },
+  custom: {
+    label: "自定义",
+    keyUrl: "",
+    flash: "",
+    pro: "",
+    thinking: null,
+    hasBalance: false,
+  },
+} as const;
+
+export type CloudProviderId = keyof typeof CLOUD_PROVIDERS;
+
+// ===== 飞书日历事件 =====
+
+export interface FeishuCalendarEvent {
+  event_id: string;
+  summary: string;
+  start_date: string;
+  end_date?: string | null;
+  is_all_day: boolean;
+  description?: string;
+  location?: string;
+  app_link?: string;
+}

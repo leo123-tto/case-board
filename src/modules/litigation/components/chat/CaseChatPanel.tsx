@@ -631,7 +631,7 @@ export function CaseChatPanel({
         />
         <QuickChip
           label="🔍 类案检索"
-          hint="检索相似判例(本地/江苏优先),判断对我方诉求是支持还是不利 + 风险点,案例原文存进本地知识库(检索辅助,非法律意见)"
+          hint="检索相似判例(本地/浙江优先),判断对我方诉求是支持还是不利 + 风险点,案例原文存进本地知识库(检索辅助,非法律意见)"
           onClick={() => send("", "find_similar_cases")}
           disabled={disabled}
           className="border-sky-500/40 bg-sky-500/5 hover:bg-sky-500/15"

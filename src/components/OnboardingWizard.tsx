@@ -270,6 +270,7 @@ export function OnboardingWizard({ open, onComplete }: OnboardingWizardProps) {
         cloud_enabled: true,
         mineru_api_key: minerKey.trim() || null,
         cloud_llm_api_key: dsKey.trim() || null,
+        deepseek_api_key: dsKey.trim() || null,
         cloud_llm_endpoint: dsEndpoint.trim() || null,
         yuandian_api_key: yuandianKey.trim() || null,
         mineru_verified_at:

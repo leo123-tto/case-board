@@ -42,9 +42,12 @@ import {
   openInDefaultApp,
   refreshCaseFiles,
   revealInFinder,
+  findFeishuCasePath,
 } from "@/lib/api";
 import {
+  CLOUD_PROVIDERS,
   type Case,
+  type CloudProviderId,
   type DocOcrStatusEvent,
   type Document,
   type ImportPlan,
@@ -354,13 +357,42 @@ function App() {
         issues.push({ label: "MinerU API Token(云端 OCR)", reason: "unverified" });
       }
     }
-    {
-      const filled = !!s.cloud_llm_api_key?.trim();
-      const verified = !!s.deepseek_verified_at;
+    const providerId = (s.cloud_llm_provider ?? "deepseek") as CloudProviderId;
+    const legacyMinimax =
+      (s.cloud_llm_backend ?? "").trim() === "minimax" && providerId !== "minimax";
+    if (legacyMinimax) {
+      const filled = !!(s.minimax_api_key?.trim() || s.cloud_llm_api_key?.trim());
+      const verified = !!(s.minimax_verified_at || s.deepseek_verified_at);
       if (!filled) {
-        issues.push({ label: "DeepSeek API Key(云端 LLM)", reason: "missing" });
+        issues.push({ label: "MiniMax API Key(云端 LLM)", reason: "missing" });
       } else if (!verified) {
-        issues.push({ label: "DeepSeek API Key(云端 LLM)", reason: "unverified" });
+        issues.push({ label: "MiniMax API Key(云端 LLM)", reason: "unverified" });
+      }
+    } else {
+      const provider = CLOUD_PROVIDERS[providerId] ?? CLOUD_PROVIDERS.deepseek;
+      const providerKey =
+        providerId === "mimo"
+          ? s.mimo_api_key || s.cloud_llm_api_key
+          : providerId === "glm"
+          ? s.glm_api_key || s.cloud_llm_api_key
+          : providerId === "custom"
+          ? s.custom_api_key || s.cloud_llm_api_key
+          : s.deepseek_api_key || s.cloud_llm_api_key;
+      const providerVerifiedAt =
+        providerId === "mimo"
+          ? s.mimo_verified_at || s.deepseek_verified_at
+          : providerId === "glm"
+          ? s.glm_verified_at || s.deepseek_verified_at
+          : providerId === "custom"
+          ? s.custom_verified_at || s.deepseek_verified_at
+          : s.deepseek_verified_at;
+      const filled = !!providerKey?.trim();
+      const verified = !!providerVerifiedAt;
+      const label = `${provider.label} API Key(云端 LLM)`;
+      if (!filled) {
+        issues.push({ label, reason: "missing" });
+      } else if (!verified) {
+        issues.push({ label, reason: "unverified" });
       }
     }
 
@@ -479,6 +511,35 @@ function App() {
     async (path: string) => {
       if (!(await validateImportKeys())) return;
       await doImport(path);
+    },
+    [validateImportKeys, doImport],
+  );
+
+  // 点击飞书日历事件后导入对应文件夹
+  const handleCalendarImport = useCallback(
+    async (eventTitle: string) => {
+      if (!(await validateImportKeys())) return;
+
+      // 先尝试从飞书案件池自动匹配本地路径
+      try {
+        const localPath = await findFeishuCasePath(eventTitle);
+        if (localPath) {
+          await doImport(localPath);
+          return;
+        }
+      } catch (e) {
+        console.warn("findFeishuCasePath failed:", e);
+      }
+
+      // 没有匹配到路径，弹出文件夹选择器
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: `选择「${eventTitle}」的案件文件夹`,
+      });
+      if (typeof selected === "string") {
+        await doImport(selected);
+      }
     },
     [validateImportKeys, doImport],
   );
@@ -748,6 +809,7 @@ function App() {
           userDisplayName={userDisplayName}
           onPickCase={pickCase}
           onImport={handleImport}
+          onImportFolder={handleCalendarImport}
         />
       </HomeDropZone>
     ) : (

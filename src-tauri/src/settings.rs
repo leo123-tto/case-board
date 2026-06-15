@@ -81,7 +81,11 @@ pub struct Settings {
     /// 本机 LLM 模型名(默认 MiniCPM-V-4_6-Q8_0.gguf)
     pub ollama_model: Option<String>,
 
-    /// 云端 LLM endpoint(默认推荐 DeepSeek `https://api.deepseek.com`)
+    /// 云端 LLM 提供商:`"deepseek"` / `"mimo"` / `"glm"` / `"custom"`。
+    /// 默认 None → serde(default) 落空 → preset_for 回退 deepseek(老用户向后兼容)。
+    pub cloud_llm_provider: Option<String>,
+
+    /// 云端 LLM endpoint(按提供商自动填默认值)
     pub cloud_llm_endpoint: Option<String>,
     /// 云端 LLM 模型档位(V0.3 统一为唯一的模型选择,被 `model_router::route_model` 读取):
     ///   - `'deepseek-v4-flash'`(默认)= 全局 Flash(便宜,约 pro 的 1/3 价)
@@ -90,8 +94,13 @@ pub struct Settings {
     ///
     /// 默认 flash;不再有"工具型任务偷偷强制 pro"的隐藏逻辑。
     pub cloud_llm_model: Option<String>,
-    /// 云端 LLM API key
+    /// 云端 LLM API key（历史字段）：保留作当前提供商的兼容槽位。
     pub cloud_llm_api_key: Option<String>,
+    /// 各云端 LLM 提供商独立 API key。避免切换/重装后互相覆盖。
+    pub deepseek_api_key: Option<String>,
+    pub mimo_api_key: Option<String>,
+    pub glm_api_key: Option<String>,
+    pub custom_api_key: Option<String>,
 
     /// 2026-06-15:云端 LLM 后端选择 —— `"deepseek"`(默认/缺省)/ `"minimax"`。
     /// **纯增量**:老用户(全是 DeepSeek)缺此字段 → 走 deepseek 分支,配置零改动、零重解释。
@@ -119,6 +128,22 @@ pub struct Settings {
     pub kuaidi100_customer: Option<String>,
     pub kuaidi100_key: Option<String>,
 
+    /// 飞书案件池同步。默认关闭；启用后复用本机 lark-cli 的登录态，不在 CaseBoard 保存飞书 token。
+    pub feishu_enabled: Option<bool>,
+    /// 飞书多维表格 app token。
+    pub feishu_app_token: Option<String>,
+    /// 案件池 table id。状态变更会匹配/写入该表。
+    pub feishu_cases_table_id: Option<String>,
+    /// 飞书日历表 table id。首页日历事件同步到该表。
+    pub feishu_calendar_table_id: Option<String>,
+
+    /// 飞书到期推送总开关。启用后定期检查即将到期事件并通过飞书 IM 推送提醒。
+    pub feishu_notify_enabled: Option<bool>,
+    /// 飞书接收消息的 user open_id（ou_xxx）。
+    pub feishu_notify_user_id: Option<String>,
+    /// 提前提醒天数（默认 7）。事件距今 ≤ N 天时推送。
+    pub feishu_notify_days_before: Option<u32>,
+
     /// 2026-06-01 V0.3.3:Embedding 云端模型(案件文档语义检索)。OpenAI 兼容 /embeddings。
     /// 默认硅基流动 BAAI/bge-m3(免费);填了 api_key 才启用语义检索,否则回退关键词选材料。
     /// 申请:https://cloud.siliconflow.cn/me/account/ak
@@ -143,6 +168,10 @@ pub struct Settings {
     pub mineru_verified_at: Option<String>,
     /// DeepSeek key 通过验证的时间(同上)。
     pub deepseek_verified_at: Option<String>,
+    /// MiMo / GLM / 自定义云端 LLM key 通过验证的时间。
+    pub mimo_verified_at: Option<String>,
+    pub glm_verified_at: Option<String>,
+    pub custom_verified_at: Option<String>,
     /// 2026-05-25 V0.1.8:元典 key 通过验证的时间(同上)。
     pub yuandian_verified_at: Option<String>,
 
@@ -209,8 +238,22 @@ impl Settings {
     /// 云端 LLM 后端(2026-06-15)。缺省 / 空 / 非法值一律回落 `"deepseek"`(老用户零感知)。
     pub fn effective_cloud_llm_backend(&self) -> &str {
         match self.cloud_llm_backend.as_deref().map(str::trim) {
-            Some("minimax") => "minimax",
-            _ => "deepseek",
+        if matches!(
+            self.cloud_llm_provider.as_deref().map(str::trim),
+            Some("minimax")
+        ) {
+            return "minimax";
+        }
+    }
+
+    pub fn cloud_llm_api_key_for(&self, provider_id: &str) -> Option<String> {
+        match provider_id {
+            "deepseek" => self.deepseek_api_key.clone().or_else(|| self.cloud_llm_api_key.clone()),
+            "mimo" => self.mimo_api_key.clone().or_else(|| self.cloud_llm_api_key.clone()),
+            "glm" => self.glm_api_key.clone().or_else(|| self.cloud_llm_api_key.clone()),
+            "custom" => self.custom_api_key.clone().or_else(|| self.cloud_llm_api_key.clone()),
+            "minimax" => self.minimax_api_key.clone().or_else(|| self.cloud_llm_api_key.clone()),
+            _ => self.cloud_llm_api_key.clone(),
         }
     }
 
@@ -244,9 +287,7 @@ impl Settings {
     /// 给前端返回时,用 sensible 默认值补全空字段(便于直接渲染表单)。
     /// 注意:**这里不返回任何 token 默认值**——key 一律保持用户输入。
     pub fn with_defaults_for_display(self) -> Self {
-        // 只对「有内置默认值」的字段填默认,其余字段一律 `..self` 原样透传。
-        // 用 `..self` 而非逐字段手列:以后给 Settings 加字段会自动继承原值,
-        // 不会因为这里漏写一行而被静默丢成默认(B14 防漏映射)。
+        let preset = crate::llm::providers::preset_for(&self);
         Self {
             local_server_auto_start: self.local_server_auto_start.or(Some(true)),
             mineru_endpoint: self
@@ -260,12 +301,20 @@ impl Settings {
                 .or_else(|| Some("MiniCPM-V-4_6-Q8_0.gguf".to_string())),
             cloud_llm_endpoint: self
                 .cloud_llm_endpoint
-                .or_else(|| Some("https://api.deepseek.com".to_string())),
-            cloud_llm_model: self
-                .cloud_llm_model
-                .or_else(|| Some("deepseek-v4-flash".to_string())),
-            embedding_endpoint: self
-                .embedding_endpoint
+            cloud_llm_endpoint: self.cloud_llm_endpoint.or_else(|| {
+                if preset.default_endpoint.is_empty() {
+                    None
+                } else {
+                    Some(preset.default_endpoint.to_string())
+                }
+            }),
+            cloud_llm_model: self.cloud_llm_model.or_else(|| {
+                if preset.flash_model.is_empty() {
+                    None
+                } else {
+                    Some(preset.flash_model.to_string())
+                }
+            }),
                 .or_else(|| Some(crate::embedding::DEFAULT_ENDPOINT.to_string())),
             embedding_model: self
                 .embedding_model

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   AlertTriangle,
   ArrowUpDown,
@@ -60,12 +60,15 @@ import {
   type StatusDef,
   type StatusId,
 } from "@/modules/litigation/lib/inferStatus";
+import { CalendarBoard } from "./CalendarBoard";
 
 export interface HomeViewProps {
   cases: Case[];
   userDisplayName: string | null;
   onPickCase: (caseId: string) => void;
   onImport: () => void;
+  /** 点击飞书日历事件后导入对应文件夹 */
+  onImportFolder?: (eventTitle: string) => void;
 }
 
 type ViewMode = "grid" | "list";
@@ -74,6 +77,8 @@ type SortDir = "asc" | "desc";
 type EventKind = "hearing" | "deadline" | "todo" | "manual";
 
 interface CaseDisplayFields {
+  title: string;
+  subtitle: string | null;
   caseNo: string | null;
   court: string | null;
   cause: string | null;
@@ -92,7 +97,7 @@ interface CaseRow {
   nearestHearing: string | null;
 }
 
-interface UpcomingEvent {
+export interface UpcomingEvent {
   kind: EventKind;
   date: string;
   daysFromNow: number;
@@ -107,7 +112,7 @@ interface UpcomingEvent {
 
 const PRESERVATION_RE = /保全|续封|查封|冻结/;
 
-export function HomeView({ cases, userDisplayName, onPickCase, onImport }: HomeViewProps) {
+export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImportFolder }: HomeViewProps) {
   const greeting = getGreeting(userDisplayName);
   const monthLabel = new Date()
     .toLocaleString("en-US", { month: "short", year: "numeric" })
@@ -127,6 +132,8 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport }: HomeV
   const [manualEvents, setManualEvents] = useState<CalendarEvent[]>([]);
   // 日程日历功能开关(默认关闭,设置里手动开)
   const [calendarEnabled, setCalendarEnabled] = useState(false);
+  const topLeftRef = useRef<HTMLDivElement | null>(null);
+  const [topLeftHeight, setTopLeftHeight] = useState<number | null>(null);
 
   const reloadManualEvents = () => {
     listCalendarEvents()
@@ -199,6 +206,20 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport }: HomeV
       .catch(() => undefined);
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const el = topLeftRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const update = () => setTopLeftHeight(Math.ceil(el.getBoundingClientRect().height));
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    window.addEventListener("resize", update);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", update);
     };
   }, []);
 
@@ -341,28 +362,48 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport }: HomeV
 
       <div className="flex-1 overflow-auto">
         <div className="mx-auto max-w-6xl px-8 py-8">
-          <div className="mb-10 grid grid-cols-1 gap-6 md:grid-cols-2">
-            <div>
-              <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-                OVERVIEW · {monthLabel}
-              </p>
-              <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
-                {greeting}
-              </h1>
-              <p className="mt-2 text-sm text-muted-foreground">
-                你正在办 {cases.length} 个案件,扫一眼今天的进度。
-              </p>
-              <div className="mt-5 flex gap-2">
-                <Button
-                  onClick={onImport}
-                  className="bg-foreground text-background hover:bg-foreground/90"
-                >
-                  <FolderOpen className="size-3.5" />
-                  导入案件文件夹
-                </Button>
+          {/* 左边(2/3): 问候语 + 飞书日历; 右边(1/3): 重要日期 */}
+          <div className="mb-10 grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,1.85fr)_minmax(20rem,1fr)]">
+            <div ref={topLeftRef} className="min-w-0 space-y-6">
+              {/* 问候语 */}
+              <div>
+                <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+                  OVERVIEW · {monthLabel}
+                </p>
+                <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
+                  {greeting}
+                </h1>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  你正在办 {cases.length} 个案件,扫一眼今天的进度。
+                </p>
+                <div className="mt-5 flex gap-2">
+                  <Button
+                    onClick={onImport}
+                    className="bg-foreground text-background hover:bg-foreground/90"
+                  >
+                    <FolderOpen className="size-3.5" />
+                    导入案件文件夹
+                  </Button>
+                </div>
               </div>
+              {/* 飞书日历 */}
+              <CalendarBoard
+                localEvents={upcomingEvents}
+                onPickCase={onPickCase}
+                onImportFolder={onImportFolder}
+              />
             </div>
-            <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
+            {/* 右边: 重要日期 */}
+            <div
+              className="flex min-h-0 min-w-0 overflow-hidden lg:h-[var(--top-left-height)]"
+              style={
+                topLeftHeight
+                  ? ({ "--top-left-height": `${topLeftHeight}px` } as CSSProperties)
+                  : undefined
+              }
+            >
+              <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
+            </div>
           </div>
 
           {cases.length > 0 && calendarEnabled && (
@@ -603,7 +644,7 @@ function CaseCard({
       }}
       role="button"
       tabIndex={0}
-      aria-label={`打开案件 ${display.cause || caseData.name}`}
+      aria-label={`打开案件 ${display.title}`}
     >
       {dragHandleProps && (
         <button
@@ -633,9 +674,11 @@ function CaseCard({
             示例
           </span>
         )}
-        {display.cause || caseData.name}
+        {display.title}
       </h3>
-      <p className="mt-1 text-sm text-muted-foreground">{display.partySummary}</p>
+      <p className="mt-1 truncate text-sm text-muted-foreground">
+        {display.subtitle || display.cause || caseData.name}
+      </p>
       <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
         <Item label="案号" value={display.caseNo} mono />
         <Item
@@ -683,13 +726,15 @@ function CaseListRow({
       }}
       role="button"
       tabIndex={0}
-      aria-label={`打开案件 ${display.cause || caseData.name}`}
+      aria-label={`打开案件 ${display.title}`}
     >
       <div className="min-w-0">
         <div className="truncate text-sm font-semibold text-foreground">
-          {display.cause || caseData.name}
+          {display.title}
         </div>
-        <div className="truncate text-xs text-muted-foreground">{display.partySummary}</div>
+        <div className="truncate text-xs text-muted-foreground">
+          {display.subtitle || display.cause || caseData.name}
+        </div>
       </div>
       <div className="min-w-0 text-xs">
         <div className="truncate font-mono text-foreground">{display.caseNo || "-"}</div>
@@ -831,7 +876,7 @@ function ImportantDates({
   const prominent = events.filter((e) => eventUrgency(e) !== "normal");
   const later = events.filter((e) => eventUrgency(e) === "normal");
   return (
-    <div className="rounded-xl border border-border bg-card p-5">
+    <div className="flex h-full min-h-0 w-full flex-col overflow-hidden rounded-xl border border-border bg-card p-5">
       <div className="mb-3 flex items-baseline justify-between">
         <h2 className="text-sm font-semibold tracking-tight">重要日期</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
@@ -839,7 +884,7 @@ function ImportantDates({
         </span>
       </div>
       {events.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-8 text-center">
+        <div className="flex flex-1 flex-col items-center justify-center py-8 text-center">
           <CalendarClock className="size-6 text-muted-foreground/40" />
           <p className="mt-2 text-xs text-muted-foreground">暂无近期事件</p>
           <p className="mt-1 text-caption text-muted-foreground/70">
@@ -847,7 +892,7 @@ function ImportantDates({
           </p>
         </div>
       ) : (
-        <div className="space-y-3">
+        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
           {prominent.length > 0 && (
             <ul className="space-y-2">
               {prominent.map((e, i) => (
@@ -1436,15 +1481,20 @@ function buildCaseDisplay(caseData: Case): CaseDisplayFields {
   const right = defendants[0] || "-";
   const leftMore = plaintiffs.length > 1 ? `等${plaintiffs.length}人` : "";
   const rightMore = defendants.length > 1 ? `等${defendants.length}人` : "";
+  const partySummary = `${left}${leftMore} vs ${right}${rightMore}`;
+  const hasParties = left !== "-" || right !== "-";
+  const cause = ovStr("agg_cause", caseData.agg_cause);
   return {
+    title: hasParties ? partySummary : caseData.name,
+    subtitle: cause && cause !== caseData.name ? cause : null,
     caseNo: ovStr("agg_case_no", caseData.agg_case_no),
     court: ovStr("agg_court", caseData.agg_court),
-    cause: ovStr("agg_cause", caseData.agg_cause),
+    cause,
     claimAmount,
     plaintiffs,
     defendants,
     judges,
-    partySummary: `${left}${leftMore} vs ${right}${rightMore}`,
+    partySummary,
     amountText: claimAmount ? formatYuan(claimAmount) : null,
   };
 }
@@ -1495,7 +1545,7 @@ function buildUpcomingEvents(cases: Case[]): UpcomingEvent[] {
   const events: UpcomingEvent[] = [];
   const now = todayDate();
   for (const c of cases) {
-    const caseName = c.agg_cause || c.name;
+    const caseName = buildCaseDisplay(c).title;
     let nearestHearing: UpcomingEvent | null = null;
     for (const kd of readKeyDates(c)) {
       if (kd.event?.includes("开庭") && kd.date) {
@@ -1558,7 +1608,7 @@ function buildAllCalendarEvents(cases: Case[]): UpcomingEvent[] {
   const events: UpcomingEvent[] = [];
   const now = todayDate();
   for (const c of cases) {
-    const caseName = c.agg_cause || c.name;
+    const caseName = buildCaseDisplay(c).title;
     for (const kd of readKeyDates(c)) {
       if (kd.event?.includes("开庭") && kd.date) {
         const d = parseDate(kd.date);

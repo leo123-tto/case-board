@@ -8,6 +8,7 @@ pub mod embedding;
 pub mod export;
 pub mod express;
 pub mod feedback;
+pub mod feishu;
 pub mod ingest;
 pub mod lifecycle;
 pub mod llm;

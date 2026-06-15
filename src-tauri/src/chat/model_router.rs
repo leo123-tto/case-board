@@ -91,11 +91,17 @@ impl ModelChoice {
 pub fn route_model(task: TaskType, user_message: &str, settings: &Settings) -> ModelChoice {
     // 2026-06-15:MiniMax 后端不套用 DeepSeek 的 flash/pro/auto 档位 —— 用户直接填模型名。
     if settings.effective_cloud_llm_backend() == "minimax" {
+        let provider_minimax = matches!(
+            settings.cloud_llm_provider.as_deref().map(str::trim),
+            Some("minimax")
+        );
         let model = settings
-            .minimax_model
+            .cloud_llm_model
             .as_deref()
+            .filter(|_| provider_minimax)
+            .or(settings.minimax_model.as_deref())
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && *s != "auto")
             .unwrap_or("MiniMax-M2");
         return ModelChoice::from_minimax(model);
     }

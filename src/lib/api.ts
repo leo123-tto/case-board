@@ -10,6 +10,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  FeishuCalendarEvent,
+  LawyerProfile,
   Case,
   CaseInstance,
   CaseWithDocs,
@@ -1352,4 +1354,56 @@ export function verifyEmbeddingKey(
   apiKey: string,
 ): Promise<number> {
   return invoke<number>("verify_embedding_key", { endpoint, model, apiKey });
+}
+
+export function listLawyerProfiles(): Promise<LawyerProfile[]> {
+  return invoke<LawyerProfile[]>("list_lawyer_profiles");
+}
+
+export function saveLawyerProfile(p: Omit<LawyerProfile, "id" | "created_at" | "updated_at">): Promise<LawyerProfile> {
+  return invoke<LawyerProfile>("save_lawyer_profile", { profile: p });
+}
+
+export function updateLawyerProfile(
+  id: string, p: Omit<LawyerProfile, "id" | "created_at" | "updated_at">,
+): Promise<LawyerProfile> {
+  return invoke<LawyerProfile>("update_lawyer_profile", { id, profile: p });
+}
+
+export function deleteLawyerProfile(id: string): Promise<void> {
+  return invoke<void>("delete_lawyer_profile", { id });
+}
+
+export function setDefaultLawyer(id: string): Promise<void> {
+  return invoke<void>("set_default_lawyer", { id });
+}
+
+// ===== 飞书通知测试 =====
+
+export function testFeishuNotify(): Promise<number> {
+  return invoke<number>("test_feishu_notify");
+}
+
+// ===== 云端 LLM Key 验证 =====
+
+export function verifyCloudLlmKey(
+  provider: string,
+  apiKey: string,
+  endpoint?: string,
+): Promise<VerifyResult> {
+  return invoke<VerifyResult>("verify_cloud_llm_key", {
+    provider,
+    apiKey,
+    endpoint: endpoint || null,
+  });
+}
+
+// ===== 飞书日历 =====
+
+export function fetchFeishuCalendar(start: string, end: string): Promise<FeishuCalendarEvent[]> {
+  return invoke<FeishuCalendarEvent[]>("fetch_feishu_calendar", { start, end });
+}
+
+export function findFeishuCasePath(eventSummary: string): Promise<string | null> {
+  return invoke<string | null>("find_feishu_case_path", { eventSummary });
 }

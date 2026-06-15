@@ -411,6 +411,7 @@ export function CaseView({
                     onReanalyze={handleReanalyze}
                     reanalyzing={reanalyzing}
                   />
+
                 </div>
               )}
             </div>

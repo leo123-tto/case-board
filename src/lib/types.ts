@@ -431,6 +431,13 @@ export interface Settings {
   mcp_servers: McpServerConfig[];
   /** 团队版:本机团队身份;null/缺省 = 未加入团队。后端 team_* 命令直接写,设置表单不碰它。 */
   team?: TeamIdentity | null;
+
+  // ===== 法院一张网在线立案 =====
+  court_filing_cli_path?: string | null;
+  court_filing_python?: string | null;
+  court_filing_account?: string | null;
+  court_filing_password?: string | null;
+  court_filing_cookie_dir?: string | null;
 }
 
 /** 外部 MCP server 配置项(对应 Rust chat::mcp_bridge::McpServerConfig)。
@@ -768,3 +775,58 @@ export type DocOcrStatusEvent = Extract<
   ProgressEvent,
   { stage: "doc_ocr_status" }
 >;
+
+// ===== 法院一张网在线立案 =====
+
+export interface CourtFilingJob {
+  id: string;
+  case_id: string;
+  filing_type: "civil" | "execution";
+  court_name: string;
+  cookie_account: string | null;
+  status: "pending" | "running" | "waiting_captcha" | "completed" | "failed" | "cancelled";
+  output_dir: string | null;
+  preview_url: string | null;
+  progress_json: string | null;
+  captcha_active: number;
+  error: string | null;
+  timing_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CourtFilingProgress {
+  job_id: string;
+  case_id: string;
+  phase: "system" | "login" | "http" | "playwright" | "captcha";
+  stage: string;
+  level: "info" | "warning" | "error";
+  message: string;
+  detail?: string;
+  round?: number;
+  task_id?: string;
+  image_base64?: string;
+  timing?: Record<string, number>;
+}
+
+export interface CourtFilingCaptcha {
+  job_id: string;
+  case_id: string;
+  task_id: string;
+  round: number;
+  image_base64: string;
+  timeout_sec: number;
+}
+
+export interface LawyerProfile {
+  id: string;
+  name: string;
+  bar_number: string | null;
+  law_firm: string | null;
+  id_number: string | null;
+  phone: string | null;
+  address: string | null;
+  is_default: number;
+  created_at: string;
+  updated_at: string;
+}

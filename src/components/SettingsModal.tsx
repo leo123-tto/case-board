@@ -25,6 +25,7 @@ import { Button } from "@/components/ui/button";
 import { HoverHint } from "@/components/HoverHint";
 import { GroupQrCode } from "@/components/GroupQrCode";
 import { KbSemanticIndexCard } from "@/components/KbSemanticIndexCard";
+import { LawyerProfilesCard } from "@/components/LawyerProfilesCard";
 import {
   createLocalKb,
   detectKbStatus,
@@ -1048,6 +1049,55 @@ export function SettingsModal({
                 onChange={(next) => updateField("mcp_servers", next)}
               />
 
+              {/* 法院一张网在线立案 */}
+              <Section
+                title="法院一张网在线立案"
+                desc="自动化到预览页停止，不自动提交；留空 CLI 路径时使用应用内置脚本"
+              >
+                <Field label="CLI 路径" hint="留空使用应用内置 court_filing_cli；只有调试外部版本时才填写">
+                  <input
+                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm font-mono"
+                    placeholder="留空使用内置 CLI"
+                    value={settings.court_filing_cli_path ?? ""}
+                    onChange={(e) => updateField("court_filing_cli_path", e.target.value || null)}
+                  />
+                </Field>
+                <Field label="Python 解释器" hint="可填 venv 内 python3 路径；留空使用系统 python3">
+                  <input
+                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm font-mono"
+                    placeholder="python3"
+                    value={settings.court_filing_python ?? ""}
+                    onChange={(e) => updateField("court_filing_python", e.target.value || null)}
+                  />
+                </Field>
+                <Field label="一张网账号">
+                  <input
+                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm"
+                    placeholder="律师登录手机号"
+                    value={settings.court_filing_account ?? ""}
+                    onChange={(e) => updateField("court_filing_account", e.target.value || null)}
+                  />
+                </Field>
+                <Field label="一张网密码">
+                  <input
+                    type="password"
+                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm"
+                    placeholder="登录密码"
+                    value={settings.court_filing_password ?? ""}
+                    onChange={(e) => updateField("court_filing_password", e.target.value || null)}
+                  />
+                </Field>
+                <Field label="Cookie 目录" hint="可选。留空时使用应用数据目录">
+                  <input
+                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm font-mono"
+                    placeholder="留空自动管理"
+                    value={settings.court_filing_cookie_dir ?? ""}
+                    onChange={(e) => updateField("court_filing_cookie_dir", e.target.value || null)}
+                  />
+                </Field>
+              </Section>
+
+              <LawyerProfilesCard />
 
               {/* 错误展示 */}
               {error && (

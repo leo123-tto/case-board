@@ -25,7 +25,7 @@ use std::path::Path;
 
 use serde::Serialize;
 use sqlx::SqlitePool;
-use tauri::{Emitter, Manager};
+use tauri::{path::BaseDirectory, Emitter, Manager};
 
 use crate::db::cases::{self as cases_db, Case};
 use crate::db::documents::{self as documents_db, Document};
@@ -1697,6 +1697,2115 @@ async fn clear_chat_history(
 
 /// 智能粘贴:把平台「接入指南」复制来的配置文本解析成 MCP server 列表。
 /// 纯本地确定性解析(JSON / claude mcp add 命令行),不联网、不调 LLM。
+// ============================================================================
+// 法院一张网在线立案 — 2026-06-15
+// ============================================================================
+
+/// 立案任务事件（emit 到前端）。
+#[derive(Clone, serde::Serialize)]
+struct CourtFilingProgress {
+    job_id: String,
+    case_id: String,
+    phase: String,
+    stage: String,
+    level: String,
+    message: String,
+    detail: Option<String>,
+    round: Option<i64>,
+    task_id: Option<String>,
+    image_base64: Option<String>,
+    timing: Option<serde_json::Value>,
+}
+
+/// 验证码请求事件（弹窗用）。
+#[derive(Clone, serde::Serialize)]
+struct CourtFilingCaptcha {
+    job_id: String,
+    case_id: String,
+    task_id: String,
+    round: i64,
+    image_base64: String,
+    timeout_sec: i64,
+}
+
+/// 法院立案 CLI 的内置资源路径。
+const COURT_FILING_CLI_RESOURCE: &str = "standalone/court_filing_cli";
+
+fn bundled_court_filing_cli_path(app: &tauri::AppHandle) -> Option<String> {
+    if let Ok(path) = app
+        .path()
+        .resolve(COURT_FILING_CLI_RESOURCE, BaseDirectory::Resource)
+    {
+        if path.join("__main__.py").exists() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+
+    let dev_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+        .join(COURT_FILING_CLI_RESOURCE);
+    if dev_path.join("__main__.py").exists() {
+        return Some(dev_path.to_string_lossy().to_string());
+    }
+
+    None
+}
+
+fn resolve_court_filing_cli_path(app: &tauri::AppHandle, configured: Option<String>) -> String {
+    let configured = configured
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(path) = configured {
+        return path;
+    }
+
+    bundled_court_filing_cli_path(app).unwrap_or_else(|| COURT_FILING_CLI_RESOURCE.to_string())
+}
+
+#[derive(Clone, serde::Serialize)]
+struct CourtFilingMaterialCandidate {
+    doc_id: String,
+    source_path: String,
+    filename: String,
+    category: Option<String>,
+    stage: Option<String>,
+    size_bytes: i64,
+    slot: i32,
+    slot_label: String,
+    confidence: i32,
+    included: bool,
+    reasons: Vec<String>,
+    warnings: Vec<String>,
+}
+
+struct CourtFilingSourceDoc {
+    id: String,
+    source_path: String,
+    filename: String,
+    category: Option<String>,
+    stage: Option<String>,
+    mime_type: Option<String>,
+    size_bytes: i64,
+    missing: bool,
+}
+
+/// 通用材料包匹配：只处理用户本次选择的材料文件夹。
+///
+/// 立案材料必须由用户先放进一个独立文件夹。后端只上传能明确识别到槽位的 PDF，
+/// 识别不出来的文件保留在预检报告里，避免把法院通知书、传票等旧材料误传。
+fn build_court_filing_materials(
+    docs: &[CourtFilingSourceDoc],
+    material_folder: &str,
+    filing_type: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    use serde_json::{Map, Value};
+
+    let slot_keywords: Vec<(i32, &str, Vec<&str>)> = if filing_type == "execution" {
+        vec![
+            (
+                0,
+                "执行申请书",
+                vec!["执行申请书", "申请执行", "强制执行申请"],
+            ),
+            (
+                1,
+                "执行依据",
+                vec!["执行依据", "判决书", "裁定书", "调解书", "仲裁裁决"],
+            ),
+            (2, "授权委托手续", vec!["授权", "委托", "律所函", "所函"]),
+            (
+                3,
+                "主体资格材料",
+                vec![
+                    "身份证明",
+                    "身份证",
+                    "营业执照",
+                    "身份信息",
+                    "统一社会信用代码",
+                ],
+            ),
+            (4, "送达地址确认", vec!["送达地址", "地址确认"]),
+        ]
+    } else {
+        vec![
+            (0, "起诉状", vec!["起诉状", "诉状", "民事起诉"]),
+            (
+                1,
+                "主体资格材料",
+                vec![
+                    "身份证明",
+                    "身份证",
+                    "营业执照",
+                    "身份信息",
+                    "统一社会信用代码",
+                ],
+            ),
+            (2, "授权委托手续", vec!["授权", "委托", "律所函", "所函"]),
+            (3, "证据材料", vec!["证据", "证据目录", "证据材料", "附件"]),
+            (4, "送达地址确认", vec!["送达地址", "地址确认"]),
+        ]
+    };
+
+    let mut map: Map<String, Value> = Map::new();
+    let mut candidates: Vec<CourtFilingMaterialCandidate> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let pdf_docs: Vec<&CourtFilingSourceDoc> = docs
+        .iter()
+        .filter(|doc| {
+            doc.source_path.to_lowercase().ends_with(".pdf")
+                || doc.mime_type.as_deref().unwrap_or("").contains("pdf")
+        })
+        .collect();
+
+    for doc in &pdf_docs {
+        let signal = format!(
+            "{} {} {} {}",
+            doc.category.as_deref().unwrap_or(""),
+            doc.stage.as_deref().unwrap_or(""),
+            doc.filename,
+            doc.source_path
+        );
+        let signal_lower = signal.to_lowercase();
+
+        let mut best_slot: Option<(i32, &str, i32, Vec<String>)> = None;
+        for (slot, label, keywords) in &slot_keywords {
+            let mut score = 0;
+            let mut reasons = Vec::new();
+            for kw in keywords {
+                let kw_lower = kw.to_lowercase();
+                if signal_lower.contains(&kw_lower) {
+                    let weight = if doc
+                        .category
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&kw_lower)
+                    {
+                        45
+                    } else if doc.filename.to_lowercase().contains(&kw_lower) {
+                        35
+                    } else if doc
+                        .stage
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&kw_lower)
+                    {
+                        25
+                    } else {
+                        12
+                    };
+                    score += weight;
+                    reasons.push(format!("命中关键词「{}」", kw));
+                }
+            }
+            if best_slot
+                .as_ref()
+                .map(|(_, _, best, _)| score > *best)
+                .unwrap_or(true)
+            {
+                best_slot = Some((*slot, *label, score, reasons));
+            }
+        }
+
+        let (slot, slot_label, score, reasons) =
+            best_slot.filter(|(_, _, score, _)| *score > 0).unwrap_or((
+                -1,
+                "未识别材料",
+                0,
+                vec!["没有命中立案材料关键词，未自动上传".to_string()],
+            ));
+        let mut doc_warnings = Vec::new();
+        let file_exists = std::path::Path::new(&doc.source_path).is_file();
+        if slot < 0 {
+            doc_warnings.push("未识别为必备立案材料，已跳过上传".to_string());
+        } else if score < 30 {
+            doc_warnings.push("材料类型置信度偏低，必要时需人工核对".to_string());
+        }
+        if doc.size_bytes <= 0 {
+            doc_warnings.push("文件大小异常，可能无法上传".to_string());
+        }
+        if doc.missing || !file_exists {
+            doc_warnings.push("源文件已失联，上传前需要重新选择文件".to_string());
+        }
+        if !doc_warnings.is_empty() {
+            warnings.push(format!("{}：{}", doc.filename, doc_warnings.join("；")));
+        }
+
+        let included = slot >= 0 && file_exists && !doc.missing && doc.size_bytes > 0;
+        if included {
+            let key = slot.to_string();
+            let entry = map.entry(key).or_insert_with(|| Value::Array(vec![]));
+            if let Value::Array(arr) = entry {
+                arr.push(Value::Array(vec![
+                    Value::String(doc.source_path.clone()),
+                    Value::String(doc.filename.clone()),
+                ]));
+            }
+        }
+        candidates.push(CourtFilingMaterialCandidate {
+            doc_id: doc.id.clone(),
+            source_path: doc.source_path.clone(),
+            filename: doc.filename.clone(),
+            category: doc.category.clone(),
+            stage: doc.stage.clone(),
+            size_bytes: doc.size_bytes,
+            slot,
+            slot_label: slot_label.to_string(),
+            confidence: score.min(100),
+            included,
+            reasons,
+            warnings: doc_warnings,
+        });
+    }
+
+    let required_slots: Vec<i32> = if filing_type == "execution" {
+        vec![0, 1, 3]
+    } else {
+        vec![0, 1, 3]
+    };
+    let missing_required: Vec<Value> = required_slots
+        .into_iter()
+        .filter(|slot| !map.contains_key(&slot.to_string()))
+        .map(|slot| {
+            let label = slot_keywords
+                .iter()
+                .find(|(s, _, _)| *s == slot)
+                .map(|(_, label, _)| *label)
+                .unwrap_or("必备材料");
+            Value::String(label.to_string())
+        })
+        .collect();
+    if pdf_docs.is_empty() {
+        warnings.push("本案没有可用于立案上传的 PDF，请先导入或生成 PDF 材料".to_string());
+    }
+    if !missing_required.is_empty() {
+        let labels: Vec<String> = missing_required
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        warnings.push(format!("疑似缺少必备材料：{}", labels.join("、")));
+    }
+
+    let included_count = candidates.iter().filter(|c| c.included).count();
+    let report = serde_json::json!({
+        "filing_type": filing_type,
+        "material_folder": material_folder,
+        "generated_at": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+        "total_documents": docs.len(),
+        "pdf_documents": pdf_docs.len(),
+        "matched_documents": included_count,
+        "scanned_pdf_documents": candidates.len(),
+        "missing_required": missing_required,
+        "warnings": warnings,
+        "materials": candidates,
+        "slots": slot_keywords.iter().map(|(slot, label, _)| {
+            serde_json::json!({
+                "slot": slot,
+                "label": label,
+                "count": map.get(&slot.to_string()).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+            })
+        }).collect::<Vec<_>>(),
+    });
+
+    (Value::Object(map), report)
+}
+
+fn collect_pdf_files(
+    dir: &std::path::Path,
+    out: &mut Vec<CourtFilingSourceDoc>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("读取材料文件夹失败：{}", e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取材料文件失败：{}", e))?;
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if !ext.eq_ignore_ascii_case("pdf") {
+            continue;
+        }
+        let meta = std::fs::metadata(&path).map_err(|e| format!("读取 PDF 信息失败：{}", e))?;
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("未命名.pdf")
+            .to_string();
+        out.push(CourtFilingSourceDoc {
+            id: path.to_string_lossy().to_string(),
+            source_path: path.to_string_lossy().to_string(),
+            filename,
+            category: None,
+            stage: Some("立案".to_string()),
+            mime_type: Some("application/pdf".to_string()),
+            size_bytes: meta.len() as i64,
+            missing: false,
+        });
+    }
+    Ok(())
+}
+
+fn scan_material_folder(material_folder: &str) -> Result<Vec<CourtFilingSourceDoc>, String> {
+    let dir = std::path::Path::new(material_folder);
+    if !dir.exists() || !dir.is_dir() {
+        return Err("请选择一个有效的立案材料文件夹。".to_string());
+    }
+    let mut docs = Vec::new();
+    collect_pdf_files(dir, &mut docs)?;
+    if docs.is_empty() {
+        return Err("这个材料文件夹里没有 PDF，不能开始立案。".to_string());
+    }
+    Ok(docs)
+}
+
+async fn append_jsonl(path: &std::path::Path, value: &serde_json::Value) {
+    use tokio::io::AsyncWriteExt;
+    if let Ok(mut file) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        if let Ok(line) = serde_json::to_string(value) {
+            let _ = file.write_all(line.as_bytes()).await;
+            let _ = file.write_all(b"\n").await;
+        }
+    }
+}
+
+fn court_filing_stage_label(stage: &str) -> &'static str {
+    match stage {
+        "login.failed" => "登录法院平台",
+        "playwright.step.open_case_type" => "进入立案页面",
+        "playwright.step.select_court" => "选择受理法院",
+        "playwright.step.read_notice" => "确认立案须知",
+        "playwright.step.select_cause" => "选择案由",
+        "playwright.step.upload_materials" => "上传立案材料",
+        "playwright.step.fill_case_info" => "填写当事人信息",
+        "playwright.step.next" => "进入预览页",
+        "playwright.failed" => "法院页面办理",
+        "captcha.required" => "输入验证码",
+        _ => "办理立案",
+    }
+}
+
+fn court_filing_user_error(stage: &str, message: &str, detail: Option<&str>) -> String {
+    let raw = [message, detail.unwrap_or("")]
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("；");
+    let step = if raw.contains("原告信息") || raw.contains("当事人") || raw.contains("标的金额")
+    {
+        "填写当事人信息"
+    } else {
+        court_filing_stage_label(stage)
+    };
+    let reason = if raw.contains("无法找到法院") {
+        "没有找到对应法院，请先确认案件档案里的受理法院是否正确。"
+    } else if raw.contains("省份为空") || raw.contains("判断所属省份") {
+        "没有判断出法院所属省份，请把法院名称补充完整。"
+    } else if raw.contains("验证码") {
+        "验证码没有完成或已超时。"
+    } else if raw.contains("登录") {
+        "法院平台登录失败，请检查账号、密码或验证码。"
+    } else if raw.contains("原告信息") || raw.contains("当事人") || raw.contains("标的金额")
+    {
+        "法院页面没有出现当事人信息填写区，通常是材料上传后没有进入正确页面。请先检查材料文件夹是否只放本次立案必需 PDF。"
+    } else if raw.contains("材料") || raw.contains("上传") {
+        "材料上传没有完成，请检查材料文件夹里的 PDF 是否齐全、是否能打开。"
+    } else {
+        "法院页面没有完成这一步。"
+    };
+    format!("失败步骤：{}。{}", step, reason)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CourtRegion {
+    province: String,
+    city: String,
+    district: String,
+    confidence: i32,
+    reason: String,
+}
+
+fn municipality_districts(province: &str) -> &'static [&'static str] {
+    match province {
+        "北京市" => &[
+            "东城区",
+            "西城区",
+            "朝阳区",
+            "丰台区",
+            "石景山区",
+            "海淀区",
+            "门头沟区",
+            "房山区",
+            "通州区",
+            "顺义区",
+            "昌平区",
+            "大兴区",
+            "怀柔区",
+            "平谷区",
+            "密云区",
+            "延庆区",
+        ],
+        "天津市" => &[
+            "和平区",
+            "河东区",
+            "河西区",
+            "南开区",
+            "河北区",
+            "红桥区",
+            "东丽区",
+            "西青区",
+            "津南区",
+            "北辰区",
+            "武清区",
+            "宝坻区",
+            "滨海新区",
+            "宁河区",
+            "静海区",
+            "蓟州区",
+        ],
+        "上海市" => &[
+            "黄浦区",
+            "徐汇区",
+            "长宁区",
+            "静安区",
+            "普陀区",
+            "虹口区",
+            "杨浦区",
+            "闵行区",
+            "宝山区",
+            "嘉定区",
+            "浦东新区",
+            "金山区",
+            "松江区",
+            "青浦区",
+            "奉贤区",
+            "崇明区",
+        ],
+        "重庆市" => &[
+            "万州区",
+            "涪陵区",
+            "渝中区",
+            "大渡口区",
+            "江北区",
+            "沙坪坝区",
+            "九龙坡区",
+            "南岸区",
+            "北碚区",
+            "綦江区",
+            "大足区",
+            "渝北区",
+            "巴南区",
+            "黔江区",
+            "长寿区",
+            "江津区",
+            "合川区",
+            "永川区",
+            "南川区",
+            "璧山区",
+            "铜梁区",
+            "潼南区",
+            "荣昌区",
+            "开州区",
+            "梁平区",
+            "武隆区",
+        ],
+        _ => &[],
+    }
+}
+
+fn county_region_hints(
+    name: &str,
+) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+    let _ = name;
+    None
+}
+
+fn infer_court_region(court_name: &str) -> CourtRegion {
+    let provinces = [
+        ("北京市", &["北京"][..]),
+        ("天津市", &["天津"][..]),
+        (
+            "河北省",
+            &[
+                "河北",
+                "石家庄",
+                "唐山",
+                "秦皇岛",
+                "邯郸",
+                "邢台",
+                "保定",
+                "张家口",
+                "承德",
+                "沧州",
+                "廊坊",
+                "衡水",
+            ][..],
+        ),
+        (
+            "山西省",
+            &[
+                "山西", "太原", "大同", "阳泉", "长治", "晋城", "朔州", "晋中", "运城", "忻州",
+                "临汾", "吕梁",
+            ][..],
+        ),
+        (
+            "内蒙古自治区",
+            &[
+                "内蒙古",
+                "呼和浩特",
+                "包头",
+                "乌海",
+                "赤峰",
+                "通辽",
+                "鄂尔多斯",
+                "呼伦贝尔",
+                "巴彦淖尔",
+                "乌兰察布",
+                "兴安盟",
+                "锡林郭勒",
+                "阿拉善",
+            ][..],
+        ),
+        (
+            "辽宁省",
+            &[
+                "辽宁",
+                "沈阳",
+                "大连",
+                "鞍山",
+                "抚顺",
+                "本溪",
+                "丹东",
+                "锦州",
+                "营口",
+                "阜新",
+                "辽阳",
+                "盘锦",
+                "铁岭",
+                "朝阳",
+                "葫芦岛",
+            ][..],
+        ),
+        (
+            "吉林省",
+            &[
+                "吉林", "长春", "四平", "辽源", "通化", "白山", "松原", "白城", "延边",
+            ][..],
+        ),
+        (
+            "黑龙江省",
+            &[
+                "黑龙江",
+                "哈尔滨",
+                "齐齐哈尔",
+                "鸡西",
+                "鹤岗",
+                "双鸭山",
+                "大庆",
+                "伊春",
+                "佳木斯",
+                "七台河",
+                "牡丹江",
+                "黑河",
+                "绥化",
+                "大兴安岭",
+            ][..],
+        ),
+        ("上海市", &["上海"][..]),
+        (
+            "江苏省",
+            &[
+                "江苏",
+                "南京",
+                "无锡",
+                "徐州",
+                "常州",
+                "苏州",
+                "南通",
+                "连云港",
+                "淮安",
+                "盐城",
+                "扬州",
+                "镇江",
+                "泰州",
+                "宿迁",
+            ][..],
+        ),
+        (
+            "浙江省",
+            &[
+                "浙江", "杭州", "宁波", "嘉兴", "湖州", "绍兴", "金华", "衢州", "舟山", "台州",
+                "丽水",
+            ][..],
+        ),
+        (
+            "安徽省",
+            &[
+                "安徽",
+                "合肥",
+                "芜湖",
+                "蚌埠",
+                "淮南",
+                "马鞍山",
+                "淮北",
+                "铜陵",
+                "安庆",
+                "黄山",
+                "滁州",
+                "阜阳",
+                "宿州",
+                "六安",
+                "亳州",
+                "池州",
+                "宣城",
+            ][..],
+        ),
+        (
+            "福建省",
+            &[
+                "福建", "福州", "厦门", "莆田", "三明", "泉州", "漳州", "南平", "龙岩", "宁德",
+            ][..],
+        ),
+        (
+            "江西省",
+            &[
+                "江西",
+                "南昌",
+                "景德镇",
+                "萍乡",
+                "九江",
+                "新余",
+                "鹰潭",
+                "赣州",
+                "吉安",
+                "宜春",
+                "抚州",
+                "上饶",
+            ][..],
+        ),
+        (
+            "山东省",
+            &[
+                "山东", "济南", "青岛", "淄博", "枣庄", "东营", "烟台", "潍坊", "济宁", "泰安",
+                "威海", "日照", "临沂", "德州", "聊城", "滨州", "菏泽",
+            ][..],
+        ),
+        (
+            "河南省",
+            &[
+                "河南",
+                "郑州",
+                "开封",
+                "洛阳",
+                "平顶山",
+                "安阳",
+                "鹤壁",
+                "新乡",
+                "焦作",
+                "濮阳",
+                "许昌",
+                "漯河",
+                "三门峡",
+                "南阳",
+                "商丘",
+                "信阳",
+                "周口",
+                "驻马店",
+                "济源",
+            ][..],
+        ),
+        (
+            "湖北省",
+            &[
+                "湖北", "武汉", "黄石", "十堰", "宜昌", "襄阳", "鄂州", "荆门", "孝感", "荆州",
+                "黄冈", "咸宁", "随州", "恩施",
+            ][..],
+        ),
+        (
+            "湖南省",
+            &[
+                "湖南",
+                "长沙",
+                "株洲",
+                "湘潭",
+                "衡阳",
+                "邵阳",
+                "岳阳",
+                "常德",
+                "张家界",
+                "益阳",
+                "郴州",
+                "永州",
+                "怀化",
+                "娄底",
+                "湘西",
+            ][..],
+        ),
+        (
+            "广东省",
+            &[
+                "广东", "广州", "深圳", "珠海", "汕头", "佛山", "韶关", "河源", "梅州", "惠州",
+                "汕尾", "东莞", "中山", "江门", "阳江", "湛江", "茂名", "肇庆", "清远", "潮州",
+                "揭阳", "云浮",
+            ][..],
+        ),
+        (
+            "广西壮族自治区",
+            &[
+                "广西",
+                "南宁",
+                "柳州",
+                "桂林",
+                "梧州",
+                "北海",
+                "防城港",
+                "钦州",
+                "贵港",
+                "玉林",
+                "百色",
+                "贺州",
+                "河池",
+                "来宾",
+                "崇左",
+            ][..],
+        ),
+        ("海南省", &["海南", "海口", "三亚", "三沙", "儋州"][..]),
+        ("重庆市", &["重庆"][..]),
+        (
+            "四川省",
+            &[
+                "四川",
+                "成都",
+                "自贡",
+                "攀枝花",
+                "泸州",
+                "德阳",
+                "绵阳",
+                "广元",
+                "遂宁",
+                "内江",
+                "乐山",
+                "南充",
+                "眉山",
+                "宜宾",
+                "广安",
+                "达州",
+                "雅安",
+                "巴中",
+                "资阳",
+                "阿坝",
+                "甘孜",
+                "凉山",
+            ][..],
+        ),
+        (
+            "贵州省",
+            &[
+                "贵州",
+                "贵阳",
+                "六盘水",
+                "遵义",
+                "安顺",
+                "毕节",
+                "铜仁",
+                "黔西南",
+                "黔东南",
+                "黔南",
+            ][..],
+        ),
+        (
+            "云南省",
+            &[
+                "云南",
+                "昆明",
+                "曲靖",
+                "玉溪",
+                "保山",
+                "昭通",
+                "丽江",
+                "普洱",
+                "临沧",
+                "楚雄",
+                "红河",
+                "文山",
+                "西双版纳",
+                "大理",
+                "德宏",
+                "怒江",
+                "迪庆",
+            ][..],
+        ),
+        (
+            "西藏自治区",
+            &[
+                "西藏",
+                "拉萨",
+                "日喀则",
+                "昌都",
+                "林芝",
+                "山南",
+                "那曲",
+                "阿里",
+            ][..],
+        ),
+        (
+            "陕西省",
+            &[
+                "陕西", "西安", "铜川", "宝鸡", "咸阳", "渭南", "延安", "汉中", "榆林", "安康",
+                "商洛",
+            ][..],
+        ),
+        (
+            "甘肃省",
+            &[
+                "甘肃",
+                "兰州",
+                "嘉峪关",
+                "金昌",
+                "白银",
+                "天水",
+                "武威",
+                "张掖",
+                "平凉",
+                "酒泉",
+                "庆阳",
+                "定西",
+                "陇南",
+                "临夏",
+                "甘南",
+            ][..],
+        ),
+        (
+            "青海省",
+            &[
+                "青海", "西宁", "海东", "海北", "黄南", "海南", "果洛", "玉树", "海西",
+            ][..],
+        ),
+        (
+            "宁夏回族自治区",
+            &["宁夏", "银川", "石嘴山", "吴忠", "固原", "中卫"][..],
+        ),
+        (
+            "新疆维吾尔自治区",
+            &[
+                "新疆",
+                "乌鲁木齐",
+                "克拉玛依",
+                "吐鲁番",
+                "哈密",
+                "昌吉",
+                "博尔塔拉",
+                "巴音郭楞",
+                "阿克苏",
+                "克孜勒苏",
+                "喀什",
+                "和田",
+                "伊犁",
+                "塔城",
+                "阿勒泰",
+            ][..],
+        ),
+    ];
+
+    let mut province = String::new();
+    let mut city = String::new();
+    let mut confidence = 0;
+    let mut reason = String::new();
+
+    if let Some((_, p, c, d)) = county_region_hints(court_name) {
+        return CourtRegion {
+            province: p.to_string(),
+            city: c.to_string(),
+            district: d.to_string(),
+            confidence: 95,
+            reason: format!("法院名称命中县区地名「{}」", d),
+        };
+    }
+
+    for (p, hints) in provinces {
+        if court_name.contains(p) || court_name.contains(p.trim_end_matches('省')) {
+            province = p.to_string();
+            confidence = 100;
+            reason = format!("法院名称包含省级地名「{}」", p);
+            break;
+        }
+        if let Some(hit) = hints.iter().find(|hint| court_name.contains(**hint)) {
+            province = p.to_string();
+            if *hit != p.trim_end_matches('省') {
+                city = if hit.ends_with('盟') || hit.ends_with('州') || hit.ends_with("地区") {
+                    hit.to_string()
+                } else {
+                    format!("{}市", hit)
+                };
+            }
+            confidence = 80;
+            reason = format!("法院名称命中地市关键词「{}」", hit);
+            break;
+        }
+    }
+
+    if ["北京市", "天津市", "上海市", "重庆市"].contains(&province.as_str()) {
+        city = province.clone();
+    }
+
+    if city.is_empty() {
+        if let Some(pos) = court_name.find('市') {
+            city = court_name[..=pos].to_string();
+        }
+    }
+
+    let mut district = String::new();
+    if !province.is_empty() && city == province {
+        for d in municipality_districts(&province) {
+            if court_name.contains(d) {
+                district = d.to_string();
+                break;
+            }
+        }
+    } else if let Some(city_pos) = court_name.find('市') {
+        let after_city = &court_name[city_pos + '市'.len_utf8()..];
+        for suffix in ["区", "县", "市"] {
+            if let Some(pos) = after_city.find(suffix) {
+                district = after_city[..=pos].to_string();
+                break;
+            }
+        }
+    }
+
+    CourtRegion {
+        province,
+        city,
+        district,
+        confidence,
+        reason,
+    }
+}
+
+/// 从委托手续 PDF OCR 提取代理人信息（姓名、执业证号、电话、律所）。
+/// 使用 MinerU batch API 上传 PDF → OCR → 解析文本。
+async fn extract_agents_from_pdf(
+    pdf_path: &str,
+    settings: &crate::settings::Settings,
+) -> Result<Vec<serde_json::Value>, String> {
+    let api_key = settings
+        .mineru_api_key
+        .clone()
+        .ok_or_else(|| "未配置 MinerU API Key".to_string())?;
+
+    let client = reqwest::Client::new();
+    let file_name = std::path::Path::new(pdf_path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // 1. 获取上传 URL
+    let batch_resp = client
+        .post("https://mineru.net/api/v4/file-urls/batch")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "files": [{"name": file_name, "data_id": uuid::Uuid::new_v4().to_string()}],
+            "model_version": "vlm"
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("MinerU batch 请求失败: {}", e))?;
+
+    let batch_result: serde_json::Value = batch_resp
+        .json()
+        .await
+        .map_err(|e| format!("解析 MinerU batch 响应失败: {}", e))?;
+
+    if batch_result.get("code").and_then(|v| v.as_i64()) != Some(0) {
+        return Err(format!(
+            "MinerU batch 失败: {}",
+            batch_result
+                .get("msg")
+                .unwrap_or(&serde_json::json!("未知错误"))
+        ));
+    }
+
+    let batch_id = batch_result["data"]["batch_id"]
+        .as_str()
+        .ok_or_else(|| "batch_id 缺失".to_string())?
+        .to_string();
+    let upload_url = batch_result["data"]["file_urls"][0]
+        .as_str()
+        .ok_or_else(|| "upload_url 缺失".to_string())?
+        .to_string();
+
+    // 2. 上传文件
+    let file_bytes = tokio::fs::read(pdf_path)
+        .await
+        .map_err(|e| format!("读取 PDF 失败: {}", e))?;
+    client
+        .put(&upload_url)
+        .body(file_bytes)
+        .send()
+        .await
+        .map_err(|e| format!("上传 PDF 失败: {}", e))?;
+
+    // 3. 轮询结果（最多 60 秒）
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let result_resp = client
+            .get(format!(
+                "https://mineru.net/api/v4/extract-results/batch/{}",
+                batch_id
+            ))
+            .header("Authorization", format!("Bearer {}", api_key))
+            .send()
+            .await
+            .map_err(|e| format!("轮询 MinerU 结果失败: {}", e))?;
+
+        let result: serde_json::Value = result_resp
+            .json()
+            .await
+            .map_err(|e| format!("解析 MinerU 结果失败: {}", e))?;
+
+        let extract = result
+            .get("data")
+            .and_then(|d| d.get("extract_result"))
+            .and_then(|e| e.as_array())
+            .and_then(|a| a.first());
+
+        let state = extract
+            .and_then(|e| e.get("state"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        if state == "done" {
+            let zip_url = extract
+                .and_then(|e| e.get("full_zip_url"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "zip_url 缺失".to_string())?;
+
+            // 4. 下载 ZIP 并提取文本
+            let zip_bytes = client
+                .get(zip_url)
+                .send()
+                .await
+                .map_err(|e| format!("下载 ZIP 失败: {}", e))?
+                .bytes()
+                .await
+                .map_err(|e| format!("读取 ZIP 失败: {}", e))?;
+
+            let mut text = String::new();
+            let reader = std::io::Cursor::new(zip_bytes.to_vec());
+            if let Ok(mut archive) = zip::ZipArchive::new(reader) {
+                for i in 0..archive.len() {
+                    if let Ok(mut file) = archive.by_index(i) {
+                        if file.name().ends_with(".md") {
+                            let mut content = String::new();
+                            if std::io::Read::read_to_string(&mut file, &mut content).is_ok() {
+                                text.push_str(&content);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5. 从文本提取代理人信息
+            return Ok(parse_agents_from_ocr_text(&text));
+        }
+    }
+
+    Err("MinerU OCR 超时（60秒）".to_string())
+}
+
+/// 从 OCR 文本里提取代理人信息。
+/// 匹配模式：律师：XXX 执业证号码：XXX，联系电话：XXX + 身份证号
+fn parse_agents_from_ocr_text(text: &str) -> Vec<serde_json::Value> {
+    let mut agents = Vec::new();
+
+    // 匹配 "律师：XXX 执业证号码/执业证号：XXX，联系电话：XXX"
+    let re = regex::Regex::new(
+        r"(?m)律师[：:]\s*(\S+?)[\s　]+执业证号[码]?[：:]\s*(\d+)[\s,，]+联系电话[：:]\s*(1\d{10})",
+    )
+    .unwrap();
+
+    // 提取所有身份证号（顺序对应持证人顺序）
+    let id_re = regex::Regex::new(r"身份证号\s*(\d{17}[\dXx])").unwrap();
+    let id_numbers: Vec<String> = id_re
+        .captures_iter(text)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .collect();
+
+    for (i, cap) in re.captures_iter(text).enumerate() {
+        let name = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+        let bar_number = cap.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+        let phone = cap.get(3).map(|m| m.as_str()).unwrap_or("").to_string();
+
+        // 身份证号按顺序匹配
+        let id_number = id_numbers.get(i).cloned().unwrap_or_default();
+
+        // 提取律所名
+        let law_firm = extract_law_firm(text, &name);
+
+        agents.push(serde_json::json!({
+            "name": name,
+            "bar_number": bar_number,
+            "phone": phone,
+            "law_firm": law_firm,
+            "id_number": id_number,
+            "address": "",
+        }));
+    }
+
+    agents
+}
+
+/// 从 OCR 文本里提取律所名。
+fn extract_law_firm(text: &str, _agent_name: &str) -> String {
+    // 匹配 "执业机构 XXX律师事务所" 或 "受托人：... XXX律师事务所"
+    let patterns = [
+        regex::Regex::new(r"执业机构\s*[：:]?\s*(\S+律师事务所)").unwrap(),
+        regex::Regex::new(r"受托人[：:]\s*\S+\s*\S+\s*律师\s*(\S+律师事务所)").unwrap(),
+    ];
+    for re in &patterns {
+        if let Some(cap) = re.captures(text) {
+            return cap
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+        }
+    }
+    String::new()
+}
+
+/// 启动一次法院在线立案：读案件数据 → 组装 JSON → spawn CLI → 流式读 stdout。
+/// 前端通过 "court-filing-progress" + "court-filing-captcha" 事件订阅进度。
+#[tauri::command]
+async fn start_court_filing(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    filing_type: String,
+    agent_ids: Vec<String>,
+    original_case_number: Option<String>,
+    material_folder: String,
+) -> Result<db::court_filing::CourtFilingJob, String> {
+    // 1. 校验案件存在
+    let case = cases_db::get_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| format!("案件不存在: {}", case_id))?;
+
+    // 2. 防重复草稿
+    let active = db::court_filing::has_active_job(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)?;
+    if active {
+        return Err("该案件有立案任务进行中，请等待完成后再发起".to_string());
+    }
+
+    // 3. 读取用户本次指定的立案材料文件夹。只上传这个文件夹里的 PDF，避免把全案材料都传上去。
+    let docs = scan_material_folder(&material_folder)?;
+
+    // 4. 读设置
+    let settings = crate::settings::read_settings().unwrap_or_default();
+    let account = settings
+        .court_filing_account
+        .clone()
+        .ok_or_else(|| "未配置一张网账号（设置→法院立案）".to_string())?;
+    let password = settings
+        .court_filing_password
+        .clone()
+        .ok_or_else(|| "未配置一张网密码（设置→法院立案）".to_string())?;
+    let cli_path = resolve_court_filing_cli_path(&app, settings.court_filing_cli_path.clone());
+    let python = settings
+        .court_filing_python
+        .clone()
+        .unwrap_or_else(|| "python3".to_string());
+    let cookie_dir = settings.court_filing_cookie_dir.clone();
+
+    // 5. 组装 case_data.json
+    // user_overrides_json 优先（用户手动编辑的字段），fallback 到 agg_court
+    let overrides: serde_json::Value = case
+        .user_overrides_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::json!({}));
+    let ov_fields = overrides
+        .get("fields")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+
+    let court_name = ov_fields
+        .get("agg_court")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| case.agg_court.as_deref().filter(|s| !s.is_empty()))
+        .or_else(|| case.court.as_deref().filter(|s| !s.is_empty()))
+        .unwrap_or("");
+    if court_name.is_empty() {
+        return Err("案件缺少法院名称（请先在案件档案里填写法院信息）".to_string());
+    }
+    let cause = ov_fields
+        .get("agg_cause")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| case.agg_cause.as_deref().filter(|s| !s.is_empty()))
+        .or_else(|| case.cause.as_deref().filter(|s| !s.is_empty()))
+        .unwrap_or("");
+    let amount = case
+        .agg_claim_amount
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let court_region = infer_court_region(court_name);
+    if court_region.province.is_empty() {
+        return Err(format!(
+            "无法从法院名称「{}」判断所属省份。请在案件法院名称中补充完整省、市、区县信息。",
+            court_name
+        ));
+    }
+
+    let mut case_data = serde_json::json!({
+        "court_name": court_name,
+        "cause_of_action": cause,
+        "target_amount": amount,
+        "province": court_region.province,
+        "city": court_region.city,
+        "district": court_region.district,
+        "court_region": court_region,
+        "filing_type": filing_type,
+        "case_id": case_id,
+        "filing_engine": "playwright",
+        "original_case_number": original_case_number.as_deref().unwrap_or(""),
+    });
+
+    // 解析当事人 JSON（兼容字符串数组 ["潘尖"] 和对象数组 [{name:"潘尖"}]）
+    for (key, field) in [
+        ("plaintiffs", &case.agg_plaintiffs),
+        ("defendants", &case.agg_defendants),
+        ("third_parties", &case.agg_third_parties),
+    ] {
+        let raw_items: Vec<serde_json::Value> = field
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let items: Vec<serde_json::Value> = raw_items
+            .into_iter()
+            .map(|v| {
+                if let Some(name) = v.as_str() {
+                    // 根据名字判断当事人类型
+                    let client_type = if name.contains("公司") || name.contains("集团")
+                        || name.contains("企业") || name.contains("有限")
+                        || name.contains("合伙") || name.contains("工厂")
+                        || name.contains("店") || name.contains("商行")
+                    {
+                        "legal"
+                    } else {
+                        "natural"
+                    };
+                    serde_json::json!({"name": name, "client_type": client_type, "type": client_type})
+                } else {
+                    v
+                }
+            })
+            .collect();
+        case_data[key] = serde_json::json!(items);
+    }
+
+    // 补充当事人详情从 agg_party_contacts
+    if let Some(contacts_str) = &case.agg_party_contacts {
+        if let Ok(contacts) = serde_json::from_str::<Vec<serde_json::Value>>(contacts_str) {
+            for key in ["plaintiffs", "defendants", "third_parties"] {
+                if let Some(arr) = case_data[key].as_array_mut() {
+                    for party in arr.iter_mut() {
+                        let party_name = party
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !party_name.is_empty() {
+                            if let Some(contact) = contacts.iter().find(|c| {
+                                c.get("name").and_then(|n| n.as_str()) == Some(&party_name)
+                            }) {
+                                // 补充通用字段
+                                for field in ["phone", "address"] {
+                                    if party.get(field).is_none()
+                                        || party[field].as_str() == Some("")
+                                    {
+                                        if let Some(val) = contact.get(field) {
+                                            party[field] = val.clone();
+                                        }
+                                    }
+                                }
+                                // 法人：id_no → uscc（统一社会信用代码）
+                                let client_type = party
+                                    .get("client_type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if client_type == "legal" {
+                                    if let Some(id_no) =
+                                        contact.get("id_no").and_then(|v| v.as_str())
+                                    {
+                                        if !id_no.is_empty() {
+                                            party["uscc"] = serde_json::json!(id_no);
+                                        }
+                                    }
+                                    // 查找法定代表人（role 包含"法定代表人"的联系人）
+                                    if let Some(rep_contact) = contacts.iter().find(|c| {
+                                        c.get("role")
+                                            .and_then(|r| r.as_str())
+                                            .unwrap_or("")
+                                            .contains("法定代表人")
+                                    }) {
+                                        if let Some(rep_name) =
+                                            rep_contact.get("name").and_then(|v| v.as_str())
+                                        {
+                                            party["legal_rep"] = serde_json::json!(rep_name);
+                                        }
+                                        if let Some(rep_id) =
+                                            rep_contact.get("id_no").and_then(|v| v.as_str())
+                                        {
+                                            party["legal_rep_id_number"] =
+                                                serde_json::json!(rep_id);
+                                        }
+                                        // 法定代表人的地址作为公司地址（如果没有公司地址）
+                                        if party
+                                            .get("address")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .is_empty()
+                                        {
+                                            if let Some(rep_addr) =
+                                                rep_contact.get("address").and_then(|v| v.as_str())
+                                            {
+                                                party["address"] = serde_json::json!(rep_addr);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. 查律师档案组装 agents
+    let mut agents = Vec::new();
+    for agent_id in &agent_ids {
+        if let Some(profile) = db::lawyer_profiles::get(pool.inner(), agent_id)
+            .await
+            .map_err(db_err)?
+        {
+            agents.push(serde_json::json!({
+                "name": profile.name,
+                "id_number": profile.id_number.as_deref().unwrap_or(""),
+                "bar_number": profile.bar_number.as_deref().unwrap_or(""),
+                "law_firm": profile.law_firm.as_deref().unwrap_or(""),
+                "address": profile.address.as_deref().unwrap_or(""),
+                "phone": profile.phone.as_deref().unwrap_or(""),
+            }));
+        }
+    }
+    case_data["agents"] = serde_json::json!(agents);
+    if let Some(first) = agents.first() {
+        case_data["agent"] = first.clone();
+    }
+
+    // 补充：我方当事人（原告）的电话填律师的电话（如果没有电话）
+    // 被告/第三人的电话有就填，没有就空着
+    let agent_phone = agents
+        .first()
+        .and_then(|a| a.get("phone"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    if !agent_phone.is_empty() {
+        // 只给 plaintiffs 填律师电话（我方代理的当事人）
+        if let Some(arr) = case_data["plaintiffs"].as_array_mut() {
+            for party in arr.iter_mut() {
+                let phone = party.get("phone").and_then(|v| v.as_str()).unwrap_or("");
+                if phone.is_empty() {
+                    party["phone"] = serde_json::json!(agent_phone);
+                }
+            }
+        }
+    }
+
+    // 7. 组装 materials.json + material_preflight.json。
+    // 前端只暴露简单流程；排错时看预检报告即可知道每个 PDF 被归到哪个法院材料槽位。
+    let (materials, material_report) =
+        build_court_filing_materials(&docs, &material_folder, &filing_type);
+    let missing_required_count = material_report
+        .get("missing_required")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if missing_required_count > 0 {
+        let missing = material_report
+            .get("missing_required")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            })
+            .unwrap_or_default();
+        return Err(format!(
+            "立案材料还没准备完整，缺少：{}。请把这些 PDF 放进同一个材料文件夹后再开始。",
+            missing
+        ));
+    }
+    case_data["materials"] = materials.clone();
+    case_data["materials_manifest"] = material_report.clone();
+    case_data["material_folder"] = serde_json::json!(material_folder);
+
+    // 7.5 从委托手续 PDF OCR 提取代理人信息，补充到 agents
+    if let Some(mats) = materials.as_object() {
+        if let Some(slot2) = mats.get("2").and_then(|v| v.as_array()) {
+            if let Some(first_mat) = slot2.first().and_then(|v| v.as_array()) {
+                if let Some(pdf_path) = first_mat.first().and_then(|v| v.as_str()) {
+                    match extract_agents_from_pdf(pdf_path, &settings).await {
+                        Ok(extracted_agents) => {
+                            if !extracted_agents.is_empty() {
+                                // 合并：保留原有律师档案里的代理人，追加从 PDF 提取的（去重）
+                                let existing_names: Vec<String> = agents
+                                    .iter()
+                                    .filter_map(|a| {
+                                        a.get("name").and_then(|v| v.as_str()).map(String::from)
+                                    })
+                                    .collect();
+                                for agent in extracted_agents {
+                                    let name =
+                                        agent.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    if !existing_names.contains(&name.to_string()) {
+                                        agents.push(agent);
+                                    }
+                                }
+                                case_data["agents"] = serde_json::json!(agents);
+                                if let Some(first) = agents.first() {
+                                    case_data["agent"] = first.clone();
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // OCR 失败不阻塞立案，只记录警告
+                            crate::dlog!("从委托手续提取代理人失败（不影响立案）: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 8. 插 pending 记录
+    let job = db::court_filing::insert(
+        pool.inner(),
+        &db::court_filing::NewCourtFilingJob {
+            case_id: case_id.clone(),
+            filing_type: filing_type.clone(),
+            court_name: court_name.to_string(),
+            cookie_account: Some(account.clone()),
+            output_dir: None, // 后面更新
+        },
+    )
+    .await
+    .map_err(db_err)?;
+
+    // 9. 建 output_dir + 写 JSON 文件
+    let output_dir = crate::db::app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("court_filing")
+        .join(&job.id);
+    tokio::fs::create_dir_all(&output_dir)
+        .await
+        .map_err(|e| format!("创建输出目录失败: {}", e))?;
+    let output_dir_str = output_dir.to_string_lossy().to_string();
+
+    let case_data_path = output_dir.join("case_data.json");
+    tokio::fs::write(
+        &case_data_path,
+        serde_json::to_string_pretty(&case_data).unwrap(),
+    )
+    .await
+    .map_err(|e| format!("写 case_data.json 失败: {}", e))?;
+
+    let materials_path = output_dir.join("materials.json");
+    tokio::fs::write(
+        &materials_path,
+        serde_json::to_string_pretty(&materials).unwrap(),
+    )
+    .await
+    .map_err(|e| format!("写 materials.json 失败: {}", e))?;
+
+    let preflight_path = output_dir.join("material_preflight.json");
+    tokio::fs::write(
+        &preflight_path,
+        serde_json::to_string_pretty(&material_report).unwrap(),
+    )
+    .await
+    .map_err(|e| format!("写 material_preflight.json 失败: {}", e))?;
+
+    // 更新 job 的 output_dir
+    sqlx::query("UPDATE court_filing_jobs SET output_dir = ? WHERE id = ?")
+        .bind(&output_dir_str)
+        .bind(&job.id)
+        .execute(pool.inner())
+        .await
+        .map_err(db_err)?;
+
+    // 10. spawn CLI（流式 stdout）
+    let app_clone = app.clone();
+    let pool_clone = pool.inner().clone();
+    let job_id = job.id.clone();
+    let case_id_clone = case_id.clone();
+    let cli_path_clone = cli_path.clone();
+    let output_dir_clone = output_dir_str.clone();
+    let material_report_clone = material_report.clone();
+
+    tauri::async_runtime::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        use tokio::process::Command;
+
+        let output_dir_path = std::path::PathBuf::from(&output_dir_clone);
+        let progress_log_path = output_dir_path.join("progress_events.jsonl");
+        let stderr_log_path = output_dir_path.join("stderr.log");
+        let diagnosis_path = output_dir_path.join("final_diagnosis.json");
+
+        let _ = app_clone.emit(
+            "court-filing-progress",
+            CourtFilingProgress {
+                job_id: job_id.clone(),
+                case_id: case_id_clone.clone(),
+                phase: "system".into(),
+                stage: "filing.start".into(),
+                level: "info".into(),
+                message: "正在启动立案流程...".into(),
+                detail: None,
+                round: None,
+                task_id: None,
+                image_base64: None,
+                timing: None,
+            },
+        );
+        append_jsonl(
+            &progress_log_path,
+            &serde_json::json!({
+                "phase": "system",
+                "stage": "filing.start",
+                "level": "info",
+                "message": "正在启动立案流程...",
+                "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            }),
+        )
+        .await;
+
+        let preflight_warnings = material_report_clone
+            .get("warnings")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join("；")
+            })
+            .unwrap_or_default();
+        let matched_documents = material_report_clone
+            .get("matched_documents")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let preflight_message = if preflight_warnings.is_empty() {
+            format!("材料预检完成：已自动匹配 {} 份 PDF", matched_documents)
+        } else {
+            format!(
+                "材料预检完成：已自动匹配 {} 份 PDF，{}",
+                matched_documents, preflight_warnings
+            )
+        };
+        let _ = app_clone.emit(
+            "court-filing-progress",
+            CourtFilingProgress {
+                job_id: job_id.clone(),
+                case_id: case_id_clone.clone(),
+                phase: "system".into(),
+                stage: "materials.preflight".into(),
+                level: if preflight_warnings.is_empty() {
+                    "info"
+                } else {
+                    "warning"
+                }
+                .into(),
+                message: preflight_message.clone(),
+                detail: Some("完整预检报告已保存到 material_preflight.json".into()),
+                round: None,
+                task_id: None,
+                image_base64: None,
+                timing: None,
+            },
+        );
+        append_jsonl(
+            &progress_log_path,
+            &serde_json::json!({
+                "phase": "system",
+                "stage": "materials.preflight",
+                "level": if preflight_warnings.is_empty() { "info" } else { "warning" },
+                "message": preflight_message,
+                "detail": "完整预检报告已保存到 material_preflight.json",
+                "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            }),
+        )
+        .await;
+
+        let case_data_path_str = case_data_path.to_string_lossy().to_string();
+        let materials_path_str = materials_path.to_string_lossy().to_string();
+
+        let mut args = vec![
+            "-m".to_string(),
+            "court_filing_cli".to_string(),
+            "--account".to_string(),
+            account.clone(),
+            "--password".to_string(),
+            password.clone(),
+            "--filing-type".to_string(),
+            filing_type.clone(),
+            "--case-data".to_string(),
+            case_data_path_str,
+            "--materials".to_string(),
+            materials_path_str,
+            "--output-dir".to_string(),
+            output_dir_clone.clone(),
+            "--log-level".to_string(),
+            "INFO".to_string(),
+        ];
+        if let Some(ref cd) = cookie_dir {
+            args.extend(["--cookie-dir".to_string(), cd.clone()]);
+        }
+
+        // 从 cli_path 的父目录运行，这样 python -m court_filing_cli 能找到包
+        let cli_parent = std::path::Path::new(&cli_path_clone)
+            .parent()
+            .unwrap_or(std::path::Path::new(&cli_path_clone));
+        let spawn_result = Command::new(&python)
+            .current_dir(cli_parent)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn();
+
+        let mut child = match spawn_result {
+            Ok(c) => c,
+            Err(e) => {
+                let err_msg = format!("启动 CLI 失败（确认 python3 + 依赖已装）: {}", e);
+                let _ = db::court_filing::update_status(
+                    &pool_clone,
+                    &job_id,
+                    "failed",
+                    Some(&err_msg),
+                    None,
+                    None,
+                )
+                .await;
+                let _ = app_clone.emit(
+                    "court-filing-progress",
+                    CourtFilingProgress {
+                        job_id: job_id.clone(),
+                        case_id: case_id_clone.clone(),
+                        phase: "system".into(),
+                        stage: "cli.spawn_failed".into(),
+                        level: "error".into(),
+                        message: err_msg.clone(),
+                        detail: None,
+                        round: None,
+                        task_id: None,
+                        image_base64: None,
+                        timing: None,
+                    },
+                );
+                let _ = tokio::fs::write(&diagnosis_path, serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "failed",
+                    "failed_stage": "cli.spawn_failed",
+                    "summary": "CLI 启动失败",
+                    "error": err_msg,
+                    "material_preflight": material_report_clone,
+                    "output_dir": output_dir_clone,
+                    "generated_at": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                })).unwrap_or_default()).await;
+                return;
+            }
+        };
+
+        let _ = db::court_filing::update_status(&pool_clone, &job_id, "running", None, None, None)
+            .await;
+
+        // 逐行读 stderr，避免子进程错误输出过多导致管道阻塞；同时落盘供失败诊断。
+        let stderr_task = child.stderr.take().map(|stderr| {
+            let stderr_log_path = stderr_log_path.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let reader = tokio::io::BufReader::new(stderr);
+                let mut lines = reader.lines();
+                let mut excerpt: Vec<String> = Vec::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Ok(mut file) = tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&stderr_log_path)
+                        .await
+                    {
+                        let _ = file.write_all(line.as_bytes()).await;
+                        let _ = file.write_all(b"\n").await;
+                    }
+                    excerpt.push(line);
+                    if excerpt.len() > 40 {
+                        excerpt.remove(0);
+                    }
+                }
+                excerpt
+            })
+        });
+
+        // 逐行读 stdout
+        let stdout = child.stdout.take().expect("stdout piped");
+        let reader = tokio::io::BufReader::new(stdout);
+        let mut lines = reader.lines();
+        let mut last_progress_json = String::new();
+        let mut last_stage = "filing.start".to_string();
+        let mut last_message = "正在启动立案流程...".to_string();
+        let mut last_detail: Option<String> = None;
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let ev: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue, // 非 JSON 行跳过
+            };
+
+            let progress_str = serde_json::to_string(&ev).unwrap_or_default();
+            last_progress_json = progress_str.clone();
+            let _ = db::court_filing::update_progress(&pool_clone, &job_id, &progress_str).await;
+
+            let phase = ev.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+            let stage = ev.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+            let level = ev.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+            let message = ev.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let detail = ev.get("detail").and_then(|v| v.as_str()).map(String::from);
+            let round = ev.get("round").and_then(|v| v.as_i64());
+            let task_id = ev.get("task_id").and_then(|v| v.as_str()).map(String::from);
+            let image_base64 = ev
+                .get("image_base64")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let timing = ev.get("timing").cloned();
+            if !stage.is_empty() {
+                last_stage = stage.to_string();
+            }
+            if !message.is_empty() {
+                last_message = message.to_string();
+            }
+            last_detail = detail.clone();
+            let mut log_ev = ev.clone();
+            if let Some(obj) = log_ev.as_object_mut() {
+                obj.insert(
+                    "ts".to_string(),
+                    serde_json::Value::String(
+                        chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    ),
+                );
+            }
+            append_jsonl(&progress_log_path, &log_ev).await;
+
+            let _ = app_clone.emit(
+                "court-filing-progress",
+                CourtFilingProgress {
+                    job_id: job_id.clone(),
+                    case_id: case_id_clone.clone(),
+                    phase: phase.to_string(),
+                    stage: stage.to_string(),
+                    level: level.to_string(),
+                    message: message.to_string(),
+                    detail,
+                    round,
+                    task_id: task_id.clone(),
+                    image_base64: image_base64.clone(),
+                    timing,
+                },
+            );
+
+            // 处理验证码事件
+            if phase == "captcha" && stage == "captcha.required" {
+                let _ = db::court_filing::set_captcha_active(&pool_clone, &job_id, true).await;
+                if let (Some(img), Some(tid), Some(rd)) =
+                    (image_base64.as_deref(), task_id.as_deref(), round)
+                {
+                    let _ = app_clone.emit(
+                        "court-filing-captcha",
+                        CourtFilingCaptcha {
+                            job_id: job_id.clone(),
+                            case_id: case_id_clone.clone(),
+                            task_id: tid.to_string(),
+                            round: rd,
+                            image_base64: img.to_string(),
+                            timeout_sec: 300,
+                        },
+                    );
+                }
+            }
+            if phase == "captcha" && (stage == "captcha.answered" || stage == "captcha.timeout") {
+                let _ = db::court_filing::set_captcha_active(&pool_clone, &job_id, false).await;
+            }
+        }
+
+        // 等子进程结束
+        let exit_status = child.wait().await;
+        let exit_code = exit_status
+            .as_ref()
+            .map(|s| s.code().unwrap_or(-1))
+            .unwrap_or(-1);
+        let stderr_excerpt = match stderr_task {
+            Some(task) => task.await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        // 判断最终状态
+        let final_status = if exit_code == 0 {
+            "completed"
+        } else {
+            "failed"
+        };
+        let error_msg = if exit_code != 0 {
+            Some(court_filing_user_error(
+                &last_stage,
+                &last_message,
+                last_detail.as_deref(),
+            ))
+        } else {
+            None
+        };
+
+        // 从最后一条 progress 提取 preview_url
+        let preview_url: Option<String> =
+            serde_json::from_str::<serde_json::Value>(&last_progress_json)
+                .ok()
+                .and_then(|v| v.get("result")?.get("url")?.as_str().map(String::from));
+
+        let _ = db::court_filing::update_status(
+            &pool_clone,
+            &job_id,
+            final_status,
+            error_msg.as_deref(),
+            preview_url.as_deref(),
+            None,
+        )
+        .await;
+
+        let diagnosis = serde_json::json!({
+            "status": final_status,
+            "exit_code": exit_code,
+            "failed_stage": if final_status == "failed" { Some(last_stage.clone()) } else { None },
+            "last_message": last_message,
+            "last_detail": last_detail,
+            "error": error_msg,
+            "preview_url": preview_url,
+            "stderr_excerpt": stderr_excerpt,
+            "material_preflight": material_report_clone,
+            "files": {
+                "case_data": case_data_path.to_string_lossy().to_string(),
+                "materials": materials_path.to_string_lossy().to_string(),
+                "material_preflight": preflight_path.to_string_lossy().to_string(),
+                "progress_events": progress_log_path.to_string_lossy().to_string(),
+                "stderr": stderr_log_path.to_string_lossy().to_string()
+            },
+            "output_dir": output_dir_clone,
+            "generated_at": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+        });
+        let _ = tokio::fs::write(
+            &diagnosis_path,
+            serde_json::to_string_pretty(&diagnosis).unwrap_or_default(),
+        )
+        .await;
+        append_jsonl(&progress_log_path, &serde_json::json!({
+            "phase": "system",
+            "stage": if final_status == "completed" { "filing.success" } else { "filing.failed" },
+            "level": if final_status == "completed" { "info" } else { "error" },
+            "message": if final_status == "completed" { "立案流程执行完成（已到预览页，未提交）" } else { "立案流程失败" },
+            "detail": error_msg,
+            "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+        })).await;
+
+        let final_msg = if final_status == "completed" {
+            "立案流程执行完成（已到预览页，未提交）"
+        } else {
+            "立案流程失败"
+        };
+        let _ = app_clone.emit(
+            "court-filing-progress",
+            CourtFilingProgress {
+                job_id: job_id.clone(),
+                case_id: case_id_clone.clone(),
+                phase: "system".into(),
+                stage: if final_status == "completed" {
+                    "filing.success"
+                } else {
+                    "filing.failed"
+                }
+                .into(),
+                level: if final_status == "completed" {
+                    "info"
+                } else {
+                    "error"
+                }
+                .into(),
+                message: final_msg.into(),
+                detail: error_msg,
+                round: None,
+                task_id: None,
+                image_base64: None,
+                timing: None,
+            },
+        );
+    });
+
+    Ok(db::court_filing::CourtFilingJob {
+        id: job.id,
+        case_id: job.case_id,
+        filing_type: job.filing_type,
+        court_name: job.court_name,
+        cookie_account: job.cookie_account,
+        status: "pending".into(),
+        output_dir: Some(output_dir_str),
+        preview_url: None,
+        progress_json: None,
+        captcha_active: 0,
+        error: None,
+        timing_json: None,
+        created_at: job.created_at,
+        updated_at: job.updated_at,
+    })
+}
+
+/// 提交验证码答案（写 captcha_answer.json 到 output_dir，CLI 轮询读取）。
+#[tauri::command]
+async fn submit_captcha_answer(
+    pool: tauri::State<'_, SqlitePool>,
+    job_id: String,
+    task_id: String,
+    round: i64,
+    answer: String,
+) -> Result<(), String> {
+    let job = db::court_filing::get(pool.inner(), &job_id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| format!("立案任务不存在: {}", job_id))?;
+
+    let output_dir = job
+        .output_dir
+        .ok_or_else(|| "任务输出目录不存在".to_string())?;
+    let answer_path = std::path::PathBuf::from(&output_dir).join("captcha_answer.json");
+
+    let answer_json = serde_json::json!({
+        "task_id": task_id,
+        "round": round,
+        "answer": answer,
+        "submitted_ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+    });
+    tokio::fs::write(&answer_path, serde_json::to_string(&answer_json).unwrap())
+        .await
+        .map_err(|e| format!("写 captcha_answer.json 失败: {}", e))?;
+
+    let _ = db::court_filing::set_captcha_active(pool.inner(), &job_id, false)
+        .await
+        .map_err(db_err)?;
+    let _ = db::court_filing::update_status(pool.inner(), &job_id, "running", None, None, None)
+        .await
+        .map_err(db_err)?;
+
+    Ok(())
+}
+
+/// 列出某案件的全部立案记录。
+#[tauri::command]
+async fn list_court_filing_jobs(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<db::court_filing::CourtFilingJob>, String> {
+    db::court_filing::list_by_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)
+}
+
+/// 查单条立案任务。
+#[tauri::command]
+async fn get_court_filing_job(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+) -> Result<Option<db::court_filing::CourtFilingJob>, String> {
+    db::court_filing::get(pool.inner(), &id)
+        .await
+        .map_err(db_err)
+}
+
+/// 列出全部律师档案。
+#[tauri::command]
+async fn list_lawyer_profiles(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<db::lawyer_profiles::LawyerProfile>, String> {
+    db::lawyer_profiles::list(pool.inner())
+        .await
+        .map_err(db_err)
+}
+
+/// 新增律师档案。
+#[tauri::command]
+async fn save_lawyer_profile(
+    pool: tauri::State<'_, SqlitePool>,
+    profile: db::lawyer_profiles::SaveLawyerProfile,
+) -> Result<db::lawyer_profiles::LawyerProfile, String> {
+    db::lawyer_profiles::insert(pool.inner(), &profile)
+        .await
+        .map_err(db_err)
+}
+
+/// 更新律师档案。
+#[tauri::command]
+async fn update_lawyer_profile(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+    profile: db::lawyer_profiles::SaveLawyerProfile,
+) -> Result<db::lawyer_profiles::LawyerProfile, String> {
+    db::lawyer_profiles::update(pool.inner(), &id, &profile)
+        .await
+        .map_err(db_err)
+}
+
+/// 删除律师档案。
+#[tauri::command]
+async fn delete_lawyer_profile(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+) -> Result<(), String> {
+    db::lawyer_profiles::delete(pool.inner(), &id)
+        .await
+        .map_err(db_err)
+}
+
+/// 设为默认律师。
+#[tauri::command]
+async fn set_default_lawyer(pool: tauri::State<'_, SqlitePool>, id: String) -> Result<(), String> {
+    db::lawyer_profiles::set_default(pool.inner(), &id)
+        .await
+        .map_err(db_err)
+}
+
+// ============================================================================
+
 #[tauri::command]
 fn parse_mcp_paste(text: String) -> Result<chat::mcp_paste::ParsedPaste, String> {
     chat::mcp_paste::parse_pasted_config(&text)
@@ -2582,6 +4691,15 @@ pub fn run() {
             verify_paddle_vl_key,
             verify_deepseek_key,
             verify_minimax_key,
+            start_court_filing,
+            submit_captcha_answer,
+            list_court_filing_jobs,
+            get_court_filing_job,
+            list_lawyer_profiles,
+            save_lawyer_profile,
+            update_lawyer_profile,
+            delete_lawyer_profile,
+            set_default_lawyer,
             verify_yuandian_key,
             check_for_update,
             app_version,

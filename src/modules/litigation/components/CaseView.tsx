@@ -27,6 +27,7 @@ import { groupByStage } from "../lib/groupByStage";
 import { CaseChatPanel } from "./chat/CaseChatPanel";
 import { CaseSnapshotView } from "./snapshot/CaseSnapshotView";
 import { CaseSwitcher } from "./CaseSwitcher";
+import { CourtFilingSection } from "./CourtFilingSection";
 import {
   type DocumentWritingPaneHandle,
   DocumentWritingPane,
@@ -411,6 +412,8 @@ export function CaseView({
                     onReanalyze={handleReanalyze}
                     reanalyzing={reanalyzing}
                   />
+
+                  <CourtFilingSection caseData={selectedCase} />
                 </div>
               )}
             </div>

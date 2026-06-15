@@ -191,6 +191,19 @@ pub struct Settings {
     /// 2026-06-10 团队版 Phase 1(LAN 接力同步,详 docs/提案-团队版-2026-06-10.md §6)。
     /// None = 未加入团队,团队功能整体关闭零开销。secret/配对码跟 API key 同级:只存本机不进 git。
     pub team: Option<crate::team::TeamIdentity>,
+
+    // ===== 法院一张网在线立案 =====
+    /// 法院立案 CLI 包根目录(或 python -m court_filing_cli 可用的路径)。
+    /// None = 使用应用内置 standalone/court_filing_cli。
+    pub court_filing_cli_path: Option<String>,
+    /// Python 解释器路径(venv 或系统 python3)。None = 用 "python3"。
+    pub court_filing_python: Option<String>,
+    /// 一张网账号(律师登录 zxfw.court.gov.cn 用)。
+    pub court_filing_account: Option<String>,
+    /// 一张网密码。
+    pub court_filing_password: Option<String>,
+    /// Cookie 存储目录。None = 用默认应用数据目录。
+    pub court_filing_cookie_dir: Option<String>,
 }
 
 impl Settings {

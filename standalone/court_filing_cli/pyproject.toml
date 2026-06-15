@@ -1,0 +1,23 @@
+[project]
+name = "court-filing-cli"
+version = "0.1.0"
+description = "法院「一张网」在线立案 CLI（法穿独立抽取版，不依赖 Django）"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.40",
+    "ddddocr>=1.4",
+    "httpx>=0.27",
+    # gmssl 可选，HTTP 逆向登录用（当前插件不可用，未来启用时取消注释）
+    # "gmssl>=3.2",
+]
+
+[project.scripts]
+court-filing-cli = "court_filing_cli.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-mock"]
+gmssl = ["gmssl>=3.2"]  # SM2 国密 HTTP 逆向登录（可选）
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

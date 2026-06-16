@@ -1,0 +1,4 @@
+interface:
+  display_name: "法院一张网送达"
+  short_description: "解析人民法院在线服务一张网送达短信并下载法院文书PDF文件"
+  default_prompt: "Use $court-zxfw-delivery to parse this court delivery SMS, list the documents, and download them if requested."

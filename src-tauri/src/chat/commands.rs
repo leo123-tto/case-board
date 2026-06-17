@@ -149,17 +149,17 @@ pub async fn case_chat_impl(
     if settings.effective_llm_provider() == "cloud" {
         let backend = settings.effective_cloud_llm_backend();
         // 2026-06-16:按后端取对应 key 字段(DeepSeek / MiniMax / 通用兼容 三选一)。
-        let (key_opt, name): (&Option<String>, &str) = if backend == "minimax" {
-            (&settings.minimax_api_key, "MiniMax")
+        let (key_value, name): (Option<String>, &str) = if backend == "minimax" {
+            (settings.minimax_api_key.clone(), "MiniMax")
         } else if settings.cloud_llm_is_compat() {
             let label = crate::llm::providers::compat_preset(backend)
                 .map(|p| p.label)
                 .unwrap_or("云端 LLM");
-            (&settings.compat_llm_api_key, label)
+            (settings.effective_compat_llm_api_key(), label)
         } else {
-            (&settings.cloud_llm_api_key, "DeepSeek")
+            (settings.cloud_llm_api_key.clone(), "DeepSeek")
         };
-        let key_missing = key_opt.as_deref().map(str::trim).unwrap_or("").is_empty();
+        let key_missing = key_value.as_deref().map(str::trim).unwrap_or("").is_empty();
         if key_missing {
             return Err(format!("尚未配置 {} API Key,请在设置页填入", name));
         }

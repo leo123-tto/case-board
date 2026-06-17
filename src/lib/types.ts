@@ -376,18 +376,31 @@ export interface Settings {
   cloud_llm_model: string | null;
   cloud_llm_api_key: string | null;
   /** 云端 LLM 后端:"deepseek"(默认/null)/ "minimax" / "glm" / "mimo" / "custom"。
-   *  minimax 读 minimax_*;glm/mimo/custom 读 compat_llm_*;其余读 cloud_llm_*。 */
+   *  minimax 读 minimax_*;glm/mimo/custom 读各自独立配置;其余读 cloud_llm_*。 */
   cloud_llm_backend: string | null;
   minimax_api_key: string | null;
   minimax_endpoint: string | null;
   /** MiniMax 模型名(可编辑文本,默认 MiniMax-M2)。型号以 MiniMax 控制台为准。 */
   minimax_model: string | null;
   minimax_verified_at: string | null;
-  /** 2026-06-16:通用 OpenAI 兼容后端(glm/mimo/custom 共用)。完整 chat completions URL / 具体模型名 / key。 */
+  /** 2026-06-16:旧版通用 OpenAI 兼容字段。保留作升级兜底,新 UI 写入下面的独立字段。 */
   compat_llm_endpoint: string | null;
   compat_llm_model: string | null;
   compat_llm_api_key: string | null;
   compat_llm_verified_at: string | null;
+  /** 2026-06-17:智谱 / MiMo / 自定义模型各自独立保存,切换服务商不互相覆盖。 */
+  glm_llm_endpoint: string | null;
+  glm_llm_model: string | null;
+  glm_llm_api_key: string | null;
+  glm_llm_verified_at: string | null;
+  mimo_llm_endpoint: string | null;
+  mimo_llm_model: string | null;
+  mimo_llm_api_key: string | null;
+  mimo_llm_verified_at: string | null;
+  custom_llm_endpoint: string | null;
+  custom_llm_model: string | null;
+  custom_llm_api_key: string | null;
+  custom_llm_verified_at: string | null;
   /** 2026-05-24 k:元典法律开放平台 API key(执行案件查被执行人 / 财产线索)*/
   yuandian_api_key: string | null;
   /** 2026-06-01 V0.3:快递100 实时查询 customer + key(快递查询工具用)*/

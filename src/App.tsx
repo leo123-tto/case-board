@@ -383,15 +383,31 @@ function App() {
       const backend = s.cloud_llm_backend ?? "deepseek";
       const isMinimax = backend === "minimax";
       const isCompat = ["glm", "mimo", "custom"].includes(backend);
+      const compatKey =
+        backend === "glm"
+          ? s.glm_llm_api_key || s.compat_llm_api_key
+          : backend === "mimo"
+            ? s.mimo_llm_api_key || s.compat_llm_api_key
+            : backend === "custom"
+              ? s.custom_llm_api_key || s.compat_llm_api_key
+              : s.compat_llm_api_key;
+      const compatVerifiedAt =
+        backend === "glm"
+          ? s.glm_llm_verified_at || s.compat_llm_verified_at
+          : backend === "mimo"
+            ? s.mimo_llm_verified_at || s.compat_llm_verified_at
+            : backend === "custom"
+              ? s.custom_llm_verified_at || s.compat_llm_verified_at
+              : s.compat_llm_verified_at;
       const filled = isMinimax
         ? !!s.minimax_api_key?.trim()
         : isCompat
-          ? !!s.compat_llm_api_key?.trim()
+          ? !!compatKey?.trim()
           : !!s.cloud_llm_api_key?.trim();
       const verified = isMinimax
         ? !!s.minimax_verified_at
         : isCompat
-          ? !!s.compat_llm_verified_at
+          ? !!compatVerifiedAt
           : !!s.deepseek_verified_at;
       const providerName = isMinimax
         ? "MiniMax"

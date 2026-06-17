@@ -251,6 +251,10 @@ pub fn compat_chat_url(endpoint: &str) -> String {
     }
     if e.ends_with("/chat/completions") {
         e.to_string()
+    } else if e.ends_with("/v1") {
+        format!("{}/chat/completions", e)
+    } else if e.ends_with("/v4") {
+        format!("{}/chat/completions", e)
     } else {
         format!("{}/v1/chat/completions", e)
     }
@@ -309,11 +313,7 @@ impl LlmConfig {
                 let preset =
                     crate::llm::providers::compat_preset(settings.effective_cloud_llm_backend());
                 let raw_endpoint = settings
-                    .compat_llm_endpoint
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
+                    .effective_compat_llm_endpoint()
                     .or_else(|| {
                         preset
                             .map(|p| p.default_endpoint.to_string())
@@ -322,18 +322,14 @@ impl LlmConfig {
                     .unwrap_or_default();
                 let endpoint = compat_chat_url(&raw_endpoint);
                 let model = settings
-                    .compat_llm_model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
+                    .effective_compat_llm_model()
                     .or_else(|| preset.map(|p| p.default_model.to_string()))
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
                 return Self {
                     endpoint,
                     model,
-                    api_key: settings.compat_llm_api_key.clone(),
+                    api_key: settings.effective_compat_llm_api_key(),
                     timeout_secs: 90,
                     temperature: 0.3, // 兼容档可能是推理型,0.0 易死循环 → 同 MiniMax 取 0.3
                 };
@@ -544,4 +540,37 @@ fn extract_json_from_content(content: &str) -> String {
         }
     }
     text.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compat_chat_url;
+
+    #[test]
+    fn compat_chat_url_preserves_full_chat_urls() {
+        assert_eq!(
+            compat_chat_url("https://open.bigmodel.cn/api/paas/v4/chat/completions"),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            compat_chat_url("https://token-plan-cn.xiaomimimo.com/v1/chat/completions"),
+            "https://token-plan-cn.xiaomimimo.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn compat_chat_url_adds_standard_chat_path_to_base_url() {
+        assert_eq!(
+            compat_chat_url("https://api.openai.com"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            compat_chat_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            compat_chat_url("https://open.bigmodel.cn/api/coding/paas/v4"),
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+        );
+    }
 }

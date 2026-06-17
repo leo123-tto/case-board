@@ -110,12 +110,14 @@ pub struct Settings {
     pub minimax_verified_at: Option<String>,
 
     /// 2026-06-16:通用 OpenAI 兼容云端 LLM 后端(智谱 GLM / 小米 MiMo / 自定义)。
-    /// `cloud_llm_backend` 取 `"glm"` / `"mimo"` / `"custom"` 时改读下面这组 `compat_llm_*`。
+    /// `cloud_llm_backend` 取 `"glm"` / `"mimo"` / `"custom"` 时读对应服务商的独立配置。
     /// **纯增量调和**:DeepSeek(`cloud_llm_*`+档位)/ MiniMax(`minimax_*`+v2 协议)两条老路完全不动;
     /// 这条走标准 `/v1/chat/completions`,模型名是用户**显式填的具体型号**(不套 DeepSeek 的 flash/pro 档位,
-    /// 同 MiniMax 处理)。glm/mimo/custom 共用这一组字段(同一时刻只激活一个后端)——
-    /// 切换具体服务商时前端会重填 endpoint/model 并清空 key+verified(各家 key 不通用)。
+    /// 同 MiniMax 处理)。glm/mimo/custom 的 key/endpoint/model 分开保存,切换服务商不会互相覆盖。
     /// 预设默认值见 `llm::providers`。
+    ///
+    /// 旧版 `compat_llm_*` 作为兼容字段保留:读当前后端时,如果新字段为空,会 fallback 到旧字段,
+    /// 这样用户已经填过的配置不会因升级丢失。
     pub compat_llm_endpoint: Option<String>,
     /// 通用兼容后端模型名(具体型号,如 `glm-4.6`;自由文本,以服务商控制台为准)。
     pub compat_llm_model: Option<String>,
@@ -123,6 +125,24 @@ pub struct Settings {
     pub compat_llm_api_key: Option<String>,
     /// 通用兼容后端 key 验证通过时间(坑#11)。
     pub compat_llm_verified_at: Option<String>,
+
+    /// 智谱 GLM 独立配置(OpenAI-compatible chat completions)。
+    pub glm_llm_endpoint: Option<String>,
+    pub glm_llm_model: Option<String>,
+    pub glm_llm_api_key: Option<String>,
+    pub glm_llm_verified_at: Option<String>,
+
+    /// 小米 MiMo 独立配置(OpenAI-compatible chat completions)。
+    pub mimo_llm_endpoint: Option<String>,
+    pub mimo_llm_model: Option<String>,
+    pub mimo_llm_api_key: Option<String>,
+    pub mimo_llm_verified_at: Option<String>,
+
+    /// 自定义 OpenAI 兼容模型独立配置。
+    pub custom_llm_endpoint: Option<String>,
+    pub custom_llm_model: Option<String>,
+    pub custom_llm_api_key: Option<String>,
+    pub custom_llm_verified_at: Option<String>,
 
     /// 2026-05-24 k:元典法律开放平台 API key — 执行案件查被执行人 / 失信 / 财产线索 用
     /// 申请:https://open.chineselaw.com/
@@ -264,6 +284,47 @@ impl Settings {
             self.effective_cloud_llm_backend(),
             "glm" | "mimo" | "custom"
         )
+    }
+
+    fn clean_string(value: &Option<String>) -> Option<String> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// 当前兼容后端的 endpoint。新字段优先,旧版 compat_llm_* 兜底。
+    pub fn effective_compat_llm_endpoint(&self) -> Option<String> {
+        let current = match self.effective_cloud_llm_backend() {
+            "glm" => Self::clean_string(&self.glm_llm_endpoint),
+            "mimo" => Self::clean_string(&self.mimo_llm_endpoint),
+            "custom" => Self::clean_string(&self.custom_llm_endpoint),
+            _ => None,
+        };
+        current.or_else(|| Self::clean_string(&self.compat_llm_endpoint))
+    }
+
+    /// 当前兼容后端的模型名。新字段优先,旧版 compat_llm_* 兜底。
+    pub fn effective_compat_llm_model(&self) -> Option<String> {
+        let current = match self.effective_cloud_llm_backend() {
+            "glm" => Self::clean_string(&self.glm_llm_model),
+            "mimo" => Self::clean_string(&self.mimo_llm_model),
+            "custom" => Self::clean_string(&self.custom_llm_model),
+            _ => None,
+        };
+        current.or_else(|| Self::clean_string(&self.compat_llm_model))
+    }
+
+    /// 当前兼容后端的 API key。新字段优先,旧版 compat_llm_* 兜底。
+    pub fn effective_compat_llm_api_key(&self) -> Option<String> {
+        let current = match self.effective_cloud_llm_backend() {
+            "glm" => Self::clean_string(&self.glm_llm_api_key),
+            "mimo" => Self::clean_string(&self.mimo_llm_api_key),
+            "custom" => Self::clean_string(&self.custom_llm_api_key),
+            _ => None,
+        };
+        current.or_else(|| Self::clean_string(&self.compat_llm_api_key))
     }
 
     /// 云端 OCR 主力(2026-06-12)。`"paddle-vl"` 仅当用户显式选择**且** key 已填才生效,

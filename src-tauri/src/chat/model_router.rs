@@ -118,11 +118,7 @@ pub fn route_model(task: TaskType, user_message: &str, settings: &Settings) -> M
     if settings.cloud_llm_is_compat() {
         let backend = settings.effective_cloud_llm_backend();
         let model = settings
-            .compat_llm_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+            .effective_compat_llm_model()
             .or_else(|| {
                 crate::llm::providers::compat_preset(backend)
                     .map(|p| p.default_model.to_string())

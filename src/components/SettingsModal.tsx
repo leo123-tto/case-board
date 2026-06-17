@@ -61,6 +61,21 @@ import { FEATURE_FLAGS, useFeatureFlag } from "@/lib/featureFlags";
 import { FONT_SCALE, useFontScale } from "@/lib/uiScale";
 
 type VerifyStatus = "idle" | "verifying" | "ok" | "fail";
+type CompatBackend = "glm" | "mimo" | "custom";
+type CompatSettingKey =
+  | "glm_llm_endpoint"
+  | "glm_llm_model"
+  | "glm_llm_api_key"
+  | "glm_llm_verified_at"
+  | "mimo_llm_endpoint"
+  | "mimo_llm_model"
+  | "mimo_llm_api_key"
+  | "mimo_llm_verified_at"
+  | "custom_llm_endpoint"
+  | "custom_llm_model"
+  | "custom_llm_api_key"
+  | "custom_llm_verified_at";
+type CompatFieldKind = "endpoint" | "model" | "apiKey" | "verifiedAt";
 
 /** 云端 AI 后端可选项(下拉)。glm/mimo/custom 共用「通用 OpenAI 兼容」配置(compat_llm_*)。 */
 const CLOUD_BACKEND_OPTIONS = [
@@ -73,7 +88,7 @@ const CLOUD_BACKEND_OPTIONS = [
 
 /** OpenAI 兼容后端预设(镜像 Rust llm::providers;切换时预填到 compat_llm_*,均可改)。 */
 const COMPAT_PRESETS: Record<
-  string,
+  CompatBackend,
   { label: string; endpoint: string; model: string; applyUrl?: string }
 > = {
   glm: {
@@ -89,6 +104,81 @@ const COMPAT_PRESETS: Record<
   },
   custom: { label: "自定义(OpenAI 兼容)", endpoint: "", model: "" },
 };
+
+const COMPAT_FIELD_KEYS: Record<
+  CompatBackend,
+  {
+    endpoint: CompatSettingKey;
+    model: CompatSettingKey;
+    apiKey: CompatSettingKey;
+    verifiedAt: CompatSettingKey;
+  }
+> = {
+  glm: {
+    endpoint: "glm_llm_endpoint",
+    model: "glm_llm_model",
+    apiKey: "glm_llm_api_key",
+    verifiedAt: "glm_llm_verified_at",
+  },
+  mimo: {
+    endpoint: "mimo_llm_endpoint",
+    model: "mimo_llm_model",
+    apiKey: "mimo_llm_api_key",
+    verifiedAt: "mimo_llm_verified_at",
+  },
+  custom: {
+    endpoint: "custom_llm_endpoint",
+    model: "custom_llm_model",
+    apiKey: "custom_llm_api_key",
+    verifiedAt: "custom_llm_verified_at",
+  },
+};
+
+function isCompatBackend(value: string | null | undefined): value is CompatBackend {
+  return value === "glm" || value === "mimo" || value === "custom";
+}
+
+function compatValue(
+  settings: Settings,
+  backend: CompatBackend,
+  kind: CompatFieldKind,
+): string | null {
+  const key = COMPAT_FIELD_KEYS[backend][kind];
+  const value = settings[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function legacyCompatValue(
+  settings: Settings,
+  kind: CompatFieldKind,
+): string | null {
+  const key =
+    kind === "apiKey"
+      ? "compat_llm_api_key"
+      : kind === "verifiedAt"
+        ? "compat_llm_verified_at"
+        : kind === "model"
+          ? "compat_llm_model"
+          : "compat_llm_endpoint";
+  const value = settings[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function effectiveCompatValue(
+  settings: Settings,
+  backend: CompatBackend,
+  kind: CompatFieldKind,
+): string | null {
+  return compatValue(settings, backend, kind) || legacyCompatValue(settings, kind);
+}
+
+function setStringSetting(
+  target: Partial<Settings>,
+  key: CompatSettingKey,
+  value: string | null,
+) {
+  target[key] = value as never;
+}
 
 /** 设置页底部标签页(按类型归拢散乱配置;详见 docs/设置页重构-分类方案-2026-06-16.md) */
 export type SettingsTab =
@@ -193,7 +283,13 @@ export function SettingsModal({
     if (settings.minimax_verified_at && minimaxStatus === "idle") {
       setMinimaxStatus("ok");
     }
-    if (settings.compat_llm_verified_at && compatStatus === "idle") {
+    const backend = isCompatBackend(settings.cloud_llm_backend)
+      ? settings.cloud_llm_backend
+      : null;
+    const compatVerifiedAt = backend
+      ? effectiveCompatValue(settings, backend, "verifiedAt")
+      : null;
+    if (compatVerifiedAt && compatStatus === "idle") {
       setCompatStatus("ok");
     }
     if (settings.yuandian_verified_at && yuandianStatus === "idle") {
@@ -209,7 +305,11 @@ export function SettingsModal({
     settings?.paddle_vl_verified_at,
     settings?.deepseek_verified_at,
     settings?.minimax_verified_at,
+    settings?.cloud_llm_backend,
     settings?.compat_llm_verified_at,
+    settings?.glm_llm_verified_at,
+    settings?.mimo_llm_verified_at,
+    settings?.custom_llm_verified_at,
     settings?.yuandian_verified_at,
   ]);
 
@@ -324,7 +424,12 @@ export function SettingsModal({
   }
 
   async function handleVerifyCompat() {
-    if (!settings?.compat_llm_api_key?.trim()) {
+    if (!settings || !isCompatBackend(settings.cloud_llm_backend)) return;
+    const keys = COMPAT_FIELD_KEYS[settings.cloud_llm_backend];
+    const apiKey = effectiveCompatValue(settings, settings.cloud_llm_backend, "apiKey") || "";
+    const endpoint = effectiveCompatValue(settings, settings.cloud_llm_backend, "endpoint") || "";
+    const model = effectiveCompatValue(settings, settings.cloud_llm_backend, "model") || "";
+    if (!apiKey.trim()) {
       setCompatStatus("fail");
       setCompatMsg("请先填入 API Key");
       return;
@@ -333,23 +438,23 @@ export function SettingsModal({
     setCompatMsg("");
     try {
       const r = await verifyOpenAICompatKey(
-        settings.compat_llm_api_key,
-        settings.compat_llm_endpoint ?? "",
-        settings.compat_llm_model ?? "",
+        apiKey,
+        endpoint,
+        model,
       );
       if (r.ok) {
         setCompatStatus("ok");
         setCompatMsg("");
-        updateField("compat_llm_verified_at", new Date().toISOString());
+        updateField(keys.verifiedAt, new Date().toISOString());
       } else {
         setCompatStatus("fail");
         setCompatMsg(r.message);
-        updateField("compat_llm_verified_at", null);
+        updateField(keys.verifiedAt, null);
       }
     } catch (e) {
       setCompatStatus("fail");
       setCompatMsg(String(e));
-      updateField("compat_llm_verified_at", null);
+      updateField(keys.verifiedAt, null);
     }
   }
 
@@ -359,16 +464,17 @@ export function SettingsModal({
       updateField("cloud_llm_backend", "minimax");
       return;
     }
-    const preset = COMPAT_PRESETS[value];
-    if (preset) {
-      // 切到通用兼容服务商:预填 endpoint/model,清空 key + 验证态(各家 key 不通用)
-      updateFields({
-        cloud_llm_backend: value,
-        compat_llm_endpoint: preset.endpoint || null,
-        compat_llm_model: preset.model || null,
-        compat_llm_api_key: null,
-        compat_llm_verified_at: null,
-      });
+    if (isCompatBackend(value)) {
+      const preset = COMPAT_PRESETS[value];
+      const keys = COMPAT_FIELD_KEYS[value];
+      const patch: Partial<Settings> = { cloud_llm_backend: value };
+      if (!settings || !effectiveCompatValue(settings, value, "endpoint")) {
+        setStringSetting(patch, keys.endpoint, preset.endpoint || null);
+      }
+      if (!settings || !effectiveCompatValue(settings, value, "model")) {
+        setStringSetting(patch, keys.model, preset.model || null);
+      }
+      updateFields(patch);
       setCompatStatus("idle");
       setCompatMsg("");
       return;
@@ -465,7 +571,7 @@ export function SettingsModal({
     setSaving(true);
     setError(null);
     try {
-      await saveSettings(settings);
+      await saveSettings(prepareSettingsForSave(settings));
       setDirty(false);
       // 2026-05-27 · 两种模式都要通知父组件 settings 已经变了,父组件据此重判依赖项
       // (如 DeepSeek 余额 chip 是否显示)。修复同事场景:onboarding 选"稍后再配置"
@@ -497,6 +603,34 @@ export function SettingsModal({
   function updateFields(patch: Partial<Settings>) {
     setSettings((prev) => (prev ? { ...prev, ...patch } : prev));
     setDirty(true);
+  }
+
+  function prepareSettingsForSave(current: Settings): Settings {
+    if (!isCompatBackend(current.cloud_llm_backend)) return current;
+    const backend = current.cloud_llm_backend;
+    const keys = COMPAT_FIELD_KEYS[backend];
+    const next: Settings = { ...current };
+    if (!compatValue(next, backend, "endpoint")) {
+      setStringSetting(
+        next,
+        keys.endpoint,
+        legacyCompatValue(current, "endpoint") || COMPAT_PRESETS[backend].endpoint || null,
+      );
+    }
+    if (!compatValue(next, backend, "model")) {
+      setStringSetting(
+        next,
+        keys.model,
+        legacyCompatValue(current, "model") || COMPAT_PRESETS[backend].model || null,
+      );
+    }
+    if (!compatValue(next, backend, "apiKey")) {
+      setStringSetting(next, keys.apiKey, legacyCompatValue(current, "apiKey"));
+    }
+    if (!compatValue(next, backend, "verifiedAt")) {
+      setStringSetting(next, keys.verifiedAt, legacyCompatValue(current, "verifiedAt"));
+    }
+    return next;
   }
 
   // page 模式:没有蒙层,卡片直接占主区域,scroll 由父容器管;不带 X 按钮
@@ -919,9 +1053,8 @@ export function SettingsModal({
                         ))}
                       </select>
                       <p className="mt-1 text-label text-muted-foreground">
-                        切换后下面只显示所选后端的配置。DeepSeek / MiniMax 的 Key
-                        各自独立保存;GLM / MiMo / 自定义共用一组「OpenAI
-                        兼容」配置,换服务商会重填地址/模型并清空 Key(各家 Key 不通用)。
+                        切换后下面只显示所选后端的配置。DeepSeek、MiniMax、GLM、MiMo、自定义模型
+                        都各自独立保存,切换服务商不会互相覆盖。
                       </p>
                     </Field>
                   </Section>
@@ -1101,14 +1234,25 @@ export function SettingsModal({
                     settings.cloud_llm_backend ?? "",
                   ) &&
                     (() => {
-                      const cur = settings.cloud_llm_backend ?? "custom";
-                      const preset = COMPAT_PRESETS[cur] ?? COMPAT_PRESETS.custom;
+                      const cur = isCompatBackend(settings.cloud_llm_backend)
+                        ? settings.cloud_llm_backend
+                        : "custom";
+                      const preset = COMPAT_PRESETS[cur];
+                      const keys = COMPAT_FIELD_KEYS[cur];
+                      const apiKey = effectiveCompatValue(settings, cur, "apiKey") ?? "";
+                      const model = effectiveCompatValue(settings, cur, "model") ?? "";
+                      const endpoint =
+                        effectiveCompatValue(settings, cur, "endpoint") ??
+                        preset.endpoint;
                       // 改 key/模型/地址 → 清验证态(坑#11:改了要重验)
                       const onConfigChange = () => {
                         if (compatStatus !== "idle") {
                           setCompatStatus("idle");
                           setCompatMsg("");
-                          updateField("compat_llm_verified_at", null);
+                          updateField(
+                            keys.verifiedAt,
+                            null,
+                          );
                         }
                       };
                       return (
@@ -1128,10 +1272,10 @@ export function SettingsModal({
                             <div className="flex items-center gap-2">
                               <input
                                 type="password"
-                                value={settings.compat_llm_api_key ?? ""}
+                                value={apiKey}
                                 onChange={(e) => {
                                   updateField(
-                                    "compat_llm_api_key",
+                                    keys.apiKey,
                                     e.target.value || null,
                                   );
                                   onConfigChange();
@@ -1149,7 +1293,7 @@ export function SettingsModal({
                                 onClick={handleVerifyCompat}
                                 disabled={
                                   compatStatus === "verifying" ||
-                                  !settings.compat_llm_api_key?.trim()
+                                  !apiKey.trim()
                                 }
                               >
                                 {compatStatus === "verifying" ? (
@@ -1176,10 +1320,10 @@ export function SettingsModal({
                           >
                             <input
                               type="text"
-                              value={settings.compat_llm_model ?? ""}
+                              value={model}
                               onChange={(e) => {
                                 updateField(
-                                  "compat_llm_model",
+                                  keys.model,
                                   e.target.value || null,
                                 );
                                 onConfigChange();
@@ -1195,10 +1339,10 @@ export function SettingsModal({
                           >
                             <input
                               type="text"
-                              value={settings.compat_llm_endpoint ?? ""}
+                              value={endpoint}
                               onChange={(e) => {
                                 updateField(
-                                  "compat_llm_endpoint",
+                                  keys.endpoint,
                                   e.target.value || null,
                                 );
                                 onConfigChange();

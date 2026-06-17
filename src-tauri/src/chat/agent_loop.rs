@@ -417,7 +417,8 @@ pub async fn run_chat_with_tools(
     let mut m_completion = 0u64;
     let mut m_cache_hit = 0u64;
     let mut m_cache_miss = 0u64;
-    let endpoint = beta_endpoint(&config.endpoint);
+    let is_compat = ctx.settings.cloud_llm_is_compat();
+    let endpoint = beta_endpoint(&config.endpoint, is_compat);
 
     // V0.2 D5:hook chain + session 统计共享
     let session = Arc::new(RwLock::new(SessionStats::default()));
@@ -1055,7 +1056,15 @@ fn build_initial_messages(req: &AgentLoopRequest) -> Vec<ApiMessage> {
 /// 把用户在 Settings 填的 cloud_llm_endpoint 自动补到 `/beta/chat/completions`(支持工具调用)。
 /// 已经以 `/beta/chat/completions` / `/v1/chat/completions` 结尾的不动 — 前者直接用,后者
 /// V0.2 chat 切到 beta(老 stream::run_chat 仍走 v1)。
-fn beta_endpoint(current: &str) -> String {
+///
+/// 2026-06-16:兼容后端(glm/mimo/custom/OpenRouter 等)不走 beta 路径(它们不支持)。
+/// 只有 DeepSeek 等原生支持 beta 端点的后端才自动转换。
+fn beta_endpoint(current: &str, is_compat_backend: bool) -> String {
+    // 2026-06-16: 兼容后端不走 beta 路径(它们不支持),原样返回
+    if is_compat_backend {
+        return current.to_string();
+    }
+
     // 2026-06-15:MiniMax 自有协议路径(/v1/text/chatcompletion_v2)就是工具调用路径,
     // **绝不能**再加 /beta 后缀(会 404)。原样返回。
     if current.contains("chatcompletion_v2") {

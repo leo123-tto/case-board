@@ -28,6 +28,7 @@ import type { InterestPrefill } from "@/modules/tools/calculators/InterestCalcul
 import { TeamModule } from "@/modules/team/TeamModule";
 import { ExecutionModule } from "@/modules/execution";
 import { CaseView } from "@/modules/litigation/components/CaseView";
+import { ChatStandaloneWindow } from "@/modules/litigation/components/chat/ChatStandaloneWindow";
 import { EmptyState } from "@/modules/litigation/components/EmptyState";
 import { ProgressBanner } from "@/modules/litigation/components/ProgressBanner";
 import { confirmDialog } from "@/lib/dialog";
@@ -57,7 +58,40 @@ import {
 } from "@/lib/types";
 import { SplitImportDialog } from "@/components/SplitImportDialog";
 
+function readChatWindowParams(): {
+  caseId: string | null;
+  caseName: string | null;
+  domain: "civil" | "criminal";
+} | null {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("window") !== "chat") return null;
+    return {
+      caseId: params.get("caseId"),
+      caseName: params.get("caseName"),
+      domain: params.get("domain") === "criminal" ? "criminal" : "civil",
+    };
+  } catch {
+    return null;
+  }
+}
+
 function App() {
+  const chatWin = readChatWindowParams();
+  if (chatWin) {
+    return (
+      <ChatStandaloneWindow
+        caseId={chatWin.caseId}
+        caseName={chatWin.caseName}
+        domain={chatWin.domain}
+      />
+    );
+  }
+
+  return <MainApp />;
+}
+
+function MainApp() {
   /** 全部已入库案件(按 updated_at 倒序) */
   const [cases, setCases] = useState<Case[]>([]);
   /** 当前选中案件 ID */

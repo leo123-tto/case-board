@@ -4407,6 +4407,70 @@ async fn case_chat(
     chat::case_chat_impl(app, pool.inner(), registry.inner(), input).await
 }
 
+/// 打开独立的案件 AI 助手窗口,与主窗口共享同一份本地聊天记录。
+/// 同一 caseId 已打开时直接聚焦,避免重复窗口。
+#[tauri::command]
+fn open_chat_window(
+    app: tauri::AppHandle,
+    case_id: String,
+    case_name: Option<String>,
+    domain: Option<String>,
+) -> Result<(), String> {
+    let label = format!("chat-{}", case_id);
+    if let Some(win) = app.get_webview_window(&label) {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+
+    let qs = format!(
+        "?window=chat&caseId={}&caseName={}&domain={}",
+        url_encode(&case_id),
+        case_name.as_deref().map(url_encode).unwrap_or_default(),
+        url_encode(domain.as_deref().unwrap_or("civil")),
+    );
+    let url = tauri::WebviewUrl::App(format!("index.html{}", qs).into());
+    let title = match &case_name {
+        Some(name) => format!("案件 AI 助手 · {}", name),
+        None => "案件 AI 助手".to_string(),
+    };
+
+    let win = tauri::WebviewWindowBuilder::new(&app, label, url)
+        .title(title)
+        .inner_size(600.0, 780.0)
+        .min_inner_size(420.0, 500.0)
+        .resizable(true)
+        .focused(true)
+        .center()
+        .build()
+        .map_err(|e| format!("打开助手窗口失败: {}", e))?;
+    let app_for_close = app.clone();
+    let case_id_for_close = case_id.clone();
+    win.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            let _ = app_for_close.emit_to(
+                "main",
+                "caseboard:chat-window-closed",
+                serde_json::json!({ "caseId": case_id_for_close }),
+            );
+        }
+    });
+    Ok(())
+}
+
+/// 简易 URL 百分号编码(query 用):保留 `A-Za-z0-9-_.~`,其余字节 `%HH`。
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 /// 取案件聊天历史(升序,前端直接渲染)。
 #[tauri::command]
 async fn list_chat_history(
@@ -5418,6 +5482,7 @@ pub fn run() {
             contract_draft::delete_contract_preference,
             save_editor_doc,
             case_chat,
+            open_chat_window,
             list_chat_history,
             cancel_chat,
             clear_chat_history,

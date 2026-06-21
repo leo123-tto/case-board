@@ -627,6 +627,16 @@ function App() {
       setViewerDoc(doc);
       return;
     }
+    const isOfficeDoc =
+      /\.(docx?|rtf|odt)$/i.test(doc.filename) ||
+      /wordprocessingml|msword|opendocument\.text|rtf/i.test(doc.mime_type ?? "");
+    if (isOfficeDoc) {
+      openInDefaultApp(doc.source_path).catch((e) => {
+        console.warn("open_in_default_app failed", e);
+        setError(String(e));
+      });
+      return;
+    }
     // 2026-05-31 · 抽取成功的文件(PDF/扫描件/docx 等)点击优先看「处理后的文本(MD)」
     // —— 这正是 AI 实际读到的内容,也方便核对抽取质量;原件仍可用行尾「在 Finder 打开」。
     // 见下方 MarkdownModal 的 previewExtractedPath 逻辑。
@@ -635,9 +645,9 @@ function App() {
     // App 内预览能力覆盖的文件类型:
     //   .md/.markdown/.txt   → react-markdown
     //   .html/.htm           → iframe sandbox
-    //   .docx/.doc/.rtf/.odt → macOS textutil 抽纯文本
+    //   .docx/.doc/.rtf/.odt → 上面已交给系统默认应用
     // 其他(.pdf/.png/...)原本走系统默认应用;现在抽取成功的也能 App 内看处理后文本。
-    const isPreviewable = /\.(md|markdown|html?|txt|docx?|rtf|odt)$/i.test(
+    const isPreviewable = /\.(md|markdown|html?|txt)$/i.test(
       doc.filename,
     );
     if (hasExtracted || isPreviewable) {
@@ -881,7 +891,12 @@ function App() {
         setDocuments(r.documents);
         if (docId) {
           const target = r.documents.find((d) => d.id === docId);
-          if (target) setEditingDoc(target);
+          if (
+            target &&
+            (target.source === "chat_artifact" || target.source === "chat")
+          ) {
+            setEditingDoc(target);
+          }
         }
       } catch {
         /* 不阻塞 */

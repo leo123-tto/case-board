@@ -28,6 +28,7 @@ type TabIcon = ComponentType<{ className?: string }>;
 
 export type ModuleId =
   | "litigation"
+  | "element_trial"
   | "criminal"
   | "execution"
   | "transaction"
@@ -39,6 +40,8 @@ export type ModuleId =
 // 2026-05-25 V0.1.8 · 加「设置」tab(工具之后),作者反馈:别人找不到右上角齿轮
 const MODULES: { id: string; label: string; icon: TabIcon; beta?: boolean }[] = [
   { id: "litigation", label: "诉讼", icon: Briefcase },
+  // 2026-06-22 · 要素式审判智能辅助:诉状生成/要件分析/攻防策略
+  { id: "element_trial", label: "要素审判", icon: Scale, beta: true },
   // 2026-06-17 · 加「刑事」tab(诉讼之后):复刻诉讼看板框架,只显示刑事案件,
   // AI 助手只保留「刑事深度分析」单 chip(三阶层鉴定式,借鉴游初 gutachten-criminal-case)。
   // 2026-06-18 · 标 Beta(尚在打磨,结果需自行核对)。

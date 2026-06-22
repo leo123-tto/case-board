@@ -4,6 +4,7 @@ pub mod contract_review;
 pub mod court_filing_env;
 pub mod court_sms;
 pub mod db;
+pub mod element_trial;
 pub mod deepseek;
 pub mod diagnostic_log;
 pub mod doc_search;
@@ -5174,6 +5175,75 @@ async fn verify_embedding_key(
 }
 
 // ============================================================================
+// 要素式审判智能辅助 Tauri Commands
+// ============================================================================
+
+#[tauri::command]
+async fn get_element_templates(
+    pool: tauri::State<'_, SqlitePool>,
+    cause: String,
+    direction: Option<String>,
+) -> Result<Vec<element_trial::ElementTemplate>, String> {
+    let dir = direction.as_deref();
+    element_trial::get_templates(pool.inner(), &cause, dir).await
+}
+
+#[tauri::command]
+async fn list_template_causes(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<String>, String> {
+    element_trial::list_template_causes(pool.inner()).await
+}
+
+#[tauri::command]
+async fn get_element_facts(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<element_trial::ElementFact>, String> {
+    element_trial::get_element_facts(pool.inner(), &case_id).await
+}
+
+#[tauri::command]
+async fn get_disputed_facts(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<element_trial::ElementFact>, String> {
+    element_trial::get_disputed_facts(pool.inner(), &case_id).await
+}
+
+#[tauri::command]
+async fn get_trial_strategies(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<element_trial::TrialStrategy>, String> {
+    element_trial::get_strategies(pool.inner(), &case_id).await
+}
+
+#[tauri::command]
+async fn upsert_element_facts(
+    pool: tauri::State<'_, SqlitePool>,
+    facts: Vec<element_trial::ElementFact>,
+) -> Result<(), String> {
+    element_trial::upsert_element_facts(pool.inner(), &facts).await
+}
+
+#[tauri::command]
+async fn save_trial_strategy(
+    pool: tauri::State<'_, SqlitePool>,
+    strategy: element_trial::TrialStrategy,
+) -> Result<(), String> {
+    element_trial::save_strategy(pool.inner(), &strategy).await
+}
+
+#[tauri::command]
+async fn get_element_complaints(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<element_trial::ElementComplaint>, String> {
+    element_trial::get_complaints(pool.inner(), &case_id).await
+}
+
+// ============================================================================
 // 测试
 // ============================================================================
 
@@ -5398,6 +5468,15 @@ pub fn run() {
             export_md_html,
             export_md_docx,
             export_filing_docx,
+            // 要素式审判智能辅助
+            get_element_templates,
+            list_template_causes,
+            get_element_facts,
+            get_disputed_facts,
+            get_trial_strategies,
+            upsert_element_facts,
+            save_trial_strategy,
+            get_element_complaints,
             // 合同审查(非诉 tab)
             contract_review::review_contract_docx,
             contract_review::convert_doc_to_docx,

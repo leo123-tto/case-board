@@ -27,6 +27,7 @@ import { ToolsModule } from "@/modules/tools";
 import type { InterestPrefill } from "@/modules/tools/calculators/InterestCalculator";
 import { TeamModule } from "@/modules/team/TeamModule";
 import { ExecutionModule } from "@/modules/execution";
+import { ElementTrialModule } from "@/modules/element_trial/ElementTrialModule";
 import { CaseView } from "@/modules/litigation/components/CaseView";
 import { EmptyState } from "@/modules/litigation/components/EmptyState";
 import { ProgressBanner } from "@/modules/litigation/components/ProgressBanner";
@@ -1074,6 +1075,9 @@ function App() {
       {/* 模块内容区(flex-1 + min-h-0 让子模块能正常滚动) */}
       <div className="min-h-0 flex-1">
         {activeModule === "litigation" && litigationBody}
+        {activeModule === "element_trial" && (
+          <ElementTrialModule selectedCase={selectedCase ?? null} />
+        )}
         {activeModule === "criminal" && criminalBody}
         {activeModule === "execution" && (
           <ExecutionModule

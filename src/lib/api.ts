@@ -8,6 +8,11 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import type {
+  ElementDocumentType,
+  ElementDraft,
+  SavedElementDocument,
+} from "./types";
 
 import type {
   Case,
@@ -1920,4 +1925,64 @@ export function listContractPreferences(): Promise<ContractPreference[]> {
 /** 删除一条起草偏好。 */
 export function deleteContractPreference(id: string): Promise<number> {
   return invoke<number>("delete_contract_preference", { id });
+}
+
+/* ------------------------------------------------------------------ */
+/* 要素式文书                                                        */
+/* ------------------------------------------------------------------ */
+
+export function listElementDocumentTypes(): Promise<ElementDocumentType[]> {
+  return invoke<ElementDocumentType[]>("list_element_document_types");
+}
+
+export function generateElementDocument(
+  sourcePath: string,
+  extractedTextPath: string | null,
+  templateId: string,
+): Promise<ElementDraft> {
+  return invoke<ElementDraft>("generate_element_document", {
+    sourcePath,
+    extractedTextPath,
+    templateId,
+  });
+}
+
+export function saveElementDocument(
+  caseId: string,
+  templateId: string,
+  title: string,
+  fields: ElementDraft["fields"],
+): Promise<SavedElementDocument> {
+  return invoke<SavedElementDocument>("save_element_document", {
+    caseId,
+    templateId,
+    title,
+    fields,
+  });
+}
+
+export function exportElementDocument(
+  templateId: string,
+  title: string,
+  fields: ElementDraft["fields"],
+  savePath: string,
+): Promise<string> {
+  return invoke<string>("export_element_document", { templateId, title, fields, savePath });
+}
+
+export function saveExternalElementDocument(
+  caseId: string,
+  filename: string,
+  dataBase64: string,
+): Promise<SavedElementDocument> {
+  return invoke<SavedElementDocument>("save_external_element_document", {
+    caseId,
+    filename,
+    dataBase64,
+  });
+}
+
+/** 工具页(无案件):把外部转换的 base64 docx 写到用户选择的路径(由 Rust 写,绕过前端 fs scope)。 */
+export function saveElementDocxToPath(savePath: string, dataBase64: string): Promise<string> {
+  return invoke<string>("save_element_docx_to_path", { savePath, dataBase64 });
 }

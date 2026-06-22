@@ -947,3 +947,61 @@ export type DocOcrStatusEvent = Extract<
   ProgressEvent,
   { stage: "doc_ocr_status" }
 >;
+
+/* ------------------------------------------------------------------ */
+/* 要素式文书                                                        */
+/* ------------------------------------------------------------------ */
+
+export interface ElementFieldDefinition {
+  key: string;
+  label: string;
+  required: boolean;
+}
+
+export interface ElementDocumentType {
+  id: string;
+  name: string;
+  category: string;
+  quality_level: "refined" | "review_required";
+  template_version: string;
+  fields: ElementFieldDefinition[];
+}
+
+export interface ElementFieldValue {
+  key: string;
+  label: string;
+  value: string;
+  evidence: string;
+  confidence: number;
+  required: boolean;
+}
+
+export interface ElementDraft {
+  template_id: string;
+  document_type: string;
+  title: string;
+  quality_level: string;
+  template_version: string;
+  fields: ElementFieldValue[];
+  missing_required: string[];
+  input_truncated: boolean;
+  processor_notice: string;
+}
+
+export interface ExternalElementResult {
+  filename: string;
+  data_base64: string;
+  preview_text: string;
+}
+
+export interface SavedElementDocument {
+  doc_id: string;
+  path: string;
+}
+
+export interface ElementConvertProgress {
+  stage: "auth" | "upload" | "convert" | "generate" | "download" | "done" | "error";
+  message: string;
+  percent: number;
+  elapsed_ms: number;
+}

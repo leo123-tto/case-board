@@ -593,6 +593,35 @@ fn llm_backend_label(cfg: &llm::LlmConfig) -> String {
 /// 直接 await 即可。本机 vision sync 调用由 ocr.rs 内部 spawn_blocking 包好。
 /// 2026-06-12 改:返回 `(text, backend)` —— 云端有主/备自动切换后,实际用的
 /// 后端可能不是主力,metric 必须记真实那家。
+pub async fn extract_text_for_element_conversion(
+    path: &Path,
+    filename: &str,
+    ocr_ctx: &OcrContext,
+) -> Result<String, String> {
+    let kind = text_extraction_kind(filename);
+    if matches!(kind, TextKind::Unsupported) {
+        return Err("仅支持 .docx、.doc 和 .pdf 格式".into());
+    }
+
+    let text = match extract_text(path, kind) {
+        Ok((text, _)) => text,
+        Err(error) if error == "__NEEDS_OCR__" => {
+            ocr_fallback(path.to_path_buf(), ocr_ctx.clone()).await?.0
+        }
+        Err(error) => return Err(error),
+    };
+    if text.trim().chars().count() < 30 {
+        return Err("文书可识别文字太少，无法进行要素化".into());
+    }
+    Ok(text)
+}
+
+/// 用 OCR 后端兜底抽文本,失败返回真错。
+///
+/// 2026-05-25 V0.1.10 改:`extract_with_ocr` 变成 async(MinerU 切到 HTTP 客户端),
+/// 直接 await 即可。本机 vision sync 调用由 ocr.rs 内部 spawn_blocking 包好。
+/// 2026-06-12 改:返回 `(text, backend)` —— 云端有主/备自动切换后,实际用的
+/// 后端可能不是主力,metric 必须记真实那家。
 async fn ocr_fallback(path: PathBuf, ctx: OcrContext) -> Result<(String, &'static str), String> {
     match ocr::extract_with_ocr(&path, &ctx).await {
         ocr::OcrResult::Ok { text, backend, .. } => Ok((text, backend)),

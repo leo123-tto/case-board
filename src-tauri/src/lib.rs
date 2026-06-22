@@ -9,6 +9,7 @@ pub mod diagnostic_log;
 pub mod doc_search;
 pub mod docx_extract;
 pub mod docx_filing;
+pub mod element_convert;
 pub mod embedding;
 pub mod export;
 pub mod express;
@@ -38,6 +39,7 @@ use tauri::{path::BaseDirectory, Emitter, Manager};
 
 use crate::db::cases::{self as cases_db, Case};
 use crate::db::documents::{self as documents_db, Document};
+use crate::element_convert::*;
 use crate::ingest::case_split;
 use crate::ingest::pipeline;
 use crate::ingest::scanner::{scan_folder, ScannedDoc};
@@ -5416,6 +5418,12 @@ pub fn run() {
             contract_draft::add_contract_preference,
             contract_draft::list_contract_preferences,
             contract_draft::delete_contract_preference,
+            list_element_document_types,
+            generate_element_document,
+            save_element_document,
+            export_element_document,
+            save_external_element_document,
+            save_element_docx_to_path,
             save_editor_doc,
             case_chat,
             list_chat_history,

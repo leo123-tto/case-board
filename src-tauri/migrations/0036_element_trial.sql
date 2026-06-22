@@ -2,7 +2,7 @@
 -- 0036 · 要素式审判智能辅助
 --
 -- 设计说明:
---   - element_templates: 案由×起诉/答辩 要素模板,预置 67 类案由×2 方向=134 条基准
+--   - element_templates: 案由×起诉/答辩 要素模板(预置交通事故类14项作为参考示例,其余案由按需扩展)
 --   - element_facts: 具体案件的要件事实逐条归依(证据→要件→争点)
 --   - trial_strategies: 攻防策略记录(三级递进:主张责任→证明责任→举证行为)
 --   - element_complaints: AI 生成的要素式起诉状/答辩状草稿
@@ -121,14 +121,4 @@ INSERT INTO element_templates (id, cause, direction, element_name, element_desc,
 ('et-traf-d05', '机动车交通事故责任纠纷', '答辩', '已赔付', '已支付的赔偿金额及项目明细', 0, '书证', '转账记录/收条/调解协议', '被告', 5);
 
 -- 预置要素模板(网络服务合同纠纷 — 起诉方向,4 项)
-INSERT INTO element_templates (id, cause, direction, element_name, element_desc, is_required, evidence_type, evidence_hint, burden_party, sort_order) VALUES
-('et-net-001', '网络服务合同纠纷', '起诉', '合同关系成立', '双方存在网络服务合同关系', 1, '书证', '平台服务协议/入驻协议', '原告', 1),
-('et-net-002', '网络服务合同纠纷', '起诉', '违约行为', '被告存在违约行为(如无故下架/扣款)', 1, '电子数据', '后台处罚记录/扣款通知', '原告', 2),
-('et-net-003', '网络服务合同纠纷', '起诉', '损失后果', '违约行为给原告造成的损失金额', 1, '书证/电子数据', '财务报表/交易记录', '原告', 3),
-('et-net-004', '网络服务合同纠纷', '起诉', '因果关系', '违约行为与损失之间的因果关系', 1, '书证', '时间线对应关系说明', '原告', 4);
-
--- 预置要素模板(网络服务合同纠纷 — 答辩方向,3 项)
-INSERT INTO element_templates (id, cause, direction, element_name, element_desc, is_required, evidence_type, evidence_hint, burden_party, sort_order) VALUES
-('et-net-d01', '网络服务合同纠纷', '答辩', '违约行为不存在', '处罚符合平台规则', 1, '电子数据', '平台规则/违约证据截图', '被告', 1),
-('et-net-d02', '网络服务合同纠纷', '答辩', '损失不成立', '原告主张的损失金额缺乏依据', 0, '书证', '财务核算说明', '被告', 2),
-('et-net-d03', '网络服务合同纠纷', '答辩', '对方违约在先', '原告自身存在违约行为', 0, '电子数据', '平台通知/催促记录', '被告', 3);
+-- 已脱敏移除，仅保留交通事故类模板作为参考示例

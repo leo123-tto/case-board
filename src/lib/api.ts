@@ -25,6 +25,7 @@ import type {
   Settings,
   UpdateInfo,
   VerifyResult,
+  WorkLog,
 } from "./types";
 
 /* ------------------------------------------------------------------ */
@@ -1920,4 +1921,48 @@ export function listContractPreferences(): Promise<ContractPreference[]> {
 /** 删除一条起草偏好。 */
 export function deleteContractPreference(id: string): Promise<number> {
   return invoke<number>("delete_contract_preference", { id });
+}
+
+// ============================================================================
+// 工作记录 CRUD
+// ============================================================================
+
+/** 获取案件的工作记录列表。 */
+export function getWorkLogs(caseId: string): Promise<WorkLog[]> {
+  return invoke<WorkLog[]>("get_work_logs", { caseId });
+}
+
+/** 新增工作记录。 */
+export function addWorkLog(
+  caseId: string,
+  content: string,
+  logTime?: string,
+): Promise<WorkLog> {
+  return invoke<WorkLog>("add_work_log", { caseId, logTime: logTime ?? null, content });
+}
+
+/** 更新工作记录。 */
+export function updateWorkLog(
+  id: string,
+  content: string,
+  logTime?: string,
+): Promise<number> {
+  return invoke<number>("update_work_log", { id, logTime: logTime ?? null, content });
+}
+
+/** 删除工作记录。 */
+export function deleteWorkLog(id: string): Promise<boolean> {
+  return invoke<boolean>("delete_work_log", { id });
+}
+
+/* ------------------------------------------------------------------ */
+/* 企微/飞书 Webhook 每日待办提醒                                       */
+/* ------------------------------------------------------------------ */
+
+/** 测试企微/飞书 webhook 连接，发一条测试消息。provider: "wecom" | "feishu" */
+export function testWebhook(
+  provider: string,
+  url: string,
+): Promise<void> {
+  return invoke<void>("test_webhook", { provider, url });
 }

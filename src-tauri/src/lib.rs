@@ -17,6 +17,7 @@ pub mod feishu;
 pub mod ingest;
 pub mod lifecycle;
 pub mod llm;
+pub mod notify;
 pub mod local_kb;
 pub mod proc_util;
 // 私人专属功能 Rust 侧(双轨发布模型)。开源仓此文件为桩(命令返回 Err),照样编译。
@@ -4466,6 +4467,12 @@ async fn test_mcp_server(
     })
 }
 
+/// 测试企微/飞书 webhook 连接，发一条测试消息。
+#[tauri::command]
+async fn test_webhook(provider: String, url: String) -> Result<(), String> {
+    notify::test_webhook(&provider, &url).await
+}
+
 // ============================================================================
 // 团队版 Phase 1(LAN 接力同步,docs/提案-团队版-2026-06-10.md §6)
 // ============================================================================
@@ -5174,6 +5181,63 @@ async fn verify_embedding_key(
 }
 
 // ============================================================================
+// 工作记录 CRUD
+// ============================================================================
+
+/// 获取案件的工作记录列表。
+#[tauri::command]
+async fn get_work_logs(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<db::work_logs::WorkLog>, String> {
+    db::work_logs::get_work_logs(pool.inner(), &case_id)
+        .await
+        .map_err(|e| format!("获取工作记录失败: {}", e))
+}
+
+/// 新增工作记录。
+#[tauri::command]
+async fn add_work_log(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    log_time: Option<String>,
+    content: String,
+) -> Result<db::work_logs::WorkLog, String> {
+    let new = db::work_logs::NewWorkLog {
+        case_id,
+        log_time,
+        content,
+    };
+    db::work_logs::add_work_log(pool.inner(), &new)
+        .await
+        .map_err(|e| format!("新增工作记录失败: {}", e))
+}
+
+/// 更新工作记录。
+#[tauri::command]
+async fn update_work_log(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+    log_time: Option<String>,
+    content: String,
+) -> Result<u64, String> {
+    db::work_logs::update_work_log(pool.inner(), &id, &log_time.unwrap_or_default(), &content)
+        .await
+        .map_err(|e| format!("更新工作记录失败: {}", e))
+}
+
+/// 删除工作记录。
+#[tauri::command]
+async fn delete_work_log(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+) -> Result<bool, String> {
+    db::work_logs::delete_work_log(pool.inner(), &id)
+        .await
+        .map_err(|e| format!("删除工作记录失败: {}", e))
+}
+
+// ============================================================================
 // 测试
 // ============================================================================
 
@@ -5256,6 +5320,8 @@ pub fn run() {
 
             // 团队版:已配置团队 → 后台启动监听+广播+周期同步(失败只记日志不阻启动)
             let team_pool = pool.clone();
+            // 每日待办提醒定时调度器（企微/飞书 webhook 推送）—— 在 pool 被 move 前克隆
+            let notify_pool = pool.clone();
             app.manage(pool);
             // chat 模块全局 cancel 注册表(V0.1.13+)
             app.manage(chat::ChatCancelRegistry::default());
@@ -5275,6 +5341,12 @@ pub fn run() {
                     }
                 });
             }
+            {
+                tauri::async_runtime::spawn(async move {
+                    notify::start_scheduler(notify_pool).await;
+                });
+            }
+
             // 匿名使用遥测(只在编译期注入了 key 的 release 构建启用;dev/test 静默)。
             // fire-and-forget,失败不影响启动。
             telemetry::start();
@@ -5424,6 +5496,7 @@ pub fn run() {
             // MCP 数据源接入(粘贴识别 + 连接测试)
             parse_mcp_paste,
             test_mcp_server,
+            test_webhook,
             // 团队版 Phase 1(LAN 接力同步)
             team_status,
             team_create,
@@ -5457,6 +5530,11 @@ pub fn run() {
             private::reset_yuandian_credits,
             // 滴答清单(TickTick)双向同步(公开功能)
             ticktick::ticktick_call,
+            // 工作记录 CRUD
+            get_work_logs,
+            add_work_log,
+            update_work_log,
+            delete_work_log,
         ])
         .on_window_event(|window, event| {
             match event {

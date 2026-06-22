@@ -39,6 +39,7 @@ import { CaseTimeline } from "./CaseTimeline";
 import { EditableField } from "./EditableField";
 import { SortableCard } from "./SortableCard";
 import { TodosCard } from "@/components/TodosCard";
+import { WorkLogTimeline } from "./WorkLogTimeline";
 
 /**
  * 案件画像主视图。
@@ -179,6 +180,7 @@ export function CaseSnapshotView({
     FEE: "收费记录",
     TIMELINE: "办案时间轴",
     PRESERVATION: "财产保全",
+    WORK_LOG: "工作记录",
   } as const;
 
   /**
@@ -223,6 +225,7 @@ export function CaseSnapshotView({
     TITLES.FEE,
     TITLES.TIMELINE,
     ...(snap.preservations.length > 0 ? [TITLES.PRESERVATION] : []),
+    TITLES.WORK_LOG,
   ];
 
   const sections: SectionRenderer[] = [
@@ -528,6 +531,21 @@ export function CaseSnapshotView({
       ),
     });
   }
+  sections.push({
+    id: TITLES.WORK_LOG,
+    render: (dragHandle) => (
+      <CardSection
+        title={TITLES.WORK_LOG}
+        subtitle="记录律师为案件付出的具体劳动"
+        isEditMode={isEditMode}
+        hidden={ov.overrides.hidden_sections?.includes(TITLES.WORK_LOG)}
+        onToggleHidden={() => ov.toggleHidden(TITLES.WORK_LOG)}
+        dragHandle={dragHandle}
+      >
+        <WorkLogTimeline caseId={caseData.id} />
+      </CardSection>
+    ),
+  });
 
   // 2026-06-13:立场被改过、但 LLM 画像/报告还没按新立场重抽 → 持久提示(不分编辑模式)。
   // 判据:overlay 后的 our_side ≠ DB 里 LLM 原值;重新分析后 agg_our_side 同步即消失。

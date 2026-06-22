@@ -22,6 +22,9 @@ import {
   BookText,
   SlidersHorizontal,
   User,
+  Bell,
+  BellRing,
+  Send,
 } from "lucide-react";
 import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
 import { confirmDialog } from "@/lib/dialog";
@@ -43,6 +46,7 @@ import {
   parseMcpPaste,
   saveSettings,
   testMcpServer,
+  testWebhook,
   verifyDeepSeekKey,
   verifyMiniMaxKey,
   verifyOpenAICompatKey,
@@ -775,6 +779,24 @@ export function SettingsModal({
                       </button>
                     </label>
                   </Section>
+              )}
+
+              {/* ── 功能开关:每日待办提醒（企微/飞书 Webhook）── */}
+              {tab === "toggles" && (
+                <DailyReminderCard
+                  wecomUrl={settings.webhook_wecom_url ?? null}
+                  wecomEnabled={settings.webhook_wecom_enabled !== false}
+                  feishuUrl={settings.webhook_feishu_url ?? null}
+                  feishuEnabled={settings.webhook_feishu_enabled !== false}
+                  dailyTime={settings.webhook_daily_time ?? "09:00"}
+                  remindDays={settings.webhook_remind_days ?? 7}
+                  onWecomUrlChange={(v) => updateField("webhook_wecom_url", v)}
+                  onWecomEnabledChange={(v) => updateField("webhook_wecom_enabled", v)}
+                  onFeishuUrlChange={(v) => updateField("webhook_feishu_url", v)}
+                  onFeishuEnabledChange={(v) => updateField("webhook_feishu_enabled", v)}
+                  onDailyTimeChange={(v) => updateField("webhook_daily_time", v || null)}
+                  onRemindDaysChange={(v) => updateField("webhook_remind_days", v)}
+                />
               )}
 
               {/* ── 通用:微信扫码加群(缩略图悬停放大;托管 lawtools.top,过期换图不必重新发版) ── */}
@@ -2815,6 +2837,211 @@ function formatErr(e: unknown): string {
   } catch {
     return String(e);
   }
+}
+
+/* ================================================================== */
+/* 每日待办提醒 · 企微/飞书 Webhook 配置卡                               */
+/* ================================================================== */
+
+function DailyReminderCard({
+  wecomUrl,
+  wecomEnabled,
+  feishuUrl,
+  feishuEnabled,
+  dailyTime,
+  remindDays,
+  onWecomUrlChange,
+  onWecomEnabledChange,
+  onFeishuUrlChange,
+  onFeishuEnabledChange,
+  onDailyTimeChange,
+  onRemindDaysChange,
+}: {
+  wecomUrl: string | null;
+  wecomEnabled: boolean;
+  feishuUrl: string | null;
+  feishuEnabled: boolean;
+  dailyTime: string;
+  remindDays: number;
+  onWecomUrlChange: (v: string | null) => void;
+  onWecomEnabledChange: (v: boolean) => void;
+  onFeishuUrlChange: (v: string | null) => void;
+  onFeishuEnabledChange: (v: boolean) => void;
+  onDailyTimeChange: (v: string | null) => void;
+  onRemindDaysChange: (v: number | null) => void;
+}) {
+  const [wecomTest, setWecomTest] = useState<{ s: "idle" | "busy" | "ok" | "err"; msg?: string }>({ s: "idle" });
+  const [feishuTest, setFeishuTest] = useState<{ s: "idle" | "busy" | "ok" | "err"; msg?: string }>({ s: "idle" });
+
+  async function handleTestWecom() {
+    if (!wecomUrl?.trim()) return;
+    setWecomTest({ s: "busy" });
+    try {
+      await testWebhook("wecom", wecomUrl.trim());
+      setWecomTest({ s: "ok", msg: "测试消息已发送，请查看企业微信群" });
+    } catch (e) {
+      setWecomTest({ s: "err", msg: formatErr(e) });
+    }
+  }
+
+  async function handleTestFeishu() {
+    if (!feishuUrl?.trim()) return;
+    setFeishuTest({ s: "busy" });
+    try {
+      await testWebhook("feishu", feishuUrl.trim());
+      setFeishuTest({ s: "ok", msg: "测试消息已发送，请查看飞书群" });
+    } catch (e) {
+      setFeishuTest({ s: "err", msg: formatErr(e) });
+    }
+  }
+
+  return (
+    <Section
+      title="每日待办提醒"
+      desc={`每天 ${dailyTime} 自动推送 ${remindDays} 天内到期的待办事项到企微/飞书群`}
+    >
+      {/* 企业微信 */}
+      <div className="rounded-md border border-border bg-background p-3 space-y-2.5">
+        <div className="flex items-center gap-2">
+          <Bell className="size-4 text-green-600 shrink-0" />
+          <span className="text-sm font-medium">企业微信机器人</span>
+          <label className="ml-auto flex items-center gap-1.5 text-xs cursor-pointer">
+            <input
+              type="checkbox"
+              checked={wecomEnabled}
+              onChange={(e) => onWecomEnabledChange(e.target.checked)}
+              className="size-3.5 accent-green-600"
+            />
+            启用
+          </label>
+        </div>
+        {wecomEnabled && (
+          <Field label="Webhook URL" hint="在企业微信群中添加机器人后获取">
+            <div className="flex items-center gap-2">
+              <input
+                type="password"
+                value={wecomUrl ?? ""}
+                onChange={(e) => onWecomUrlChange(e.target.value || null)}
+                placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."
+                className={cn(inputCls, "flex-1")}
+                autoComplete="off"
+              />
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={handleTestWecom}
+                disabled={wecomTest.s === "busy" || !wecomUrl?.trim()}
+              >
+                {wecomTest.s === "busy" ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Send className="size-3.5" />
+                )}
+                测试
+              </Button>
+            </div>
+            {wecomTest.s === "ok" && (
+              <p className="mt-1 text-xs text-green-700">✓ {wecomTest.msg}</p>
+            )}
+            {wecomTest.s === "err" && (
+              <p className="mt-1 text-xs text-red-600">✗ {wecomTest.msg}</p>
+            )}
+          </Field>
+        )}
+      </div>
+
+      {/* 飞书 */}
+      <div className="rounded-md border border-border bg-background p-3 space-y-2.5">
+        <div className="flex items-center gap-2">
+          <BellRing className="size-4 text-blue-600 shrink-0" />
+          <span className="text-sm font-medium">飞书机器人</span>
+          <label className="ml-auto flex items-center gap-1.5 text-xs cursor-pointer">
+            <input
+              type="checkbox"
+              checked={feishuEnabled}
+              onChange={(e) => onFeishuEnabledChange(e.target.checked)}
+              className="size-3.5 accent-blue-600"
+            />
+            启用
+          </label>
+        </div>
+        {feishuEnabled && (
+          <Field label="Webhook URL" hint="在飞书群中添加自定义机器人后获取">
+            <div className="flex items-center gap-2">
+              <input
+                type="password"
+                value={feishuUrl ?? ""}
+                onChange={(e) => onFeishuUrlChange(e.target.value || null)}
+                placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+                className={cn(inputCls, "flex-1")}
+                autoComplete="off"
+              />
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={handleTestFeishu}
+                disabled={feishuTest.s === "busy" || !feishuUrl?.trim()}
+              >
+                {feishuTest.s === "busy" ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Send className="size-3.5" />
+                )}
+                测试
+              </Button>
+            </div>
+            {feishuTest.s === "ok" && (
+              <p className="mt-1 text-xs text-green-700">✓ {feishuTest.msg}</p>
+            )}
+            {feishuTest.s === "err" && (
+              <p className="mt-1 text-xs text-red-600">✗ {feishuTest.msg}</p>
+            )}
+          </Field>
+        )}
+      </div>
+
+      {/* 通用设置 */}
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="推送时间">
+          <select
+            value={dailyTime}
+            onChange={(e) => onDailyTimeChange(e.target.value || null)}
+            className={inputCls}
+          >
+            <option value="07:00">07:00</option>
+            <option value="08:00">08:00</option>
+            <option value="09:00">09:00</option>
+            <option value="10:00">10:00</option>
+            <option value="17:00">17:00</option>
+            <option value="18:00">18:00</option>
+            <option value="20:00">20:00</option>
+          </select>
+        </Field>
+        <Field label="提前提醒天数">
+          <select
+            value={remindDays}
+            onChange={(e) =>
+              onRemindDaysChange(e.target.value ? Number(e.target.value) : null)
+            }
+            className={inputCls}
+          >
+            <option value={1}>1 天</option>
+            <option value={3}>3 天</option>
+            <option value={5}>5 天</option>
+            <option value={7}>7 天（一周）</option>
+            <option value={14}>14 天</option>
+            <option value={30}>30 天</option>
+          </select>
+        </Field>
+      </div>
+
+      <p className="text-caption text-muted-foreground">
+        App 运行时会每天定时推送；关闭后不发送。仅在你本机运行，webhook 地址只存本地。
+      </p>
+    </Section>
+  );
 }
 
 function formatBytes(n: number): string {

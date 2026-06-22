@@ -250,6 +250,20 @@ pub struct Settings {
     /// 2026-06-10 团队版 Phase 1(LAN 接力同步,详 docs/提案-团队版-2026-06-10.md §6)。
     /// None = 未加入团队,团队功能整体关闭零开销。secret/配对码跟 API key 同级:只存本机不进 git。
     pub team: Option<crate::team::TeamIdentity>,
+
+    // ===== 每日待办提醒 · 企微/飞书 Webhook =====
+    /// 企业微信机器人 webhook URL
+    pub webhook_wecom_url: Option<String>,
+    /// 企业微信每日提醒开关
+    pub webhook_wecom_enabled: Option<bool>,
+    /// 飞书机器人 webhook URL
+    pub webhook_feishu_url: Option<String>,
+    /// 飞书每日提醒开关
+    pub webhook_feishu_enabled: Option<bool>,
+    /// 每日提醒推送时间，格式 "HH:MM"
+    pub webhook_daily_time: Option<String>,
+    /// 提前几天开始提醒
+    pub webhook_remind_days: Option<u32>,
 }
 
 impl Settings {
@@ -454,6 +468,10 @@ impl Settings {
             chat_context_budget_history: self.chat_context_budget_history.or(Some(40_000)),
             chat_loop_max_iters: self.chat_loop_max_iters.or(Some(16)),
             chat_max_attached: self.chat_max_attached.or(Some(5)),
+            webhook_daily_time: self.webhook_daily_time.or_else(|| Some("09:00".to_string())),
+            webhook_remind_days: self.webhook_remind_days.or(Some(7)),
+            webhook_wecom_enabled: self.webhook_wecom_enabled.or(Some(false)),
+            webhook_feishu_enabled: self.webhook_feishu_enabled.or(Some(false)),
             ..self
         }
     }

@@ -517,6 +517,20 @@ export interface Settings {
   mcp_servers: McpServerConfig[];
   /** 团队版:本机团队身份;null/缺省 = 未加入团队。后端 team_* 命令直接写,设置表单不碰它。 */
   team?: TeamIdentity | null;
+
+  // ===== 每日待办提醒 · 企微/飞书 Webhook =====
+  /** 企业微信机器人 webhook URL */
+  webhook_wecom_url: string | null;
+  /** 企业微信每日提醒开关 */
+  webhook_wecom_enabled: boolean | null;
+  /** 飞书机器人 webhook URL */
+  webhook_feishu_url: string | null;
+  /** 飞书每日提醒开关 */
+  webhook_feishu_enabled: boolean | null;
+  /** 每日提醒推送时间，格式 "HH:MM" */
+  webhook_daily_time: string | null;
+  /** 提前几天开始提醒 */
+  webhook_remind_days: number | null;
 }
 
 /** 飞书日历事件(对应 Rust feishu::FeishuCalendarEvent)。 */
@@ -947,3 +961,13 @@ export type DocOcrStatusEvent = Extract<
   ProgressEvent,
   { stage: "doc_ocr_status" }
 >;
+
+/** 工作记录 */
+export interface WorkLog {
+  id: string;
+  case_id: string;
+  log_time: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}

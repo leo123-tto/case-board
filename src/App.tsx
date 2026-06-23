@@ -67,12 +67,33 @@ function readChatWindowParams(): {
 } | null {
   try {
     const params = new URLSearchParams(window.location.search);
-    if (params.get("window") !== "chat") return null;
-    return {
-      caseId: params.get("caseId"),
-      caseName: params.get("caseName"),
-      domain: params.get("domain") === "criminal" ? "criminal" : "civil",
-    };
+    if (params.get("window") === "chat") {
+      return {
+        caseId: params.get("caseId"),
+        caseName: params.get("caseName"),
+        domain: params.get("domain") === "criminal" ? "criminal" : "civil",
+      };
+    }
+    // 2026-06-23 v0.3.26.1 Windows fix:WebviewUrl::App("index.html?...")
+    // 在 Windows NTFS 上 PathBuf 规范化会把 `?` 后的 query 剥掉,detached 窗口拿不到
+    // window=chat 参数 → App.tsx 退到 MainApp,用户看到空界面。改走 Rust 端
+    // WebviewWindowBuilder.initialization_script 注入 window.__CHAT_INIT__ 做兜底。
+    const init = (window as unknown as {
+      __CHAT_INIT__?: {
+        caseId?: string | null;
+        caseName?: string | null;
+        domain?: string;
+        detached?: boolean;
+      };
+    }).__CHAT_INIT__;
+    if (init && init.detached) {
+      return {
+        caseId: init.caseId ?? null,
+        caseName: init.caseName ?? null,
+        domain: init.domain === "criminal" ? "criminal" : "civil",
+      };
+    }
+    return null;
   } catch {
     return null;
   }

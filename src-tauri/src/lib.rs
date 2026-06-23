@@ -548,7 +548,7 @@ async fn verify_openai_compat_key(
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:官网公开的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:官网部署的 `version.json` 接口。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -4569,6 +4569,13 @@ async fn case_chat(
 
 /// 把案件 AI 助手从主窗口侧栏分离成独立界面,共享同一份本地聊天记录。
 /// 同一 case_id 已分离时直接聚焦,避免生成第二个实例。
+///
+/// 2026-06-23 v0.3.26.1 修复:原方案把 caseId/caseName/domain 拼到 `index.html?…` query
+/// 里,在 Windows 上 `?` 是 NTFS 保留字符,PathBuf 规范化后 query 可能被吃掉 →
+/// 前端 `readChatWindowParams()` 返 null,detached 窗口走 MainApp 空状态,看上去「没对话+没
+/// 输入框」。改用 `WebviewWindowBuilder::initialization_script` 在 webview 加载前把元
+/// 数据注入 `window.__CHAT_INIT__`,前端读不到 URL query 时降级读这个全局对象。
+/// URL 端不再带 `?`,跨平台行为一致。
 #[tauri::command]
 fn detach_chat_window(
     app: tauri::AppHandle,
@@ -4582,8 +4589,8 @@ fn detach_chat_window(
         return Ok(());
     }
 
-    let route = detached_chat_route(&case_id, case_name.as_deref(), domain.as_deref());
-    let url = tauri::WebviewUrl::App(route.into());
+    let init_script = detached_chat_init_script(&case_id, case_name.as_deref(), domain.as_deref());
+    let url = tauri::WebviewUrl::App("index.html".into());
     let title = match &case_name {
         Some(name) => format!("案件 AI 助手 · {}", name),
         None => "案件 AI 助手".to_string(),
@@ -4596,6 +4603,7 @@ fn detach_chat_window(
         .resizable(true)
         .focused(true)
         .center()
+        .initialization_script(&init_script)
         .build()
         .map_err(|e| format!("AI 助手切换到独立界面失败: {}", e))?;
     let app_for_close = app.clone();
@@ -4612,27 +4620,25 @@ fn detach_chat_window(
     Ok(())
 }
 
-fn detached_chat_route(case_id: &str, case_name: Option<&str>, domain: Option<&str>) -> String {
+/// 生成 webview 加载前注入的初始化脚本:把 caseId/caseName/domain 写进
+/// `window.__CHAT_INIT__`,前端 `readChatWindowParams` 读不到 URL query 时降级读这里。
+/// 跨平台一致,避开 Windows 上 `?` 在 NTFS path 里被规范化的问题。
+fn detached_chat_init_script(
+    case_id: &str,
+    case_name: Option<&str>,
+    domain: Option<&str>,
+) -> String {
+    let payload = serde_json::json!({
+        "caseId": case_id,
+        "caseName": case_name,
+        "domain": domain.unwrap_or("civil"),
+        "detached": true,
+    });
+    // serde_json 输出本身就是合法 JS 字面量,可直接拼接为赋值语句。
     format!(
-        "index.html?window=chat&caseId={}&caseName={}&domain={}",
-        url_encode(case_id),
-        case_name.map(url_encode).unwrap_or_default(),
-        url_encode(domain.unwrap_or("civil")),
+        "window.__CHAT_INIT__ = {};",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "null".to_string())
     )
-}
-
-/// 简易 URL 百分号编码(query 用):保留 `A-Za-z0-9-_.~`,其余字节 `%HH`。
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char);
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
 }
 
 /// 取案件聊天历史(升序,前端直接渲染)。

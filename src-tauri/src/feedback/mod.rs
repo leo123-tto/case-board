@@ -240,7 +240,7 @@ pub struct RecentFailure {
     pub created_at: String,
     /// 2026-05-25 V0.1.8 加:抽取失败的具体原因(三轮重试全失败后落库的 last_error)。
     /// 输出到反馈 MD 前会经 `sanitize_paths` 把绝对路径替换成 `<path>/<basename>`,
-    /// 防止泄漏当事人姓名出现在路径里(如路径含 `…/张三/…`)。
+    /// 防止泄漏当事人姓名出现在路径里(如 `/<root>/.../<某当事人名>/...`)。
     pub last_error: Option<String>,
 }
 
@@ -983,18 +983,51 @@ fn urlencode_simple(s: &str) -> String {
 }
 
 pub fn save_to_desktop(info: &DiagnosticInfo, user_description: &str) -> Result<PathBuf, String> {
-    let desktop = dirs_desktop().ok_or_else(|| "无法定位桌面路径".to_string())?;
-    if !desktop.exists() {
-        std::fs::create_dir_all(&desktop).map_err(|e| format!("建桌面目录失败: {}", e))?;
-    }
-
+    let md = render_md(info, user_description);
     let ts = chrono::Local::now().format("%Y-%m-%d_%H%M").to_string();
     let filename = format!("案件看板反馈_{}.md", ts);
-    let path = desktop.join(&filename);
 
-    let md = render_md(info, user_description);
+    // 2026-06-23 v0.3.26.1 Windows fix:先试桌面;写失败(OneDrive 重定向、只读、权限等)
+    // 兜底到 ~/Documents/CaseBoard/feedback/。不卡死反馈流程。
+    if let Some(desktop) = dirs_desktop() {
+        let path = desktop.join(&filename);
+        if std::fs::write(&path, &md).is_ok() {
+            return Ok(path);
+        }
+    }
+
+    let fallback = dirs_fallback_feedback_dir()
+        .ok_or_else(|| "无法定位任何可写目录(桌面/Documents/CaseBoard/feedback)".to_string())?;
+    std::fs::create_dir_all(&fallback).map_err(|e| format!("建反馈目录失败: {}", e))?;
+    let path = fallback.join(&filename);
     std::fs::write(&path, md).map_err(|e| format!("写入失败: {}", e))?;
     Ok(path)
+}
+
+/// 2026-06-23 v0.3.26.1:桌面不可写时反馈 MD 的兜底目录。
+/// `UserDirs::document_dir()` 处理 Win 已知文件夹(能识别重定向的 OneDrive Documents),
+/// Linux/mac 走 ~/Documents。失败再退回 $HOME / $USERPROFILE + Documents。
+fn dirs_fallback_feedback_dir() -> Option<PathBuf> {
+    if let Some(ud) = directories::UserDirs::new() {
+        if let Some(doc) = ud.document_dir() {
+            return Some(doc.join("CaseBoard").join("feedback"));
+        }
+        return Some(
+            ud.home_dir()
+                .join("Documents")
+                .join("CaseBoard")
+                .join("feedback"),
+        );
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(
+        PathBuf::from(home)
+            .join("Documents")
+            .join("CaseBoard")
+            .join("feedback"),
+    )
 }
 
 /// 跨平台拿桌面目录路径。
@@ -1018,6 +1051,8 @@ fn dirs_desktop() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Desktop"))
 }
 
+/// Test-only re-export of `render_md` so other modules can regression-test
+/// "敏感数据不应进反馈 MD"。生产代码继续走 `save_to_desktop`。
 fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -1356,7 +1391,7 @@ fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
     md.push_str(
         "> 反馈方 ID 是匿名 UUID 前 8 位,跟用户名/邮箱无关,只用于关联「同一人多次反馈」。\n",
     );
-    md.push_str("> 把这个 MD 文件发给作者即可,无需粘贴文字。\n");
+    md.push_str("> 把这个 MD 文件发给项目维护者即可,无需粘贴文字。\n");
 
     // 安全网:整份 MD 再过一次 sanitize_paths,兜底 stderr/console 里可能漏的路径
     sanitize_paths(&md)
@@ -1388,13 +1423,13 @@ fn provider_display(p: &str) -> &str {
 
 /// 把错误信息里的绝对路径替换成 `<path>/<basename>`,防止案件路径(常含当事人名)泄漏。
 ///
-/// 例:`某用户目录/cases/张三/foo.pdf` → `<path>/foo.pdf`
+/// 例:`/<root>/<user>/<某当事人名>/foo.pdf` → `<path>/foo.pdf`
 ///
 /// 只匹配 macOS 常见的根前缀。
 ///
 /// **已知限制**:**含空格的路径**(如 `/Users/x/Nutstore Files/y/z.pdf`)只能正确处理
 /// **引号包围**的版本(`"..."` / `'...'` / `` `...` ``).无引号 unquoted 路径会在
-/// 第一个空格切断,留下后段(如 `Files/张三/z.pdf` 仍含敏感名).MinerU CLI 通常会
+/// 第一个空格切断,留下后段(如 `Files/<某当事人名>/z.pdf` 仍含敏感名).MinerU CLI 通常会
 /// 引号包围 path,std::io::Error::Display 不含 path,所以这个简化可接受;但**绝不要**
 /// 把不可信用户输入喂进 sanitize_paths——它只用于工具 stderr 等受控来源.
 pub(crate) fn sanitize_paths(s: &str) -> String {

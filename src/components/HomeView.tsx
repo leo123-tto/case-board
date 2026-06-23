@@ -830,7 +830,10 @@ export function HomeView({
             onClick={() => {
               const id = ctxMenu.id;
               setCtxMenu(null);
-              onDeleteCase(id);
+              // 2026-06-23 v0.3.26.1 Windows fix:右键菜单关闭动画期间 onDeleteCase 立刻
+              // 弹 confirmDialog,Windows WebView 模态对话框会被菜单收尾动画遮挡/时序竞态
+              // 吞掉事件(用户看到菜单关了、对话框没弹)。延一帧让菜单先彻底关。
+              setTimeout(() => onDeleteCase(id), 0);
             }}
             className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40"
           >

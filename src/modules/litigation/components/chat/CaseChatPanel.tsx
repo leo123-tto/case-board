@@ -57,7 +57,12 @@ import {
   listChatHistory,
   openUrl,
 } from "@/lib/api";
-import type { Citation, Document, ToolCallRecord } from "@/lib/types";
+import type {
+  CaseWithDocs,
+  Citation,
+  Document,
+  ToolCallRecord,
+} from "@/lib/types";
 import { confirmDialog } from "@/lib/dialog";
 
 import { AskUserCard } from "./AskUserCard";
@@ -97,6 +102,26 @@ const LEGAL_BASIS_CHIP = {
   hintWithAttached:
     "核对你引用文档里的法条/案号准不准,逐条标 ✅一致 / ⚠️不一致 / ❌查无此条",
 } as const;
+
+const PROVINCE_SUFFIX_PATTERN =
+  /(北京市|天津市|上海市|重庆市|[^省市自治区特别行政区]+(?:省|自治区|特别行政区))/;
+
+function inferCourtRegion(
+  caseData?: CaseWithDocs["case"] | null,
+): string | null {
+  const court = caseData?.agg_court || caseData?.court;
+  if (!court) return null;
+  const province = court.match(PROVINCE_SUFFIX_PATTERN)?.[1];
+  if (province) return province;
+  return (
+    court
+      .replace(
+        /(人民法院|法院|中级|高级|基层|互联网|知识产权|海事|金融)/g,
+        "",
+      )
+      .trim() || court
+  );
+}
 
 /**
  * 快捷任务 chip:一个按钮 + 悬停即时说明气泡。
@@ -259,11 +284,17 @@ export function CaseChatPanel({
     run?.status === "running" ? run.reasoningChars : 0;
   // V0.2 D6-D7 · attachment 状态
   const [caseDocs, setCaseDocs] = useState<Document[]>([]);
+  const [loadedCaseData, setLoadedCaseData] =
+    useState<CaseWithDocs["case"] | null>(null);
   const [attachedDocIds, setAttachedDocIds] = useState<string[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const scrollerRef = useRef<HTMLDivElement>(null);
   // V0.2.2 · 自由滚动:用户上滚查看历史时停止强制吸底,滚回底部附近再恢复自动跟随
   const [autoScroll, setAutoScroll] = useState(true);
+  const courtRegion = inferCourtRegion(loadedCaseData);
+  const similarCasesHint = courtRegion
+    ? `检索全国相似判例,按本案法院所在地 ${courtRegion} 优先排序;外地高相关案例仍正常纳入,再判断对我方诉求的支持度和风险点`
+    : "检索全国相似判例,按本案法院所在地优先排序;外地高相关案例仍正常纳入,再判断对我方诉求的支持度和风险点";
 
   const refreshHistory = useCallback(async () => {
     if (!caseId) return;
@@ -400,6 +431,7 @@ export function CaseChatPanel({
       .then(([rows, withDocs]) => {
         if (abort) return;
         setHistory(rows);
+        setLoadedCaseData(withDocs.case);
         setCaseDocs(withDocs.documents);
       })
       .catch((e) => {
@@ -828,7 +860,7 @@ export function CaseChatPanel({
         />
         <QuickChip
           label="🔍 类案检索"
-          hint="检索相似判例(本地/江苏优先),判断对我方诉求是支持还是不利 + 风险点,案例原文存进本地知识库(检索辅助,非法律意见)"
+          hint={similarCasesHint}
           onClick={() => send("", "find_similar_cases")}
           disabled={disabled}
           className="border-sky-500/40 bg-sky-500/5 hover:bg-sky-500/15"

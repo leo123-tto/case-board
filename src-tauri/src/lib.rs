@@ -4230,6 +4230,13 @@ struct CourtSmsIngestResult {
     sync: documents_db::SyncStats,
 }
 
+#[derive(serde::Serialize)]
+struct CourtSmsLocalDownloadResult {
+    downloaded: Vec<String>,
+    skipped: Vec<String>,
+    folder: String,
+}
+
 /// 案号归一化后比对 `agg_case_no` **以及 case_instances 全部审级案号**(2026-06-11:
 /// 短信里是一审案号、库里 agg 已是二审时也要能匹配),返回首个匹配案件 (id, 展示名)。
 async fn find_case_by_case_no(
@@ -4475,6 +4482,46 @@ async fn ingest_court_sms(
         downloaded,
         skipped,
         sync,
+    })
+}
+
+/// 下载到用户指定的本地文件夹。用于短信未匹配到案件、或用户暂不想归档进案件看板时。
+/// 不写入 documents 表,不触发 OCR/抽取;只做一张网文书下载。
+#[tauri::command]
+async fn download_court_sms_to_folder(
+    link: court_sms::ZxfwLink,
+    target_folder: String,
+) -> Result<CourtSmsLocalDownloadResult, String> {
+    let folder = Path::new(&target_folder);
+    if !folder.is_dir() {
+        return Err(format!("目标文件夹不可用: {}", target_folder));
+    }
+    let docs = court_sms::fetch_zxfw_doc_list(&link).await?;
+    if docs.is_empty() {
+        return Err("一张网未返回任何文书(链接可能已失效,请重新粘贴最新短信)".into());
+    }
+
+    let mut downloaded = vec![];
+    let mut skipped = vec![];
+    for d in &docs {
+        let dest = unique_path(folder, &sanitize_filename(&d.name), &d.ext);
+        match court_sms::download_doc(&d.wjlj, &dest).await {
+            Ok(_) => downloaded.push(
+                dest.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| d.name.clone()),
+            ),
+            Err(e) => {
+                crate::dlog!("court_sms 本地下载失败 {}: {}", d.name, e);
+                skipped.push(format!("{}({})", d.name, e));
+            }
+        }
+    }
+
+    Ok(CourtSmsLocalDownloadResult {
+        downloaded,
+        skipped,
+        folder: target_folder,
     })
 }
 
@@ -5618,6 +5665,7 @@ pub fn run() {
             relink_case_folder,
             preview_court_sms,
             ingest_court_sms,
+            download_court_sms_to_folder,
             query_express,
             list_express_tracks,
             refresh_express_tracks,
@@ -5646,6 +5694,7 @@ pub fn run() {
             contract_review::convert_doc_to_docx,
             contract_review::export_contract_opinion_docx,
             contract_review::export_contract_redline_docx,
+            contract_draft::extract_contract_draft_context_file,
             contract_draft::plan_contract_draft,
             contract_draft::generate_contract_draft,
             contract_draft::export_contract_draft_docx,

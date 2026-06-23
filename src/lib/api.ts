@@ -1150,6 +1150,12 @@ export interface CourtSmsIngestResult {
   sync: SyncStats;
 }
 
+export interface CourtSmsLocalDownloadResult {
+  downloaded: string[];
+  skipped: string[];
+  folder: string;
+}
+
 /** 预览:解析短信 + 拉文书列表 + 匹配在办案件(不下载、无副作用)。 */
 export function previewCourtSms(smsText: string): Promise<CourtSmsPreview> {
   return invoke<CourtSmsPreview>("preview_court_sms", { smsText });
@@ -1161,6 +1167,17 @@ export function ingestCourtSms(
   link: ZxfwLink,
 ): Promise<CourtSmsIngestResult> {
   return invoke<CourtSmsIngestResult>("ingest_court_sms", { caseId, link });
+}
+
+/** 下载:重新拉新鲜下载地址 → 保存到用户指定本地文件夹;不归档案件、不触发抽取。 */
+export function downloadCourtSmsToFolder(
+  link: ZxfwLink,
+  targetFolder: string,
+): Promise<CourtSmsLocalDownloadResult> {
+  return invoke<CourtSmsLocalDownloadResult>("download_court_sms_to_folder", {
+    link,
+    targetFolder,
+  });
 }
 
 /* ───────────── 快递查询(V0.3 · 快递100 实时查询) ───────────── */
@@ -1756,6 +1773,21 @@ export interface ContractDraftResult {
   risks: string[];
   assumptions: string[];
   missing_info: string[];
+}
+
+/** 起草需求附件抽取结果:本地文本抽取,扫描 PDF 不触发云端 OCR。 */
+export interface ContractDraftContextFile {
+  filename: string;
+  path: string;
+  text: string;
+  char_count: number;
+  truncated: boolean;
+}
+
+export function extractContractDraftContextFile(
+  path: string,
+): Promise<ContractDraftContextFile> {
+  return invoke<ContractDraftContextFile>("extract_contract_draft_context_file", { path });
 }
 
 /** 步骤 1-3:起草前规划(类型判定 + 结构大纲 + 引导式采集清单)。stance: party_a/party_b/neutral。 */

@@ -28,7 +28,7 @@ impl Tool for SearchLocalKb {
                 "scope": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "[\"notes\",\"companies\",\"sources\",\"topics\",\"gap_log\"] 任意子集,默认全部(companies=企业档案/调查报告)"
+                    "description": "[\"root\",\"notes\",\"companies\",\"sources\",\"topics\",\"gap_log\"] 任意子集,默认 root 整根知识库(companies=企业档案/调查报告)"
                 },
                 "include_yuandian_cache": {"type": "boolean", "description": "默认 false"},
                 "max_results": {"type": "integer", "description": "默认 30,最大 100"}
@@ -72,14 +72,7 @@ impl Tool for SearchLocalKb {
 
 /// KB 默认检索范围(scope 缺省 / 给了无效值时用)。
 fn default_kb_scopes() -> Vec<KbScope> {
-    vec![
-        KbScope::Notes,
-        KbScope::Companies,
-        KbScope::CasesExperience,
-        KbScope::Sources,
-        KbScope::Topics,
-        KbScope::GapLog,
-    ]
+    vec![KbScope::Root]
 }
 
 /// 解析 args.scope。`None` / 空数组 / **全是无效值**(如模型误传数字 `[4]`)→ 退回默认全部,
@@ -90,6 +83,7 @@ fn parse_scopes(raw: Option<&Value>, include_yuandian_cache: bool) -> Vec<KbScop
             .iter()
             .filter_map(|v| v.as_str())
             .filter_map(|s| match s {
+                "root" | "all" => Some(KbScope::Root),
                 "notes" => Some(KbScope::Notes),
                 "companies" => Some(KbScope::Companies),
                 "cases_experience" | "cases-experience" => Some(KbScope::CasesExperience),

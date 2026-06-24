@@ -41,9 +41,7 @@ import {
   Sparkles,
   Trash2,
 } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
@@ -265,6 +263,12 @@ export function CaseChatPanel({
       return CHAT_PANEL_WIDTH_DEFAULT;
     }
   });
+  /**
+   * Windows WebView2 对跨 webview 的独立聊天窗口会稳定复现空白/未响应。
+   * 这里改用同一个主窗口 webview 内的全屏覆盖层,避开跨进程渲染/IPC 路径。
+   * detached prop 继续保留,只作为旧独立路由的兼容入口。
+   */
+  const [poppedOut, setPoppedOut] = useState(false);
   const [history, setHistory] = useState<ChatMessage[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -337,28 +341,17 @@ export function CaseChatPanel({
   const detachChatPanel = async () => {
     if (!caseId) return;
     if (isRunning(caseId)) {
-      setError("当前案件的 AI 任务完成后才能切换到独立界面。");
+      setError("当前案件的 AI 任务完成后才能切换到全屏模式。");
       return;
     }
-    try {
-      await invoke("detach_chat_window", {
-        caseId,
-        caseName: caseName ?? null,
-        domain,
-      });
-      setRestorePulse(false);
-      setCollapsed(true);
-    } catch (e) {
-      setError(formatError(e));
-    }
+    setPoppedOut(true);
+    setRestorePulse(false);
   };
 
   const reattachChatPanel = async () => {
-    try {
-      await getCurrentWindow().close();
-    } catch (e) {
-      setError(formatError(e));
-    }
+    setPoppedOut(false);
+    setRestorePulse(true);
+    window.setTimeout(() => setRestorePulse(false), 1200);
   };
 
   // V0.2 D6-D7 · attached chip 用,对 caseDocs 按 id 索引
@@ -610,16 +603,25 @@ export function CaseChatPanel({
     <aside
       className={cn(
         "relative flex h-full shrink-0 flex-col border-border bg-card/30 transition-[width,box-shadow,background-color] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]",
-        detached
-          ? "w-full border-l-0"
-          : collapsed
-            ? "w-12 items-center border-l"
-            : "border-l",
+        poppedOut
+          ? "fixed inset-0 z-50 w-full border-l-0 bg-background shadow-2xl"
+          : detached
+            ? "w-full border-l-0"
+            : collapsed
+              ? "w-12 items-center border-l"
+              : "border-l",
         restorePulse &&
           !detached &&
+          !poppedOut &&
           "bg-sky-50/55 shadow-[-12px_0_28px_-24px_rgba(14,165,233,0.95)] dark:bg-sky-950/20",
       )}
-      style={!detached && !collapsed ? { width: panelWidth } : undefined}
+      style={
+        poppedOut
+          ? undefined
+          : !detached && !collapsed
+            ? { width: panelWidth }
+            : undefined
+      }
     >
       {collapsed ? (
         <button
@@ -671,7 +673,7 @@ export function CaseChatPanel({
           >
             <Trash2 className="size-3.5" />
           </button>
-          {!detached && caseId && (
+          {!detached && !poppedOut && caseId && (
             <button
               type="button"
               onClick={detachChatPanel}
@@ -679,15 +681,15 @@ export function CaseChatPanel({
               className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
               title={
                 isStreaming
-                  ? "当前任务完成后可独立显示"
-                  : "独立显示(可最大化或拖到外接屏)"
+                  ? "当前任务完成后可全屏显示"
+                  : "全屏显示 AI 助手(铺满主窗口,避开 Windows 独立窗口渲染问题)"
               }
-              aria-label="将 AI 助手独立显示"
+              aria-label="将 AI 助手全屏显示"
             >
               <ExternalLink className="size-3.5" />
             </button>
           )}
-          {!detached && (
+          {!detached && !poppedOut && (
             <button
               type="button"
               onClick={() => setCollapsed(true)}
@@ -698,7 +700,7 @@ export function CaseChatPanel({
               <ChevronRight className="size-3.5" />
             </button>
           )}
-          {detached && (
+          {(detached || poppedOut) && (
             <button
               type="button"
               onClick={reattachChatPanel}

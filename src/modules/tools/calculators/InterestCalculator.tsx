@@ -5,7 +5,7 @@
  *   - 利息计算(interest):多本金 + 各自时间段 + 自定义利率 / LPR;按 LPR 变化点分段
  *   - 执行款(execution):多案件 + 多还款 + 五阶段清偿 + 迟延履行利息
  *
- * 计算逻辑见 ../lib/interestCalc.ts(100% 移植自 lawtools.top/interest.html)。
+ * 计算逻辑见 ../lib/interestCalc.ts。
  *
  * 法律依据:利息 / 执行款 两套独立弹窗。
  */
@@ -32,10 +32,12 @@ import {
   type ExecCaseInput,
   formatMoney,
   type InterestPrincipal,
+  type InterestSegment,
+  normalizeLprMultiplier,
   type RateType,
   type Repayment,
 } from "../lib/interestCalc";
-import { getLprForDate, type LprTerm } from "../lib/lprData";
+import type { LprTerm } from "../lib/lprData";
 import { todayIso } from "../lib/dateMath";
 
 type Mode = "interest" | "execution";
@@ -148,6 +150,7 @@ function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
       const principal = parseFloat(p.principal);
       if (!principal || principal <= 0) return null;
       const customRate = parseFloat(p.rate) || 0;
+      const lprMultiplier = normalizeLprMultiplier(parseFloat(p.lprMultiplier));
       const interest = calculateInterestByPeriod(
         principal,
         p.startDate,
@@ -155,10 +158,9 @@ function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
         p.rateType,
         customRate,
         p.lprTerm,
+        lprMultiplier,
       );
       const days = daysBetween(p.startDate, p.endDate);
-      const lprRate =
-        p.rateType === "lpr" ? getLprForDate(p.startDate, p.lprTerm) : null;
       const segments = calculateInterestSegments(
         principal,
         p.startDate,
@@ -166,8 +168,9 @@ function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
         p.rateType,
         customRate,
         p.lprTerm,
+        lprMultiplier,
       );
-      return { p, principal, interest, days, lprRate, segments };
+      return { p, principal, interest, days, lprMultiplier, segments };
     })
     .filter((x): x is NonNullable<typeof x> => x !== null);
 
@@ -246,6 +249,9 @@ function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
                   <div key={i}>
                     <p className="font-medium">
                       本金 {i + 1}: {formatMoney(x.principal)} · {x.p.startDate} ~ {x.p.endDate} · 共 {x.days} 天
+                      {x.p.rateType === "lpr" && x.lprMultiplier !== 1
+                        ? ` · LPR × ${formatMultiplier(x.lprMultiplier)}`
+                        : ""}
                     </p>
                     {x.p.rateType === "custom" ? (
                       <p className="pl-3 font-mono text-muted-foreground">
@@ -255,7 +261,7 @@ function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
                       <div className="space-y-0.5 pl-3 font-mono text-muted-foreground">
                         {x.segments.map((s, si) => (
                           <p key={si}>
-                            {s.startDate} ~ {s.endDate}: LPR {s.rate}% × {s.days} 天 = {formatMoney(s.interest)}
+                            {s.startDate} ~ {s.endDate}: {formatInterestSegmentFormula(x.principal, s)} = {formatMoney(s.interest)}
                           </p>
                         ))}
                         <p className="font-medium text-foreground">
@@ -281,9 +287,32 @@ function makeBlankPrincipal(): InterestPrincipal {
     rateType: "custom",
     rate: "",
     lprTerm: "1y",
+    lprMultiplier: "1",
     startDate: "",
     endDate: todayIso(),
   };
+}
+
+function formatMultiplier(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function formatRate(value: number): string {
+  return value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function formatInterestSegmentFormula(
+  principal: number,
+  segment: InterestSegment,
+): string {
+  if (segment.rateType === "custom") {
+    return `${principal} × ${formatRate(segment.rate)}% ÷ 365 × ${segment.days} 天`;
+  }
+  const rateText =
+    segment.multiplier === 1
+      ? `LPR ${formatRate(segment.baseRate)}%`
+      : `LPR ${formatRate(segment.baseRate)}% × ${formatMultiplier(segment.multiplier)} = ${formatRate(segment.rate)}%`;
+  return `${principal} × ${rateText} ÷ 365 × ${segment.days} 天`;
 }
 
 function PrincipalRow({
@@ -354,14 +383,31 @@ function PrincipalRow({
                 </span>
               </div>
             ) : (
-              <select
-                value={data.lprTerm}
-                onChange={(e) => onChange({ lprTerm: e.target.value as LprTerm })}
-                className="flex-1 rounded border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-foreground/50"
-              >
-                <option value="1y">1 年期 LPR</option>
-                <option value="5y+">5 年期以上 LPR</option>
-              </select>
+              <>
+                <select
+                  value={data.lprTerm}
+                  onChange={(e) => onChange({ lprTerm: e.target.value as LprTerm })}
+                  className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-foreground/50"
+                >
+                  <option value="1y">1 年期 LPR</option>
+                  <option value="5y+">5 年期以上 LPR</option>
+                </select>
+                <div className="relative w-24">
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.01}
+                    placeholder="1.5"
+                    value={data.lprMultiplier}
+                    onChange={(e) => onChange({ lprMultiplier: e.target.value })}
+                    className="w-full rounded border border-border bg-background px-2 py-1.5 pr-7 font-mono text-sm outline-none focus:border-foreground/50"
+                    aria-label="LPR 倍数"
+                  />
+                  <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">
+                    倍
+                  </span>
+                </div>
+              </>
             )}
           </div>
         </SmallField>
@@ -428,7 +474,7 @@ function ExecutionPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) 
       if (principal <= 0) return null;
       const rate =
         c.rateType === "lpr"
-          ? getLprForDate(c.startDate, c.lprTerm) ?? 3.65
+          ? 0
           : parseFloat(c.rate) || 0;
       return {
         id: c.id,
@@ -437,6 +483,7 @@ function ExecutionPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) 
         rate,
         rateType: c.rateType,
         lprTerm: c.lprTerm,
+        lprMultiplier: normalizeLprMultiplier(parseFloat(c.lprMultiplier)),
         startDate: c.startDate,
         endDate: c.endDate || todayIso(),
         litigationFee: parseFloat(c.litigationFee) || 0,
@@ -647,6 +694,7 @@ interface ExecCaseFormData {
   rate: string;
   rateType: RateType;
   lprTerm: LprTerm;
+  lprMultiplier: string;
   startDate: string;
   endDate: string;
   litigationFee: string;
@@ -662,6 +710,7 @@ function makeBlankCase(): ExecCaseFormData {
     rate: "",
     rateType: "custom",
     lprTerm: "1y",
+    lprMultiplier: "1",
     startDate: "",
     endDate: todayIso(),
     litigationFee: "",
@@ -743,14 +792,31 @@ function CaseRow({
                 </span>
               </div>
             ) : (
-              <select
-                value={data.lprTerm}
-                onChange={(e) => onChange({ lprTerm: e.target.value as LprTerm })}
-                className="flex-1 rounded border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-foreground/50"
-              >
-                <option value="1y">1 年期 LPR</option>
-                <option value="5y+">5 年期以上 LPR</option>
-              </select>
+              <>
+                <select
+                  value={data.lprTerm}
+                  onChange={(e) => onChange({ lprTerm: e.target.value as LprTerm })}
+                  className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-foreground/50"
+                >
+                  <option value="1y">1 年期 LPR</option>
+                  <option value="5y+">5 年期以上 LPR</option>
+                </select>
+                <div className="relative w-24">
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.01}
+                    placeholder="1.5"
+                    value={data.lprMultiplier}
+                    onChange={(e) => onChange({ lprMultiplier: e.target.value })}
+                    className="w-full rounded border border-border bg-background px-2 py-1.5 pr-7 font-mono text-sm outline-none focus:border-foreground/50"
+                    aria-label="LPR 倍数"
+                  />
+                  <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">
+                    倍
+                  </span>
+                </div>
+              </>
             )}
           </div>
         </SmallField>
@@ -884,6 +950,15 @@ function ExecDetailBlock({
               <p>
                 {s.repDate} 还款 {formatMoney(s.repAmount)} · 距上次计息 {s.daysSinceLast} 天 · 新增利息 {formatMoney(s.newInterest)}
               </p>
+              {s.interestSegments.length > 0 && (
+                <div className="pl-3 font-mono text-muted-foreground/80">
+                  {s.interestSegments.map((seg, si) => (
+                    <p key={si}>
+                      {seg.startDate} ~ {seg.endDate}: {formatInterestSegmentFormula(seg.principal, seg)} = {formatMoney(seg.interest)}
+                    </p>
+                  ))}
+                </div>
+              )}
               <p className="pl-3 font-mono">
                 抵扣: {s.deductions.map((d) => `${d.type} ${formatMoney(d.amount)}`).join(" / ")}
               </p>
@@ -895,9 +970,17 @@ function ExecDetailBlock({
         </div>
       )}
       {result.finalDays > 0 && (
-        <p className="mt-1 pl-3 text-muted-foreground">
-          末段:剩余本金 × 日利率 × {result.finalDays} 天 = {formatMoney(result.finalInterest)}
-        </p>
+        <div className="mt-1 pl-3 text-muted-foreground">
+          <p>末段利息:</p>
+          <div className="pl-3 font-mono text-muted-foreground/80">
+            {result.finalInterestSegments.map((seg, i) => (
+              <p key={i}>
+                {seg.startDate} ~ {seg.endDate}: {formatInterestSegmentFormula(seg.principal, seg)} = {formatMoney(seg.interest)}
+              </p>
+            ))}
+          </div>
+          <p className="pl-3">小计: {formatMoney(result.finalInterest)}</p>
+        </div>
       )}
       {result.doubleSegments.length > 0 && (
         <div className="mt-1 pl-3">

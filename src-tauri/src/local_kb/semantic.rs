@@ -661,45 +661,10 @@ fn collect_corpus(kb_root: &Path) -> Vec<(String, PathBuf, String)> {
         }
     }
 
-    // ④ 兜底:默认目录一个文件都没扫到(用户把自己按分类组织的现成知识库直接接进来,
-    //    而非按 caseboard 的 raw/* + wiki/* 结构重建)→ 退一步扫整根目录的 .md/.txt。
-    //    仅在 out 完全为空时触发:走默认结构的用户 out 非空,永不进入,零回归。
-    //    skip 用分隔符无关的纯子串 contains(与上面 notes 的 `_deprecated` 约定一致),
-    //    否则 Windows 反斜杠路径下嵌套目录的过滤会失效。
-    if out.is_empty() {
-        crate::dlog!("[kb-semantic] 默认目录扫到 0 文件,fallback 扫描整根目录的 .md/.txt");
-        let skip_dirs: &[&str] = &["_deprecated", "yuandian-cache", "00_ARCHIVE"];
-        for entry in WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let p = entry.path();
-            if !p.is_file() {
-                continue;
-            }
-            let Some(file_name) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let rel = p
-                .strip_prefix(&root)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| p.to_string_lossy().into_owned());
-            if skip_dirs.iter().any(|d| rel.contains(d)) {
-                continue;
-            }
-            if !is_indexable_file(&rel, file_name) {
-                continue;
-            }
-            let Ok(meta) = std::fs::metadata(p) else {
-                continue;
-            };
-            if meta.len() > MAX_FILE_SIZE {
-                continue;
-            }
-            out.push((rel, p.to_path_buf(), file_cache_key(&meta)));
-        }
-    }
+    // ④ 整根目录补扫:不同系统 / 不同知识库迁移过来时,文件夹命名未必遵守
+    //    `raw/*` + `wiki/*`。标准目录先走特殊逻辑(法律去重 / 元典详情过滤 SEARCH),
+    //    然后把未覆盖的 .md/.txt 从整根补进来,避免自建分类漏索引。
+    collect_root_remaining(&root, &mut out);
 
     out
 }
@@ -737,6 +702,60 @@ fn collect_dir_all(root: &Path, dir: &str, out: &mut Vec<(String, PathBuf, Strin
         }
         out.push((rel, p.to_path_buf(), file_cache_key(&meta)));
     }
+}
+
+/// 补扫整根 KB 目录,只补当前 out 里还没有的 `.md/.txt`。
+///
+/// 排除:
+/// - `raw/yuandian-cache`:上面已经用详情规则专门收集,这里不能把 `SEARCH-*` 碎片卷进来;
+/// - `_deprecated` / `00_ARCHIVE`:沿用旧语义索引的排除口径;
+/// - `.git` / `node_modules` / `target` / `dist`:明显不是知识库正文。
+fn collect_root_remaining(root: &Path, out: &mut Vec<(String, PathBuf, String)>) {
+    let mut seen: std::collections::HashSet<String> =
+        out.iter().map(|(rel, _, _)| rel.clone()).collect();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let Some(file_name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let rel = p
+            .strip_prefix(root)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"));
+        if seen.contains(&rel) || should_skip_root_corpus_path(&rel) {
+            continue;
+        }
+        if !is_indexable_file(&rel, file_name) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(p) else {
+            continue;
+        };
+        if meta.len() > MAX_FILE_SIZE {
+            continue;
+        }
+        seen.insert(rel.clone());
+        out.push((rel, p.to_path_buf(), file_cache_key(&meta)));
+    }
+}
+
+fn should_skip_root_corpus_path(rel: &str) -> bool {
+    if rel == "raw/yuandian-cache" || rel.starts_with("raw/yuandian-cache/") {
+        return true;
+    }
+    rel.split('/').any(|seg| {
+        matches!(
+            seg,
+            "_deprecated" | "00_ARCHIVE" | ".git" | "node_modules" | "target" | "dist"
+        )
+    })
 }
 
 /// 进度事件名。前端 `listen("kb_index_progress", ...)` 拿 `{done, total, phase}`。

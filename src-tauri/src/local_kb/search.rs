@@ -1,7 +1,7 @@
 //! 整库关键词检索 + 文件读取(带路径穿越防护)。
 //!
-//! 默认搜索范围:`raw/notes/` + `raw/companies/` + `raw/cases-experience/` + `wiki/sources/` + `wiki/topics/` + `gap-log.md`
-//! **排除**:`raw/yuandian-cache/`(那是元典缓存,LLM 走 `verify_legal_citations` 等专用工具命中)
+//! 默认搜索范围:整个 `local_kb_root` 下的 `.md` / `.txt` 文件。
+//! **排除**:`raw/yuandian-cache/`(那是元典缓存,LLM 走专用元典工具命中;确需搜可显式 include)
 //!
 //! `read_kb_file` 的安全约束:
 //!   1. `canonicalize` + `starts_with` 防穿越(LLM 给 `../../etc/passwd` 直接拒)
@@ -20,6 +20,7 @@ const BINARY_PEEK_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy)]
 pub enum KbScope {
+    Root,            // 整个 local_kb_root(默认)
     Notes,           // raw/notes/
     Companies,       // raw/companies/(企业档案 / 调查报告)
     CasesExperience, // raw/cases-experience/(CaseBoard 结案沉淀的办案经验卡片)
@@ -32,6 +33,7 @@ pub enum KbScope {
 impl KbScope {
     fn rel_path(&self) -> &'static str {
         match self {
+            KbScope::Root => "",
             KbScope::Notes => "raw/notes",
             KbScope::Companies => "raw/companies",
             KbScope::CasesExperience => "raw/cases-experience",
@@ -80,14 +82,7 @@ pub struct KbSearchHit {
 }
 
 fn default_scopes() -> Vec<KbScope> {
-    vec![
-        KbScope::Notes,
-        KbScope::Companies,
-        KbScope::CasesExperience,
-        KbScope::Sources,
-        KbScope::Topics,
-        KbScope::GapLog,
-    ]
+    vec![KbScope::Root]
 }
 
 /// 在 KB 下做整库关键词检索。
@@ -119,7 +114,11 @@ pub fn search_kb_files(
     let mut hits: Vec<KbSearchHit> = Vec::new();
 
     for scope in scopes {
-        let target = root_canonical.join(scope.rel_path());
+        let target = if matches!(scope, KbScope::Root) {
+            root_canonical.clone()
+        } else {
+            root_canonical.join(scope.rel_path())
+        };
         if !target.exists() {
             continue;
         }
@@ -136,6 +135,9 @@ pub fn search_kb_files(
         {
             let p = entry.path();
             if !p.is_file() {
+                continue;
+            }
+            if matches!(scope, KbScope::Root) && should_skip_root_search_path(&root_canonical, p) {
                 continue;
             }
             // 只搜 .md / .txt(避免误读 .docx 等大二进制)
@@ -161,6 +163,22 @@ pub fn search_kb_files(
     });
     hits.truncate(opts.max_results);
     Ok(hits)
+}
+
+fn should_skip_root_search_path(root_canonical: &Path, path: &Path) -> bool {
+    let rel = path
+        .strip_prefix(root_canonical)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
+    if rel == "raw/yuandian-cache" || rel.starts_with("raw/yuandian-cache/") {
+        return true;
+    }
+    rel.split('/').any(|seg| {
+        matches!(
+            seg,
+            ".git" | "node_modules" | "target" | "dist" | "__MACOSX" | ".DS_Store"
+        )
+    })
 }
 
 fn try_match_file(

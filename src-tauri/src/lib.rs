@@ -5705,6 +5705,11 @@ pub fn run() {
             // 私人专属功能(双轨发布模型;开源仓为桩命令)
             private::telemetry_get,
             private::reset_yuandian_credits,
+            private::diligence_scan_folder,
+            private::diligence_infer_project_context,
+            private::diligence_write_markdown_artifact,
+            private::diligence_write_docx_artifact,
+            private::diligence_deep_audit,
             // 滴答清单(TickTick)双向同步(公开功能)
             ticktick::ticktick_call,
         ])

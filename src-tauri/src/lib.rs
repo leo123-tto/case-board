@@ -1171,6 +1171,141 @@ struct CourtFilingSourceDoc {
     missing: bool,
 }
 
+fn court_filing_pdf_text_signal(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    let result = pdf_inspector::process_pdf(path).ok()?;
+    if result.has_encoding_issues {
+        return None;
+    }
+    let text = result.markdown.unwrap_or_default();
+    let text = text.trim();
+    if text.chars().count() < 20 {
+        return None;
+    }
+    Some(text.chars().take(8_000).collect())
+}
+
+fn content_keywords_for_slot(slot_label: &str) -> &'static [&'static str] {
+    match slot_label {
+        "主体资格材料" => &[
+            "居民身份证",
+            "身份证号码",
+            "身份证号",
+            "统一社会信用代码",
+            "营业执照",
+            "法定代表人身份证明",
+            "法定代表人证明",
+            "主体资格",
+            "企业信用信息公示报告",
+        ],
+        "授权委托手续" => &[
+            "授权委托书",
+            "委托代理人",
+            "律师事务所函",
+            "律所函",
+            "律师执业证",
+        ],
+        "送达地址确认" => &["送达地址确认", "送达地址", "电子送达", "银行账户确认"],
+        "执行依据" => &["判决如下", "裁定如下", "调解协议", "仲裁裁决"],
+        "证据材料" => &["证据目录", "证明目的", "证据名称", "证据材料"],
+        _ => &[],
+    }
+}
+
+fn snippet_around_text(text: &str, needle: &str, before: usize, after: usize) -> Option<String> {
+    if needle.trim().is_empty() {
+        return None;
+    }
+    let byte_pos = text.find(needle)?;
+    let name_start = text[..byte_pos].chars().count();
+    let name_len = needle.chars().count();
+    let chars: Vec<char> = text.chars().collect();
+    let start = name_start.saturating_sub(before);
+    let end = (name_start + name_len + after).min(chars.len());
+    Some(chars[start..end].iter().collect())
+}
+
+fn court_filing_phone_near_party(text: &str, party_name: &str) -> Option<String> {
+    let snippet = snippet_around_text(text, party_name, 80, 320)?;
+    let labeled_phone_re = regex::Regex::new(
+        r"(?:联系电话|联系方式|联系电话号码|手机号码|手机号|电话|手机)\s*[：:]?\s*(1[3-9]\d{9})",
+    )
+    .ok()?;
+    if let Some(cap) = labeled_phone_re.captures(&snippet) {
+        if let Some(phone) = cap.get(1) {
+            return Some(phone.as_str().to_string());
+        }
+    }
+
+    let mobile_re = regex::Regex::new(r"1[3-9]\d{9}").ok()?;
+    mobile_re.find(&snippet).map(|m| m.as_str().to_string())
+}
+
+fn fill_defendant_phones_from_complaint(
+    case_data: &mut serde_json::Value,
+    materials: &serde_json::Value,
+) {
+    let complaint_paths: Vec<String> = materials
+        .get("0")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_array())
+                .filter_map(|item| item.first())
+                .filter_map(|path| path.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if complaint_paths.is_empty() {
+        return;
+    }
+
+    let complaint_texts: Vec<String> = complaint_paths
+        .iter()
+        .filter_map(|path| court_filing_pdf_text_signal(path))
+        .collect();
+    if complaint_texts.is_empty() {
+        return;
+    }
+
+    let phone_re = regex::Regex::new(r"^1[3-9]\d{9}$").ok();
+    for key in ["defendants", "third_parties"] {
+        if let Some(arr) = case_data[key].as_array_mut() {
+            for party in arr.iter_mut() {
+                let existing_phone = party
+                    .get("phone")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if phone_re
+                    .as_ref()
+                    .map(|re| re.is_match(existing_phone))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let party_name = party
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if party_name.is_empty() {
+                    continue;
+                }
+                if let Some(phone) = complaint_texts
+                    .iter()
+                    .find_map(|text| court_filing_phone_near_party(text, &party_name))
+                {
+                    party["phone"] = serde_json::json!(phone);
+                }
+            }
+        }
+    }
+}
+
 /// 通用材料包匹配：只处理用户本次选择的材料文件夹。
 ///
 /// 立案材料必须由用户先放进一个独立文件夹。后端只上传能明确识别到槽位的 PDF，
@@ -1248,6 +1383,13 @@ fn build_court_filing_materials(
             doc.source_path
         );
         let signal_lower = signal.to_lowercase();
+        let file_exists = std::path::Path::new(&doc.source_path).is_file();
+        let content_signal = if file_exists {
+            court_filing_pdf_text_signal(&doc.source_path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let content_lower = content_signal.to_lowercase();
 
         let mut best_slot: Option<(i32, &str, i32, Vec<String>)> = None;
         for (slot, label, keywords) in &slot_keywords {
@@ -1281,6 +1423,24 @@ fn build_court_filing_materials(
                     reasons.push(format!("命中关键词「{}」", kw));
                 }
             }
+            let mut content_hits = Vec::new();
+            for kw in content_keywords_for_slot(label) {
+                let kw_lower = kw.to_lowercase();
+                if content_lower.contains(&kw_lower) {
+                    content_hits.push(*kw);
+                }
+            }
+            if !content_hits.is_empty() {
+                let content_score = if score == 0 {
+                    (24 + (content_hits.len().saturating_sub(1) as i32 * 8)).min(42)
+                } else {
+                    (content_hits.len() as i32 * 4).min(12)
+                };
+                score += content_score;
+                for kw in content_hits {
+                    reasons.push(format!("PDF内容命中「{}」", kw));
+                }
+            }
             if best_slot
                 .as_ref()
                 .map(|(_, _, best, _)| score > *best)
@@ -1298,7 +1458,6 @@ fn build_court_filing_materials(
                 vec!["没有命中立案材料关键词，未自动上传".to_string()],
             ));
         let mut doc_warnings = Vec::new();
-        let file_exists = std::path::Path::new(&doc.source_path).is_file();
         if slot < 0 {
             doc_warnings.push("未识别为必备立案材料，已跳过上传".to_string());
         } else if score < 30 {
@@ -2830,6 +2989,7 @@ async fn start_court_filing(
             missing
         ));
     }
+    fill_defendant_phones_from_complaint(&mut case_data, &materials);
     case_data["materials"] = materials.clone();
     case_data["materials_manifest"] = material_report.clone();
     case_data["material_folder"] = serde_json::json!(material_folder);

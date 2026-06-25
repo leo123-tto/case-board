@@ -32,14 +32,18 @@ import {
 import {
   CATEGORIES,
   EMPTY_MARK,
+  EVIDENCE_ATTITUDES,
   sortByImportance,
+  SUBMISSION_STAGES,
   UNCATEGORIZED,
   type DocMark,
   type DocMarkMap,
+  type EvidenceAttitude,
   type Importance,
+  type SubmissionStage,
 } from "../lib/docMarks";
 
-/** 源文件区视图模式:原文件夹结构 / 分阶段(AI 分类)/ 整理视图 */
+/** 源文件区视图模式:AI 视图 / 原始视图 / 源结构视图 */
 type ViewMode = "folder" | "stage" | "organize";
 
 const PARTY_SIDES = ["原告", "被告", "第三人"] as const;
@@ -51,6 +55,8 @@ export interface MarkHandlers {
   onMarkPartySide: (docIds: string[], value: string, enabled: boolean) => void;
   /** 分类(单值,单文档;null=清空) */
   onMarkCategory: (docId: string, value: string | null) => void;
+  onMarkEvidenceAttitude: (docIds: string[], value: EvidenceAttitude | null) => void;
+  onMarkSubmissionStage: (docIds: string[], value: SubmissionStage | null) => void;
   /** 重命名(板内显示名,单文档;name=null/空=清回原文件名) */
   onRename: (docId: string, name: string | null) => void;
 }
@@ -69,6 +75,8 @@ export function SourceFilesSection({
   onMarkImportance,
   onMarkPartySide,
   onMarkCategory,
+  onMarkEvidenceAttitude,
+  onMarkSubmissionStage,
   onRename,
   onAiOrganize,
   organizing,
@@ -94,6 +102,8 @@ export function SourceFilesSection({
   onMarkImportance: (docIds: string[], value: Importance | null) => void;
   onMarkPartySide: (docIds: string[], value: string, enabled: boolean) => void;
   onMarkCategory: (docId: string, value: string | null) => void;
+  onMarkEvidenceAttitude: (docIds: string[], value: EvidenceAttitude | null) => void;
+  onMarkSubmissionStage: (docIds: string[], value: SubmissionStage | null) => void;
   /** 重命名板内显示名(单文档;null/空=清回原文件名) */
   onRename: (docId: string, name: string | null) => void;
   /** 🪄 AI 自动整理(整案分类) */
@@ -114,9 +124,8 @@ export function SourceFilesSection({
 }) {
   const [expanded, setExpanded] = useState(false);
   const toggle = () => setExpanded((v) => !v);
-  // Phase 2:视图模式。默认保持原「分阶段」视图(老用户更新后界面不变,无惊吓);
-  // 「原文件夹结构」「整理视图」作为后面新增的可选视图。
-  const [viewMode, setViewMode] = useState<ViewMode>("stage");
+  // 默认打开 AI 视图,让用户一进案件就能看到 AI 整理入口与分类结果。
+  const [viewMode, setViewMode] = useState<ViewMode>("organize");
 
   // 非 AI 产物的源文件,派生原始文件夹树(只读派生,跟着 source_path 走)
   const sourceDocs = useMemo(
@@ -132,6 +141,8 @@ export function SourceFilesSection({
     onMarkImportance,
     onMarkPartySide,
     onMarkCategory,
+    onMarkEvidenceAttitude,
+    onMarkSubmissionStage,
     onRename,
   };
 
@@ -207,24 +218,16 @@ export function SourceFilesSection({
 
       {expanded && (
         <div className="space-y-6 border-t border-border px-5 py-5">
-          <OverviewCard
-            total={total}
-            aiArtifacts={aiArtifacts.length}
-            groups={groups}
-            sourceDocs={sourceDocs}
-            markMap={markMap}
-          />
-
           {/* 视图切换 */}
           <div className="flex items-center gap-1 rounded-lg bg-muted/40 p-1 text-xs">
+            <ViewTab active={viewMode === "organize"} onClick={() => setViewMode("organize")}>
+              AI视图
+            </ViewTab>
             <ViewTab active={viewMode === "stage"} onClick={() => setViewMode("stage")}>
-              默认
+              原始视图
             </ViewTab>
             <ViewTab active={viewMode === "folder"} onClick={() => setViewMode("folder")}>
-              原文件夹结构
-            </ViewTab>
-            <ViewTab active={viewMode === "organize"} onClick={() => setViewMode("organize")}>
-              整理视图
+              源结构视图
             </ViewTab>
           </div>
 
@@ -294,110 +297,6 @@ export function SourceFilesSection({
         </div>
       )}
     </section>
-  );
-}
-
-function OverviewCard({
-  total,
-  aiArtifacts,
-  groups,
-  sourceDocs,
-  markMap,
-}: {
-  total: number;
-  aiArtifacts: number;
-  groups: Record<GroupKey, Document[]>;
-  sourceDocs: Document[];
-  markMap: DocMarkMap;
-}) {
-  // 是否已有标记(AI 整理 / 人工标记过任意 importance 或 category)
-  const hasMarks = sourceDocs.some((d) => {
-    const m = markMap.get(d.id);
-    return !!m && (m.importance !== null || m.category !== null);
-  });
-
-  let stats: { label: string; count: number; dim?: boolean }[];
-  if (hasMarks) {
-    // 整理过 → 顶部统计改成反映标记:重要/忽略 + 各归类(只显示有内容的)
-    const important = sourceDocs.filter(
-      (d) => markMap.get(d.id)?.importance === "重要",
-    ).length;
-    const ignored = sourceDocs.filter(
-      (d) => markMap.get(d.id)?.importance === "忽略",
-    ).length;
-    stats = [
-      { label: "重要", count: important },
-      { label: "忽略", count: ignored, dim: ignored === 0 },
-    ];
-    for (const cat of CATEGORIES) {
-      const c = sourceDocs.filter((d) => markMap.get(d.id)?.category === cat).length;
-      if (c > 0) stats.push({ label: cat, count: c });
-    }
-    const uncat = sourceDocs.filter((d) => !markMap.get(d.id)?.category).length;
-    if (uncat > 0) stats.push({ label: UNCATEGORIZED, count: uncat, dim: true });
-  } else {
-    // 未整理 → 维持原「按文件名分阶段」的统计(立案/一审/二审/执行)
-    stats = [
-      { label: "立案", count: groups.立案.length },
-      { label: "一审", count: groups.一审.length },
-      { label: "二审", count: groups.二审.length, dim: groups.二审.length === 0 },
-      { label: "执行", count: groups.执行.length },
-    ];
-  }
-
-  return (
-    <section className="rounded-lg border border-border bg-card px-5 py-4">
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-6">
-        <Stat label="总文档" count={total} primary />
-        {stats.map((s) => (
-          <Stat key={s.label} label={s.label} count={s.count} dim={s.dim} />
-        ))}
-        {aiArtifacts > 0 && <Stat label="AI 产物" count={aiArtifacts} accent />}
-      </div>
-    </section>
-  );
-}
-
-function Stat({
-  label,
-  count,
-  primary = false,
-  accent = false,
-  dim = false,
-}: {
-  label: string;
-  count: number;
-  primary?: boolean;
-  accent?: boolean;
-  dim?: boolean;
-}) {
-  return (
-    <div>
-      <div
-        className={cn(
-          "font-mono text-2xl font-semibold tracking-tight",
-          primary
-            ? "text-foreground"
-            : accent
-              ? "text-foreground"
-              : dim
-                ? "text-muted-foreground/40"
-                : "text-foreground",
-        )}
-      >
-        {count}
-      </div>
-      <div
-        className={cn(
-          "mt-0.5 text-xs",
-          accent
-            ? "font-medium text-foreground/80"
-            : "text-muted-foreground",
-        )}
-      >
-        {label}
-      </div>
-    </div>
   );
 }
 
@@ -625,6 +524,17 @@ function FolderTreeView({
               +{p}
             </button>
           ))}
+          <span className="mx-1 text-border">|</span>
+          {EVIDENCE_ATTITUDES.map((a) => (
+            <button
+              key={a}
+              type="button"
+              onClick={() => marks.onMarkEvidenceAttitude(docIds, a)}
+              className="rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-emerald-700 hover:bg-emerald-100"
+            >
+              {a}
+            </button>
+          ))}
         </div>
       )}
 
@@ -672,6 +582,8 @@ function FolderTreeView({
           mark={menu.mark}
           onImportance={(v) => marks.onMarkImportance(menu.docIds, v)}
           onParty={(v, en) => marks.onMarkPartySide(menu.docIds, v, en)}
+          onEvidenceAttitude={(v) => marks.onMarkEvidenceAttitude(menu.docIds, v)}
+          onSubmissionStage={(v) => marks.onMarkSubmissionStage(menu.docIds, v)}
           onCategory={
             menu.docIds.length === 1
               ? (v) => marks.onMarkCategory(menu.docIds[0], v)
@@ -743,7 +655,14 @@ function FileTile({
   const aiSuggested =
     mark.importanceSource === "ai_suggest" ||
     mark.categorySource === "ai_suggest" ||
+    mark.evidenceAttitudeSource === "ai_suggest" ||
+    mark.submissionStageSource === "ai_suggest" ||
     doc.display_name_source === "ai_suggest";
+  const bottomTags = [
+    ...mark.parties,
+    mark.evidenceAttitude,
+    mark.submissionStage,
+  ].filter(Boolean);
   return (
     <button
       type="button"
@@ -791,9 +710,11 @@ function FileTile({
       <span className="line-clamp-2 break-all text-xs text-foreground">
         {docDisplayName(doc)}
       </span>
-      {/* 底部:当事人侧角标 */}
-      {mark.parties.length > 0 && (
-        <span className="text-[10px] text-sky-600">{mark.parties.join("·")}</span>
+      {/* 底部:材料标签角标 */}
+      {bottomTags.length > 0 && (
+        <span className="line-clamp-1 text-[10px] text-sky-600">
+          {bottomTags.join("·")}
+        </span>
       )}
     </button>
   );
@@ -865,6 +786,7 @@ function DocRow({
           mark={mark}
           onImportance={(v) => marks.onMarkImportance([doc.id], v)}
           onParty={(v, en) => marks.onMarkPartySide([doc.id], v, en)}
+          onEvidenceAttitude={(v) => marks.onMarkEvidenceAttitude([doc.id], v)}
         />
       )}
 
@@ -1042,6 +964,8 @@ function OrganizeView({
           onImportance={(v) => marks.onMarkImportance([menu.doc.id], v)}
           onParty={(v, en) => marks.onMarkPartySide([menu.doc.id], v, en)}
           onCategory={(v) => marks.onMarkCategory(menu.doc.id, v)}
+          onEvidenceAttitude={(v) => marks.onMarkEvidenceAttitude([menu.doc.id], v)}
+          onSubmissionStage={(v) => marks.onMarkSubmissionStage([menu.doc.id], v)}
           onRename={() => setRenaming(menu.doc)}
           onClose={() => setMenu(null)}
         />
@@ -1067,6 +991,8 @@ function MarkContextMenu({
   onImportance,
   onParty,
   onCategory,
+  onEvidenceAttitude,
+  onSubmissionStage,
   onRename,
   onClose,
 }: {
@@ -1077,6 +1003,8 @@ function MarkContextMenu({
   mark?: DocMark;
   onImportance: (v: Importance | null) => void;
   onParty: (v: string, enabled: boolean) => void;
+  onEvidenceAttitude: (v: EvidenceAttitude | null) => void;
+  onSubmissionStage: (v: SubmissionStage | null) => void;
   /** 仅单文件提供 → 显示「归类」分区(批量不支持改分类) */
   onCategory?: (v: string | null) => void;
   /** 仅单文件提供 → 显示「重命名」(打开重命名弹窗) */
@@ -1106,7 +1034,7 @@ function MarkContextMenu({
     setPosition((current) =>
       current.left === left && current.top === top ? current : { left, top },
     );
-  }, [x, y, onCategory, onRename]);
+  }, [x, y, onCategory, onEvidenceAttitude, onRename, onSubmissionStage]);
 
   useEffect(() => {
     const close = () => onClose();
@@ -1221,6 +1149,44 @@ function MarkContextMenu({
           })}
         </>
       )}
+      <div className="my-1 border-t border-border" />
+      <div className="px-2 py-0.5 text-[11px] text-muted-foreground">证据倾向</div>
+      {EVIDENCE_ATTITUDES.map((a) => {
+        const on = mark?.evidenceAttitude === a;
+        return (
+          <button
+            key={a}
+            type="button"
+            className={item}
+            onClick={() => {
+              onEvidenceAttitude(on ? null : a);
+              onClose();
+            }}
+          >
+            <span className="w-3 text-emerald-600">{on ? "✓" : ""}</span>
+            {a}
+          </button>
+        );
+      })}
+      <div className="my-1 border-t border-border" />
+      <div className="px-2 py-0.5 text-[11px] text-muted-foreground">提交阶段</div>
+      {SUBMISSION_STAGES.map((stage) => {
+        const on = mark?.submissionStage === stage;
+        return (
+          <button
+            key={stage}
+            type="button"
+            className={item}
+            onClick={() => {
+              onSubmissionStage(on ? null : stage);
+              onClose();
+            }}
+          >
+            <span className="w-3 text-indigo-600">{on ? "✓" : ""}</span>
+            {stage}
+          </button>
+        );
+      })}
     </div>,
     document.body,
   );
@@ -1334,10 +1300,12 @@ function MarkControls({
   mark,
   onImportance,
   onParty,
+  onEvidenceAttitude,
 }: {
   mark: DocMark;
   onImportance: (v: Importance | null) => void;
   onParty: (v: string, enabled: boolean) => void;
+  onEvidenceAttitude: (v: EvidenceAttitude | null) => void;
 }) {
   return (
     <div
@@ -1387,6 +1355,26 @@ function MarkControls({
             )}
           >
             {p[0]}
+          </button>
+        );
+      })}
+      <span className="mx-0.5 text-border">·</span>
+      {EVIDENCE_ATTITUDES.map((a) => {
+        const on = mark.evidenceAttitude === a;
+        return (
+          <button
+            key={a}
+            type="button"
+            title={`证据倾向:${a}(再点取消)`}
+            onClick={() => onEvidenceAttitude(on ? null : a)}
+            className={cn(
+              "rounded px-1 text-[11px] leading-none transition-colors",
+              on
+                ? "bg-emerald-100 font-medium text-emerald-700"
+                : "text-muted-foreground/40 hover:text-emerald-600",
+            )}
+          >
+            {a[0]}
           </button>
         );
       })}

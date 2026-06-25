@@ -548,7 +548,7 @@ async fn verify_openai_compat_key(
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:官网部署的 `version.json` 接口。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:官网公开的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -767,6 +767,28 @@ async fn set_document_category(
     db::document_tags::set_category(pool.inner(), &document_id, value.as_deref()).await
 }
 
+/// 人工设证据倾向(单值):value=有利/不利/中性 或 None 清空。多个 document_ids = 整批。
+#[tauri::command]
+async fn set_document_evidence_attitude(
+    pool: tauri::State<'_, SqlitePool>,
+    document_ids: Vec<String>,
+    value: Option<String>,
+) -> Result<(), String> {
+    db::document_tags::set_evidence_attitude_batch(pool.inner(), &document_ids, value.as_deref())
+        .await
+}
+
+/// 人工设材料提交阶段(单值):value 为固定阶段之一或 None 清空。多个 document_ids = 整批。
+#[tauri::command]
+async fn set_document_submission_stage(
+    pool: tauri::State<'_, SqlitePool>,
+    document_ids: Vec<String>,
+    value: Option<String>,
+) -> Result<(), String> {
+    db::document_tags::set_submission_stage_batch(pool.inner(), &document_ids, value.as_deref())
+        .await
+}
+
 /// 人工设文档板内显示名(右键重命名)。`name=None`/空白 → 清回原文件名。
 /// 纯元数据,不动磁盘原件;改过后 AI 自动整理不再覆盖该名。
 #[tauri::command]
@@ -940,6 +962,35 @@ async fn ai_organize_inner(pool: &SqlitePool, case_id: &str) -> Result<usize, St
                 &r.category,
             )
             .await;
+            let _ = db::document_tags::set_ai_party_suggestions(pool, &r.id, &r.party_side).await;
+            if let Some(attitude) = r
+                .evidence_attitude
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let _ = db::document_tags::set_ai_suggestion(
+                    pool,
+                    &r.id,
+                    db::document_tags::NS_EVIDENCE_ATTITUDE,
+                    attitude,
+                )
+                .await;
+            }
+            if let Some(stage) = r
+                .submission_stage
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let _ = db::document_tags::set_ai_suggestion(
+                    pool,
+                    &r.id,
+                    db::document_tags::NS_SUBMISSION_STAGE,
+                    stage,
+                )
+                .await;
+            }
             // 显示名建议:仅当无人工改名时写(set_ai_display_name 内部保证人工永优先;空名跳过)
             if let Some(name) = r.name.as_deref() {
                 let _ = documents_db::set_ai_display_name(pool, &r.id, name).await;
@@ -4230,6 +4281,13 @@ struct CourtSmsIngestResult {
     sync: documents_db::SyncStats,
 }
 
+#[derive(serde::Serialize)]
+struct CourtSmsLocalDownloadResult {
+    downloaded: Vec<String>,
+    skipped: Vec<String>,
+    folder: String,
+}
+
 /// 案号归一化后比对 `agg_case_no` **以及 case_instances 全部审级案号**(2026-06-11:
 /// 短信里是一审案号、库里 agg 已是二审时也要能匹配),返回首个匹配案件 (id, 展示名)。
 async fn find_case_by_case_no(
@@ -4475,6 +4533,45 @@ async fn ingest_court_sms(
         downloaded,
         skipped,
         sync,
+    })
+}
+
+/// 仅下载到用户指定文件夹:不入案件、不写 documents、不触发 OCR/抽取。
+#[tauri::command]
+async fn download_court_sms_to_folder(
+    link: court_sms::ZxfwLink,
+    target_folder: String,
+) -> Result<CourtSmsLocalDownloadResult, String> {
+    let folder = Path::new(&target_folder);
+    if !folder.is_dir() {
+        return Err(format!("目标文件夹不可用: {}", target_folder));
+    }
+    let docs = court_sms::fetch_zxfw_doc_list(&link).await?;
+    if docs.is_empty() {
+        return Err("一张网未返回任何文书(链接可能已失效,请重新粘贴最新短信)".into());
+    }
+
+    let mut downloaded = vec![];
+    let mut skipped = vec![];
+    for d in &docs {
+        let dest = unique_path(folder, &sanitize_filename(&d.name), &d.ext);
+        match court_sms::download_doc(&d.wjlj, &dest).await {
+            Ok(_) => downloaded.push(
+                dest.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| d.name.clone()),
+            ),
+            Err(e) => {
+                crate::dlog!("court_sms 本地下载失败 {}: {}", d.name, e);
+                skipped.push(format!("{}({})", d.name, e));
+            }
+        }
+    }
+
+    Ok(CourtSmsLocalDownloadResult {
+        downloaded,
+        skipped,
+        folder: target_folder,
     })
 }
 
@@ -5578,6 +5675,8 @@ pub fn run() {
             set_document_importance,
             set_document_party_side,
             set_document_category,
+            set_document_evidence_attitude,
+            set_document_submission_stage,
             set_document_display_name,
             search_in_document,
             list_document_bookmarks,
@@ -5618,6 +5717,7 @@ pub fn run() {
             relink_case_folder,
             preview_court_sms,
             ingest_court_sms,
+            download_court_sms_to_folder,
             query_express,
             list_express_tracks,
             refresh_express_tracks,
@@ -5648,6 +5748,7 @@ pub fn run() {
             contract_review::export_contract_redline_docx,
             contract_draft::plan_contract_draft,
             contract_draft::generate_contract_draft,
+            contract_draft::extract_contract_draft_context_file,
             contract_draft::export_contract_draft_docx,
             contract_draft::revise_contract_draft,
             contract_draft::save_contract_draft,

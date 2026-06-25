@@ -31,6 +31,8 @@ pub fn task_user_prompt(task: TaskType) -> Option<&'static str> {
              - 阶段不明时默认按审理阶段,并注明\"阶段判断:依据不足,暂按审理阶段\"。\n\
              在文档开头用一行写明你判断的阶段。\n\
              \n\
+             【材料筛选】先调 `list_case_docs`,优先使用已整理标签:排除 importance=忽略 和 AI 产物;按 organized_category/party_side 选择与争议焦点相关的起诉材料、答辩材料、证据材料,不要把传票、开庭通知、法院文书当作实体依据。\n\
+             \n\
              【第二步 · 查证(凡引用必先工具验证,不得编条号)】\n\
              1. 先用 `search_local_kb` 查作者本地知识库已有整理(优先复用,省积分)\n\
              2. 用 `search_laws` 定位到确切法条(拿到 fgmc / 条号 / fgid),再用 `get_law_article(fgid+ftnum)` 取**那一条**全文进上下文核对 —— **整部法规不要喂进上下文**(费 token)\n\
@@ -62,6 +64,8 @@ pub fn task_user_prompt(task: TaskType) -> Option<&'static str> {
              - 执行阶段:对方=被执行人/案外人,对抗 = 执行异议 / 案外人异议 / 不予执行 / 管辖异议等\n\
              - ⚠️ 攻防方向锚定我方立场:我方=被告方时,「我方应对」是防守反驳;我方=原告方时,是巩固诉请、击破对方抗辩。别搞反。\n\
              \n\
+             【材料筛选】先调 `list_case_docs`,用 organized_category/party_side/evidence_attitude 筛材料:我方材料用于应对和反证,对方材料用于模拟对方打法;importance=忽略、法院文书、程序文书、参考材料默认排除。\n\
+             \n\
              【第二步 · 查证支持对方的依据】(凡引用必先工具验证)\n\
              1. `search_local_kb` 查本地是否有相关整理\n\
              2. `search_laws` / `get_law_article` 拿对方可能援引的法条\n\
@@ -84,6 +88,8 @@ pub fn task_user_prompt(task: TaskType) -> Option<&'static str> {
              目标不是中立罗列判决,而是:**找到相似案例,判断它们对「我方诉讼请求」是支持还是不利,并指出风险点。**\n\
              \n\
              【第一步 · 定位本案】从案件快照【当事人】的「我方代理立场」读出我方是哪一方(原告方/被告方/第三人),再读核心诉讼请求、案由、争议焦点、地域(法院所在地)。**先判断本案属哪类请求权检视程式**(违约四分法 / 侵权五分法 / 物权返还 / 不当得利),检索和对标都围绕该类的核心要件展开,便于按要件比对类案而非泛泛找「看起来像」的判决。**支持度永远针对「我方主张」判断**:我方=原告方→看类案是否支持我方诉请成立;我方=被告方→看类案是否支持我方抗辩/驳回对方诉请。立场未识别时先让用户确认,别默认按原告。\n\
+             \n\
+             【材料筛选】先调 `list_case_docs`,只读与案由、诉请/抗辩、核心证据有关的材料;已标忽略、程序/法院文书、参考材料不作事实基础。用 evidence_attitude 识别我方风险点和不利证据。\n\
              \n\
              【第二步 · 检索(凡引用必先工具验证)】\n\
              1. 先用 `search_local_kb` 查作者本地是否已整理过类案(优先复用,省积分)\n\
@@ -141,7 +147,7 @@ pub fn task_user_prompt(task: TaskType) -> Option<&'static str> {
              【立场】先从案件快照【当事人】的「我方代理立场」确认我方是哪一方;未识别时先问清用户代理哪一方再开始。\n\
              \n\
              【阶段一 · 中性事实与法律关系(不下法律定性)】\n\
-             读案件材料(必要时 `read_case_doc` / `semantic_search_case_docs`),整理:\
+             先调 `list_case_docs`,用 organized_category/party_side/evidence_attitude 筛出起诉/答辩材料和核心证据,排除忽略/程序/参考材料;再读案件材料(必要时 `read_case_doc` / `semantic_search_case_docs`),整理:\
              ① 中性事实笔记(只陈述事实,**不出现条文号、不做法律定性、不预判争点**);\
              ② 当事人之间的法律关系对(谁—谁,基于什么)。此步内部完成即可,不必单独问用户。\n\
              \n\

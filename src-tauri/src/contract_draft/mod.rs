@@ -19,7 +19,95 @@ use crate::db::contract_drafts as drafts_db;
 use crate::db::contract_drafts::{ContractDraft, ContractDraftVersion};
 use crate::db::contract_preferences as prefs_db;
 use crate::db::contract_preferences::ContractPreference;
+use serde::Serialize;
 use sqlx::SqlitePool;
+use std::path::Path;
+
+const CONTEXT_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
+const CONTEXT_FILE_MAX_CHARS: usize = 80_000;
+
+#[derive(Debug, Serialize)]
+pub struct ContractDraftContextFile {
+    pub filename: String,
+    pub path: String,
+    pub text: String,
+    pub char_count: usize,
+    pub truncated: bool,
+}
+
+fn is_supported_context_file(filename: &str) -> bool {
+    let lower = filename.to_lowercase();
+    [
+        ".pdf",
+        ".md",
+        ".markdown",
+        ".txt",
+        ".docx",
+        ".doc",
+        ".rtf",
+        ".odt",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+/// 读取合同起草附件上下文。只做本地低成本文本抽取;扫描 PDF 不触发云端 OCR。
+#[tauri::command]
+pub async fn extract_contract_draft_context_file(
+    path: String,
+) -> Result<ContractDraftContextFile, String> {
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Err(format!("文件不存在:{}", path));
+    }
+    if !p.is_file() {
+        return Err(format!("不是文件:{}", path));
+    }
+    let filename = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("附件")
+        .to_string();
+    if !is_supported_context_file(&filename) {
+        return Err("仅支持 PDF、Markdown、TXT、Word(.docx/.doc/.rtf/.odt) 文件".to_string());
+    }
+    let size = std::fs::metadata(p)
+        .map(|m| m.len())
+        .map_err(|e| format!("读不到文件元信息:{}", e))?;
+    if size > CONTEXT_FILE_MAX_BYTES {
+        return Err(format!(
+            "文件太大({:.1} MB),超过 {} MB 上限",
+            size as f64 / 1024.0 / 1024.0,
+            CONTEXT_FILE_MAX_BYTES / 1024 / 1024
+        ));
+    }
+
+    let text = crate::ingest::extractor::extract_text_only_cheap(p, &filename)
+        .await?
+        .ok_or_else(|| {
+            "这份文件没有可直接读取的文字。若是扫描版 PDF,请先 OCR/另存为可复制文字后再导入。"
+                .to_string()
+        })?;
+    let cleaned = text.trim();
+    if cleaned.chars().count() < 10 {
+        return Err("文件可读取文字太少,无法作为起草上下文。".to_string());
+    }
+    let char_count = cleaned.chars().count();
+    let truncated = char_count > CONTEXT_FILE_MAX_CHARS;
+    let text = if truncated {
+        cleaned.chars().take(CONTEXT_FILE_MAX_CHARS).collect()
+    } else {
+        cleaned.to_string()
+    };
+
+    Ok(ContractDraftContextFile {
+        filename,
+        path,
+        text,
+        char_count,
+        truncated,
+    })
+}
 
 /// 步骤 1-3:起草前规划(类型判定 + 结构大纲 + 引导式信息采集清单)。
 #[tauri::command]

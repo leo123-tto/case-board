@@ -880,16 +880,40 @@ export function CaseChatPanel({
           label="📝 写起诉状"
           hint="根据本案材料起草一份正式民事起诉状,落成可编辑文书、可导出 Word(法律格式)。信息不全会先弹选项问你"
           onClick={() =>
-            send("请根据本案已有材料,帮我起草一份民事起诉状。", null)
+            send("请根据本案已有材料,先按已整理的材料标签筛选我方起诉材料和我方证据,帮我起草一份民事起诉状。", null)
           }
           disabled={disabled}
-          className="border-emerald-500/40 bg-emerald-500/5 hover:bg-emerald-500/15"
+          className="border-blue-500/45 bg-blue-500/5 text-blue-700 hover:bg-blue-500/15 dark:text-blue-300"
+        />
+        <QuickChip
+          label="🛡️ 写答辩状"
+          hint="被告方专用:读取对方诉状、对方证据和我方被告证据,按程序抗辩→实体抗辩→证据反驳起草民事答辩状"
+          onClick={() =>
+            send(
+              "请站在被告方/答辩人立场,根据本案已整理的材料标签筛选:对方起诉材料、对方证据、我方被告证据,先解析原告诉讼请求和事实理由,再起草一份有针对性的民事答辩状。若案件快照显示我方不是被告方,请先提醒我确认立场。",
+              null,
+            )
+          }
+          disabled={disabled}
+          className="border-rose-500/45 bg-rose-500/5 text-rose-700 hover:bg-rose-500/15 dark:text-rose-300"
         />
         <QuickChip
           label="📋 写证据目录"
           hint="根据本案证据材料起草一份正式证据目录(表格形式),落成可编辑文书、可导出 Word"
           onClick={() =>
-            send("请根据本案证据材料,帮我起草一份证据目录(表格形式)。", null)
+            send("请根据本案已整理的材料标签,只选我方一侧的证据材料,并结合起诉状诉讼请求或答辩状抗辩意见,帮我起草一份证据目录(表格形式)。", null)
+          }
+          disabled={disabled}
+          className="border-emerald-500/40 bg-emerald-500/5 hover:bg-emerald-500/15"
+        />
+        <QuickChip
+          label="🧾 出质证意见"
+          hint="被告方常用:围绕对方证据逐项写真实性/合法性/关联性和证明目的异议,并提示我方反证"
+          onClick={() =>
+            send(
+              "请根据本案已整理的材料标签,优先读取对方提交的证据材料、对方起诉状/证据目录,结合我方被告证据,为被告方出一份质证意见。请逐项围绕真实性、合法性、关联性、证明目的和证明力进行质证,并指出可用的我方反证或需补强材料。",
+              null,
+            )
           }
           disabled={disabled}
           className="border-emerald-500/40 bg-emerald-500/5 hover:bg-emerald-500/15"

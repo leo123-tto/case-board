@@ -66,6 +66,9 @@ class PartyInfoHandlerMixin(FormUtilsMixin):  # pragma: no cover
                 # 只有原告（我方当事人）才用律师电话填充，被告/第三人保持原样
                 if key == "plaintiffs" and not self._is_mobile_phone(party_phone):
                     party_phone = agent_phone
+                # 传给法人/其他组织的 agent_phone 会在其联系电话缺失时作为 fallback。
+                # 该 fallback 只允许用于我方当事人，避免把我方律师电话写进被告/第三人字段。
+                agent_phone_for_party = agent_phone if key == "plaintiffs" else ""
                 party_address = str(party.get("address", "") or "")
 
                 # 归一化当事人类别
@@ -82,7 +85,7 @@ class PartyInfoHandlerMixin(FormUtilsMixin):  # pragma: no cover
                         self._add_party_by_type(
                             client_type=client_type,
                             section_title=section_title,
-                            agent_phone=agent_phone,
+                            agent_phone=agent_phone_for_party,
                             party=party,
                             party_phone=party_phone,
                         )
@@ -90,7 +93,7 @@ class PartyInfoHandlerMixin(FormUtilsMixin):  # pragma: no cover
                     self._add_party_by_type(
                         client_type=client_type,
                         section_title=section_title,
-                        agent_phone=agent_phone,
+                        agent_phone=agent_phone_for_party,
                         party=party,
                         party_phone=party_phone,
                     )

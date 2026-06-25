@@ -12,10 +12,13 @@
 import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { save as dialogSave } from "@tauri-apps/plugin-dialog";
+import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
   BookMarked,
+  FileText,
   FileSignature,
   FolderOpen,
   History,
@@ -28,6 +31,8 @@ import {
   Sparkles,
   Star,
   Trash2,
+  Upload,
+  X,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -37,6 +42,7 @@ import {
   addContractPreference,
   deleteContractDraft,
   deleteContractPreference,
+  extractContractDraftContextFile,
   exportContractDraftDocx,
   generateContractDraft,
   listContractDraftVersions,
@@ -48,6 +54,7 @@ import {
   revealInFinder,
   saveContractDraft,
   type ContractDraft,
+  type ContractDraftContextFile,
   type ContractDraftPlan,
   type ContractDraftResult,
   type ContractDraftVersion,
@@ -56,6 +63,9 @@ import {
 
 type Stance = "party_a" | "party_b" | "neutral";
 type Step = "input" | "plan" | "draft";
+type RequirementContextFile = ContractDraftContextFile & { id: string };
+
+const CONTEXT_FILE_EXTS = ["pdf", "md", "markdown", "txt", "docx", "doc", "rtf", "odt"];
 
 const STANCE_OPTIONS: { id: Stance; label: string; hint: string }[] = [
   { id: "party_a", label: "我方代表甲方", hint: "条款倾向护甲方" },
@@ -65,6 +75,19 @@ const STANCE_OPTIONS: { id: Stance; label: string; hint: string }[] = [
 
 function stanceCn(s: string): string {
   return STANCE_OPTIONS.find((o) => o.id === s)?.label ?? "中立平衡";
+}
+
+function extOf(p: string): string {
+  return (p.split(".").pop() || "").toLowerCase();
+}
+
+function basename(p: string): string {
+  return p.split(/[\\/]/).pop() || p;
+}
+
+function formatChars(n: number): string {
+  if (n >= 10000) return `${(n / 10000).toFixed(1)}万字`;
+  return `${n}字`;
 }
 
 function formatError(e: unknown): string {
@@ -79,12 +102,35 @@ function formatError(e: unknown): string {
   }
 }
 
+function buildRequirementWithContext(
+  requirement: string,
+  files: RequirementContextFile[],
+): string {
+  const base = requirement.trim();
+  if (!files.length) return base;
+  const blocks = files.map((file, i) => {
+    const note = file.truncated ? "\n(注:该附件正文较长,这里只纳入前部可读文本。)" : "";
+    return `### 附件 ${i + 1}:${file.filename}\n来源:${file.path}${note}\n\n${file.text.trim()}`;
+  });
+  return [
+    base || "用户未另行口述需求,请以附件材料为主要交易背景和起草需求来源。",
+    "",
+    "【需求附件上下文】",
+    "以下内容来自用户导入/拖入的 PDF、Markdown、文本或 Word 文件。请把它们作为合同起草需求上下文;若附件与口述冲突,在规划 notes 或草案 assumptions 中提示需要用户确认。",
+    "",
+    ...blocks,
+  ].join("\n");
+}
+
 export function ContractDraftTool() {
   const [step, setStep] = useState<Step>("input");
   const [requirement, setRequirement] = useState("");
   const [stance, setStance] = useState<Stance>("neutral");
   const [typeHint, setTypeHint] = useState("");
   const [collected, setCollected] = useState("");
+  const [contextFiles, setContextFiles] = useState<RequirementContextFile[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const [loadingFiles, setLoadingFiles] = useState(false);
 
   const [plan, setPlan] = useState<ContractDraftPlan | null>(null);
   const [draft, setDraft] = useState<ContractDraftResult | null>(null);
@@ -121,6 +167,84 @@ export function ContractDraftTool() {
   useEffect(() => {
     loadLibrary();
     loadPrefs();
+  }, []);
+
+  const combinedRequirement = () => buildRequirementWithContext(requirement, contextFiles);
+
+  const addContextFiles = async (paths: string[]) => {
+    const candidates = Array.from(new Set(paths.filter(Boolean)));
+    if (!candidates.length) return;
+    setError("");
+    setLoadingFiles(true);
+    setBusyMsg("正在读取附件文本…");
+    const failures: string[] = [];
+    try {
+      for (const path of candidates) {
+        const ext = extOf(path);
+        if (!CONTEXT_FILE_EXTS.includes(ext)) {
+          failures.push(`${basename(path)}:不支持 .${ext || "未知"} 文件`);
+          continue;
+        }
+        try {
+          const file = await extractContractDraftContextFile(path);
+          setContextFiles((prev) =>
+            prev.some((f) => f.path === file.path)
+              ? prev
+              : [...prev, { ...file, id: `${file.path}-${Date.now()}` }],
+          );
+        } catch (e) {
+          failures.push(`${basename(path)}:${formatError(e)}`);
+        }
+      }
+      if (failures.length) setError(failures.join("\n"));
+    } finally {
+      setLoadingFiles(false);
+      setBusyMsg("");
+    }
+  };
+
+  const pickContextFiles = async () => {
+    setError("");
+    try {
+      const picked = await dialogOpen({
+        directory: false,
+        multiple: true,
+        filters: [{ name: "需求附件", extensions: CONTEXT_FILE_EXTS }],
+      });
+      const paths = Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
+      await addContextFiles(paths);
+    } catch (e) {
+      setError(formatError(e));
+    }
+  };
+
+  const removeContextFile = (id: string) => {
+    setContextFiles((prev) => prev.filter((f) => f.id !== id));
+  };
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const p = event.payload;
+        if (p.type === "enter" || p.type === "over") {
+          setDragging(true);
+        } else if (p.type === "drop") {
+          setDragging(false);
+          void addContextFiles(p.paths);
+        } else {
+          setDragging(false);
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch((e) => console.warn("listen contract draft drag-drop failed", e));
+    return () => {
+      if (unlisten) unlisten();
+    };
+    // 只需挂一次;addContextFiles 内部用函数式 state 去重。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /** 组装与当前合同类型相关的已确认偏好(通用 + 类型匹配),供注入起草/修订提示。 */
@@ -170,15 +294,16 @@ export function ContractDraftTool() {
   };
 
   const doPlan = async () => {
-    if (!requirement.trim()) {
-      setError("请先描述你要起草的交易/合同需求。");
+    const req = combinedRequirement();
+    if (!req.trim()) {
+      setError("请先描述需求,或导入 PDF、Markdown、文本、Word 作为起草上下文。");
       return;
     }
     setBusy(true);
     setBusyMsg("AI 分析需求、规划起草中…");
     setError("");
     try {
-      const p = await planContractDraft(requirement, stance, typeHint);
+      const p = await planContractDraft(req, stance, typeHint);
       setPlan(p);
       const skeleton = [
         ...p.required_info.map(
@@ -204,7 +329,7 @@ export function ContractDraftTool() {
     setError("");
     try {
       const r = await generateContractDraft(
-        requirement,
+        combinedRequirement(),
         stance,
         typeHint,
         collected + relevantPrefsBlock(),
@@ -253,7 +378,7 @@ export function ContractDraftTool() {
       draft.contract_name || draft.contract_type || "合同草案",
       draft.contract_type,
       stance,
-      requirement,
+      combinedRequirement(),
       previewMd,
     );
     setDraftId(d.id);
@@ -384,6 +509,7 @@ export function ContractDraftTool() {
     setDraft(null);
     setPreviewMd("");
     setCollected("");
+    setContextFiles([]);
     setDraftId(null);
     setVersions([]);
     setActiveVersionNo(null);
@@ -439,6 +565,71 @@ export function ContractDraftTool() {
               placeholder="例:我要把名下一间临街门面租给一家奶茶店,租期三年,押二付三,想约定到期优先续租、转租要我同意、装修不能动承重墙……"
               className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2 text-sm text-foreground outline-none focus:border-sky-400"
             />
+          </div>
+
+          <div
+            className={`rounded-lg border p-3 transition-colors ${
+              dragging
+                ? "border-sky-400 bg-sky-50/80 dark:bg-sky-950/30"
+                : "border-border bg-card"
+            }`}
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5 text-xs font-medium text-foreground">
+                  <FileText className="size-3.5" /> 需求附件
+                  <span className="text-[10px] font-normal text-muted-foreground">
+                    PDF / Markdown / TXT / Word,可直接拖入
+                  </span>
+                </div>
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  附件文字会作为起草上下文;扫描版 PDF 需先转成可复制文字。
+                </p>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={pickContextFiles}
+                disabled={busy || loadingFiles}
+              >
+                {loadingFiles ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Upload className="size-3.5" />
+                )}
+                导入文件
+              </Button>
+            </div>
+            {contextFiles.length > 0 && (
+              <ul className="mt-3 space-y-1.5">
+                {contextFiles.map((file) => (
+                  <li
+                    key={file.id}
+                    className="flex items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5 text-xs"
+                  >
+                    <FileText className="size-3.5 shrink-0 text-sky-600" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium text-foreground">
+                        {file.filename}
+                      </span>
+                      <span className="text-[10px] text-muted-foreground">
+                        {formatChars(file.char_count)}
+                        {file.truncated ? " · 已截取前部文本" : ""}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => removeContextFile(file.id)}
+                      className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      title="移除附件"
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
 
           <div>

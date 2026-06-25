@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::{opt_bool, opt_u32, require_str, Tool, ToolContext, ToolError, ToolResult};
+use crate::db::document_tags;
 use crate::db::documents::{list_documents_by_case, Document};
 
 const READ_DEFAULT_CHARS: usize = 8_000;
@@ -71,18 +72,58 @@ impl Tool for ListCaseDocs {
     async fn execute(&self, _args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
         let case_id = ctx.case_id.ok_or(ToolError::NoCaseBound)?;
         let docs = list_documents_by_case(ctx.pool, case_id).await?;
+        let tags = document_tags::list_by_case(ctx.pool, case_id).await?;
+        let mut tags_by_doc: std::collections::HashMap<&str, Vec<&document_tags::DocumentTag>> =
+            std::collections::HashMap::new();
+        for tag in &tags {
+            tags_by_doc
+                .entry(tag.document_id.as_str())
+                .or_default()
+                .push(tag);
+        }
         let arr: Vec<Value> = docs
             .iter()
             .map(|d| {
+                let doc_tags = tags_by_doc.get(d.id.as_str()).cloned().unwrap_or_default();
+                let tag_json: Vec<Value> = doc_tags
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "namespace": t.namespace,
+                            "value": t.value,
+                            "source": t.source,
+                        })
+                    })
+                    .collect();
+                let values = |namespace: &str| -> Vec<String> {
+                    doc_tags
+                        .iter()
+                        .filter(|t| t.namespace == namespace)
+                        .map(|t| t.value.clone())
+                        .collect()
+                };
+                let first_value = |namespace: &str| -> Option<String> {
+                    doc_tags
+                        .iter()
+                        .find(|t| t.namespace == namespace)
+                        .map(|t| t.value.clone())
+                };
                 json!({
                     "id": d.id,
                     "filename": d.filename,
+                    "display_name": d.display_name,
                     "category": d.category,
                     "is_ai_artifact": d.is_ai_artifact,
                     "source": d.source,
                     "has_extracted_text": d.extracted_text_path.is_some(),
                     "pinned_at": d.pinned_at,
                     "size_bytes": d.size_bytes,
+                    "organize_tags": tag_json,
+                    "importance": first_value(document_tags::NS_IMPORTANCE),
+                    "organized_category": first_value(document_tags::NS_CATEGORY),
+                    "party_side": values(document_tags::NS_PARTY_SIDE),
+                    "evidence_attitude": first_value(document_tags::NS_EVIDENCE_ATTITUDE),
+                    "submission_stage": first_value(document_tags::NS_SUBMISSION_STAGE),
                 })
             })
             .collect();

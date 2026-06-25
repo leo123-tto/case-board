@@ -23,8 +23,10 @@ import {
   reextractDocumentDewatermark,
   setDocumentCategory,
   setDocumentDisplayName,
+  setDocumentEvidenceAttitude,
   setDocumentImportance,
   setDocumentPartySide,
+  setDocumentSubmissionStage,
 } from "@/lib/api";
 import { confirmDialog } from "@/lib/dialog";
 import { type Case, type Document, type DocumentTag } from "@/lib/types";
@@ -162,6 +164,28 @@ export function CaseView({
         await reloadTags();
       } catch (e) {
         toast(`分类失败:${e}`, "error");
+      }
+    },
+    [reloadTags],
+  );
+  const onMarkEvidenceAttitude = useCallback(
+    async (docIds: string[], value: string | null) => {
+      try {
+        await setDocumentEvidenceAttitude(docIds, value);
+        await reloadTags();
+      } catch (e) {
+        toast(`证据倾向标记失败:${e}`, "error");
+      }
+    },
+    [reloadTags],
+  );
+  const onMarkSubmissionStage = useCallback(
+    async (docIds: string[], value: string | null) => {
+      try {
+        await setDocumentSubmissionStage(docIds, value);
+        await reloadTags();
+      } catch (e) {
+        toast(`提交阶段标记失败:${e}`, "error");
       }
     },
     [reloadTags],
@@ -539,6 +563,8 @@ export function CaseView({
                     onMarkImportance={onMarkImportance}
                     onMarkPartySide={onMarkPartySide}
                     onMarkCategory={onMarkCategory}
+                    onMarkEvidenceAttitude={onMarkEvidenceAttitude}
+                    onMarkSubmissionStage={onMarkSubmissionStage}
                     onRename={onRename}
                     onAiOrganize={onAiOrganize}
                     organizing={organizing}

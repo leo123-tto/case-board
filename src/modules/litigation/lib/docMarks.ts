@@ -18,6 +18,18 @@ export const CATEGORIES = [
 ] as const;
 export const UNCATEGORIZED = "未分类";
 
+export const EVIDENCE_ATTITUDES = ["有利", "不利", "中性"] as const;
+export type EvidenceAttitude = (typeof EVIDENCE_ATTITUDES)[number];
+
+export const SUBMISSION_STAGES = [
+  "起诉/答辩随附",
+  "举证期限内",
+  "补充提交",
+  "二审新证据",
+  "未提交或待确认",
+] as const;
+export type SubmissionStage = (typeof SUBMISSION_STAGES)[number];
+
 export interface DocMark {
   /** 单值:重要 / 忽略 / null(普通) */
   importance: Importance | null;
@@ -25,6 +37,10 @@ export interface DocMark {
   /** 单值分类(六类之一)/ null(未分类) */
   category: string | null;
   categorySource: TagSource | null;
+  evidenceAttitude: EvidenceAttitude | null;
+  evidenceAttitudeSource: TagSource | null;
+  submissionStage: SubmissionStage | null;
+  submissionStageSource: TagSource | null;
   /** 可多值:原告 / 被告 / 第三人 */
   parties: string[];
 }
@@ -36,6 +52,10 @@ export const EMPTY_MARK: DocMark = {
   importanceSource: null,
   category: null,
   categorySource: null,
+  evidenceAttitude: null,
+  evidenceAttitudeSource: null,
+  submissionStage: null,
+  submissionStageSource: null,
   parties: [],
 };
 
@@ -75,6 +95,12 @@ export function buildMarkMap(tags: DocumentTag[]): DocMarkMap {
     } else if (t.namespace === "category") {
       e.category = t.value;
       e.categorySource = src;
+    } else if (t.namespace === "evidence_attitude") {
+      e.evidenceAttitude = t.value as EvidenceAttitude;
+      e.evidenceAttitudeSource = src;
+    } else if (t.namespace === "submission_stage") {
+      e.submissionStage = t.value as SubmissionStage;
+      e.submissionStageSource = src;
     } else if (t.namespace === "party_side") {
       e.parties.push(t.value);
     }

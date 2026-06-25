@@ -277,9 +277,9 @@ export interface CaseCandidate {
 export interface DocumentTag {
   id: string;
   document_id: string;
-  /** 'importance' | 'party_side' */
+  /** 'importance' | 'party_side' | 'category' | 'evidence_attitude' | 'submission_stage' */
   namespace: string;
-  /** importance: 重要|忽略 ; party_side: 原告|被告|第三人 */
+  /** importance: 重要|忽略 ; party_side: 原告|被告|第三人 ; evidence_attitude: 有利|不利|中性 */
   value: string;
   /** 'user' | 'ai_suggest' */
   source: string;

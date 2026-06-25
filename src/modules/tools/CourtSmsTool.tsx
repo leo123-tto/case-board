@@ -7,16 +7,31 @@
  * wjlj 下载地址有时效:预览只拿文书名,确认导入时后端重新拉新鲜地址再下。
  */
 import { useEffect, useState } from "react";
-import { FileText, Loader2, Gavel, CheckCircle2, AlertTriangle } from "lucide-react";
+import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Download,
+  FileText,
+  FolderOpen,
+  Gavel,
+  Loader2,
+} from "lucide-react";
 
 import {
+  downloadCourtSmsToFolder,
   listCases,
   previewCourtSms,
   ingestCourtSms,
+  revealInFinder,
   type CourtSmsPreview,
 } from "@/lib/api";
 import type { Case } from "@/lib/types";
 import { toast } from "@/components/ui/toast";
+
+type DownloadDone =
+  | { mode: "case"; files: string[]; skipped: string[] }
+  | { mode: "folder"; files: string[]; skipped: string[]; folder: string };
 
 export function CourtSmsTool() {
   const [sms, setSms] = useState("");
@@ -25,7 +40,8 @@ export function CourtSmsTool() {
   const [cases, setCases] = useState<Case[]>([]);
   const [pickedCaseId, setPickedCaseId] = useState<string>("");
   const [ingesting, setIngesting] = useState(false);
-  const [done, setDone] = useState<{ files: string[]; skipped: string[] } | null>(null);
+  const [downloadingLocal, setDownloadingLocal] = useState(false);
+  const [done, setDone] = useState<DownloadDone | null>(null);
 
   useEffect(() => {
     listCases().then(setCases).catch(() => {});
@@ -63,7 +79,7 @@ export function CourtSmsTool() {
     setIngesting(true);
     try {
       const r = await ingestCourtSms(pickedCaseId, preview.link);
-      setDone({ files: r.downloaded, skipped: r.skipped });
+      setDone({ mode: "case", files: r.downloaded, skipped: r.skipped });
       if (r.downloaded.length > 0) {
         toast(
           `已下载 ${r.downloaded.length} 份文书进案件,正在后台抽取,稍后在案件里查看`,
@@ -76,6 +92,31 @@ export function CourtSmsTool() {
       toast(`导入失败:${e}`, "error");
     } finally {
       setIngesting(false);
+    }
+  };
+
+  const handleDownloadToFolder = async () => {
+    if (!preview?.link) return;
+    try {
+      const picked = await dialogOpen({
+        directory: true,
+        multiple: false,
+        title: "选择法院文书保存文件夹",
+      });
+      if (typeof picked !== "string" || !picked.trim()) return;
+      setDownloadingLocal(true);
+      const r = await downloadCourtSmsToFolder(preview.link, picked);
+      setDone({ mode: "folder", files: r.downloaded, skipped: r.skipped, folder: r.folder });
+      if (r.downloaded.length > 0) {
+        toast(`已下载 ${r.downloaded.length} 份文书到本地文件夹`, "success");
+        await revealInFinder(r.folder).catch(() => {});
+      } else {
+        toast("没有下载到文书(链接可能已失效)", "error");
+      }
+    } catch (e) {
+      toast(`下载失败:${e}`, "error");
+    } finally {
+      setDownloadingLocal(false);
     }
   };
 
@@ -101,7 +142,7 @@ export function CourtSmsTool() {
       {/* 说明 */}
       <div className="rounded-lg border border-sky-200 bg-sky-50 px-4 py-3 text-xs text-sky-800 dark:border-sky-800/50 dark:bg-sky-950/30 dark:text-sky-200">
         把法院发来的<strong>送达短信</strong>整条粘进来 —— 自动识别案号、下载文书 PDF、
-        归档进对应案件并触发抽取上看板。目前仅支持
+        可归档进对应案件并触发抽取上看板;匹配不到案件时也可直接下载到本地文件夹。目前仅支持
         <strong>「人民法院在线服务/一张网」(zxfw.court.gov.cn)</strong>的链接(无需登录)。
       </div>
 
@@ -213,6 +254,19 @@ export function CourtSmsTool() {
                   )}
                   下载并归档到案件
                 </button>
+                <button
+                  type="button"
+                  onClick={handleDownloadToFolder}
+                  disabled={downloadingLocal || preview.docs.length === 0}
+                  className="ml-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3.5 py-2 text-xs font-medium text-foreground transition-colors hover:bg-muted disabled:opacity-40"
+                >
+                  {downloadingLocal ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <FolderOpen className="size-3.5" />
+                  )}
+                  下载到本地文件夹
+                </button>
               </div>
             </>
           )}
@@ -223,9 +277,20 @@ export function CourtSmsTool() {
       {done && (
         <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-xs text-emerald-800 dark:border-emerald-800/50 dark:bg-emerald-950/30 dark:text-emerald-200">
           <p className="flex items-center gap-1.5 font-medium">
-            <CheckCircle2 className="size-3.5" />
-            已归档 {done.files.length} 份文书,后台正在抽取
+            {done.mode === "folder" ? (
+              <Download className="size-3.5" />
+            ) : (
+              <CheckCircle2 className="size-3.5" />
+            )}
+            {done.mode === "folder"
+              ? `已下载 ${done.files.length} 份文书到本地文件夹`
+              : `已归档 ${done.files.length} 份文书,后台正在抽取`}
           </p>
+          {done.mode === "folder" && (
+            <p className="mt-1.5 break-all text-emerald-700/80 dark:text-emerald-300/70">
+              保存位置:{done.folder}
+            </p>
+          )}
           {done.files.length > 0 && (
             <ul className="mt-1.5 list-inside list-disc space-y-0.5 pl-1">
               {done.files.map((f, i) => (
@@ -238,9 +303,11 @@ export function CourtSmsTool() {
               跳过 {done.skipped.length} 份:{done.skipped.join("；")}
             </p>
           )}
-          <p className="mt-2 text-emerald-700/80 dark:text-emerald-300/70">
-            打开对应案件即可看到新文书与抽取后的内容(开庭传票/判决书会更新到看板)。
-          </p>
+          {done.mode === "case" && (
+            <p className="mt-2 text-emerald-700/80 dark:text-emerald-300/70">
+              打开对应案件即可看到新文书与抽取后的内容(开庭传票/判决书会更新到看板)。
+            </p>
+          )}
         </div>
       )}
     </div>

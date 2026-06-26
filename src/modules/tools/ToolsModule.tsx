@@ -21,6 +21,7 @@ import { useEffect, useState } from "react";
 import type { InterestPrefill } from "./calculators/InterestCalculator";
 import {
   ArrowLeft,
+  BarChart3,
   Briefcase,
   Calculator,
   Calendar,
@@ -51,6 +52,7 @@ import { CourierTool } from "./CourierTool";
 import { FeishuCalendarTool } from "./FeishuCalendarTool";
 import { CourtFilingTool } from "./CourtFilingTool";
 import { ElementConvertWorkbench } from "./ElementConvertWorkbench";
+import { LawyerInsightsTool } from "./LawyerInsightsTool";
 import { TickTickPanel } from "@/components/TickTickPanel";
 import { LegalToolCard } from "./components/LegalToolCard";
 
@@ -64,6 +66,7 @@ type LegalToolId =
   | "labor"
   | "kbshare"
   | "casebundle"
+  | "lawyerinsights"
   | "courtsms"
   | "courier"
   | "ticktick"
@@ -188,6 +191,31 @@ export function ToolsModule({
         <div className="min-h-0 flex-1 overflow-auto">
           <div className="mx-auto max-w-3xl px-6 py-6">
             <CaseBundleTool />
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  // ──────────── 办案画像(案件数据分析,自带视图) ────────────
+  if (activeTool === "lawyerinsights") {
+    return (
+      <main className="flex h-full w-full flex-col bg-background">
+        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+          <button
+            type="button"
+            onClick={() => setActiveTool(null)}
+            className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <ArrowLeft className="size-3.5" />
+            返回工具列表
+          </button>
+          <span className="text-muted-foreground/40">·</span>
+          <h2 className="text-sm font-medium text-foreground">办案画像</h2>
+        </header>
+        <div className="min-h-0 flex-1 overflow-auto">
+          <div className="mx-auto max-w-5xl px-6 py-6">
+            <LawyerInsightsTool />
           </div>
         </div>
       </main>
@@ -413,6 +441,24 @@ export function ToolsModule({
                 title="案件资料包(双人办案合并)"
                 desc="导出某案件给合办律师 / 导入对方资料包合并进同一案件,材料按内容去重、并集、不冲突"
                 onClick={() => setActiveTool("casebundle")}
+              />
+            </div>
+          </section>
+
+          {/* 案件数据分析 */}
+          <section className="space-y-2">
+            <div className="px-1">
+              <h2 className="text-sm font-semibold text-foreground">案件数据分析</h2>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                基于看板里的本机案件数据做统计和导出,不给不存在的胜诉率、收入、案源渠道硬下结论
+              </p>
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <LegalToolCard
+                icon={BarChart3}
+                title="办案画像"
+                desc="统计高频案由、主要法院、代理立场、案件状态和标的金额,导出 Markdown 给 AI 继续分析"
+                onClick={() => setActiveTool("lawyerinsights")}
               />
             </div>
           </section>

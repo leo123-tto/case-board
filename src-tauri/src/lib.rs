@@ -462,6 +462,15 @@ async fn list_cases(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<Case>, Str
     cases_db::list_cases(pool.inner()).await.map_err(db_err)
 }
 
+/// 基于本机案件数据生成办案画像。只读 cases 表,不碰原始案件文件。
+#[tauri::command]
+async fn get_lawyer_insights(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<db::lawyer_insights::LawyerInsightsReport, String> {
+    let cases = cases_db::list_cases(pool.inner()).await.map_err(db_err)?;
+    Ok(db::lawyer_insights::build_lawyer_insights_report(&cases))
+}
+
 /// 删除一个案件(级联删除所有关联文档/事件/联系人)。
 ///
 /// 不动原始文件夹,只删 CaseBoard 数据库里这个案件的记录。
@@ -548,7 +557,7 @@ async fn verify_openai_compat_key(
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:官网公开的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:分发站点的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -1025,6 +1034,37 @@ async fn create_case_log(
         organized_markdown.as_deref(),
     )
     .await
+}
+
+#[tauri::command]
+async fn generate_case_work_report(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<String, String> {
+    db::case_logs::generate_work_report(pool.inner(), &case_id).await
+}
+
+#[tauri::command]
+async fn export_case_work_report_docx(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    save_path: String,
+    content_md: Option<String>,
+) -> Result<String, String> {
+    if let Some(content) = content_md.filter(|v| !v.trim().is_empty()) {
+        let bytes = crate::docx_filing::build_report_docx_bytes("案件工作汇报", &content)?;
+        std::fs::write(&save_path, bytes).map_err(|e| format!("写入工作汇报 Word 失败:{e}"))?;
+        return Ok(save_path);
+    }
+    db::case_logs::export_work_report_docx(pool.inner(), &case_id, &save_path).await
+}
+
+#[tauri::command]
+async fn generate_closing_materials(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<db::documents::Document, String> {
+    db::closing_materials::generate(pool.inner(), &case_id).await
 }
 
 #[tauri::command]
@@ -3727,6 +3767,18 @@ async fn export_report_docx(
     Ok(p.to_string_lossy().to_string())
 }
 
+/// 导出办案画像 Markdown。前端先通过保存对话框取得 save_path。
+#[tauri::command]
+async fn export_lawyer_insights_markdown(
+    pool: tauri::State<'_, SqlitePool>,
+    save_path: String,
+) -> Result<String, String> {
+    let cases = cases_db::list_cases(pool.inner()).await.map_err(db_err)?;
+    let report = db::lawyer_insights::build_lawyer_insights_report(&cases);
+    std::fs::write(&save_path, report.markdown).map_err(|e| format!("写 Markdown 失败:{}", e))?;
+    Ok(save_path)
+}
+
 /// 2026-05-25 V0.1.7 · 通用 MD → HTML 导出。
 /// 用于风险报告 / 深挖报告 / 完整报告(任何 MD 文件 + 标题)。
 #[tauri::command]
@@ -5643,6 +5695,7 @@ pub fn run() {
             plan_import_folder,
             commit_import_folder,
             list_cases,
+            get_lawyer_insights,
             get_case_with_docs,
             delete_case,
             read_text_file,
@@ -5685,6 +5738,9 @@ pub fn run() {
             ai_organize_case,
             list_case_logs,
             create_case_log,
+            generate_case_work_report,
+            export_case_work_report_docx,
+            generate_closing_materials,
             organize_case_log,
             add_calendar_event,
             list_calendar_events,
@@ -5712,6 +5768,7 @@ pub fn run() {
             reextract_document_dewatermark,
             export_report_html,
             export_report_docx,
+            export_lawyer_insights_markdown,
             recompute_case_extraction,
             refresh_case_files,
             relink_case_folder,

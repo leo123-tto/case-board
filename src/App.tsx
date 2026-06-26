@@ -38,6 +38,7 @@ import {
   deleteCase,
   getCaseWithDocs,
   getSettings,
+  generateClosingMaterials,
   globalExtractCase,
   importCaseFolder,
   planImportFolder,
@@ -140,6 +141,8 @@ function MainApp() {
   const [reportModalCase, setReportModalCase] = useState<Case | null>(null);
   /** 报告抽取中(没现成报告时点按钮,触发 globalExtractCase) */
   const [reportLoading, setReportLoading] = useState(false);
+  /** 线下归档用结案材料生成中 */
+  const [closingMaterialsLoading, setClosingMaterialsLoading] = useState(false);
   /** 2026-05-25 · 工具模块预填(从执行案件「算执行款」跳过来时带数据:本金/起算日/还款记录)*/
   const [toolsRoute, setToolsRoute] = useState<{
     tool: "interest" | "courtfiling" | null;
@@ -870,6 +873,28 @@ function MainApp() {
     }
   }, [selectedCase]);
 
+  const handleGenerateClosingMaterials = useCallback(async () => {
+    if (!selectedCase || closingMaterialsLoading) return;
+    setClosingMaterialsLoading(true);
+    const toastId = toast("正在生成结案归档材料要素…", "info", 0);
+    try {
+      const doc = await generateClosingMaterials(selectedCase.id);
+      setPreviewDoc(doc);
+      if (selectedId) {
+        const r = await getCaseWithDocs(selectedId);
+        setSelectedCase(r.case);
+        setDocuments(r.documents);
+        setCases((prev) => prev.map((c) => (c.id === r.case.id ? r.case : c)));
+      }
+      toast("已生成结案材料,可直接复制粘贴到线下归档表格", "success");
+    } catch (e) {
+      toast(`生成结案材料失败:${e}`, "error", 7000);
+    } finally {
+      setClosingMaterialsLoading(false);
+      dismissToast(toastId);
+    }
+  }, [selectedCase, selectedId, closingMaterialsLoading]);
+
   /** 是否正在跑刷新源文件(disable 按钮防重复点) */
   const [refreshingFiles, setRefreshingFiles] = useState(false);
   const [referenceMaterialsEnabled] = useFeatureFlag("reference_materials");
@@ -1077,6 +1102,8 @@ function MainApp() {
     refreshingFiles,
     onOpenReport: handleOpenReport,
     reportLoading,
+    onGenerateClosingMaterials: handleGenerateClosingMaterials,
+    closingMaterialsLoading,
     onReloadCase: handleReloadCase,
     editingDoc,
     onCloseEditor: handleCloseEditor,

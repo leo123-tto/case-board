@@ -1687,8 +1687,8 @@ function Field({
 }
 
 /**
- * 2026-06-16 · 首页功能开关卡(「功能开关」tab)。
- * 作者偏好清爽首页:新功能默认关,想用再开,逐设备生效(localStorage)。
+ * 2026-06-16 · 功能开关卡(「功能开关」tab)。
+ * 作者偏好清爽界面:新功能默认关,想用再开,逐设备生效(localStorage)。
  * 以后首页新增模块 → 在 src/lib/featureFlags.ts 的 FEATURE_FLAGS 加一条,这里自动出现开关。
  * 只渲染 location==="settings" 的开关;location==="feature" 的(如滴答待办)由对应功能页自己放。
  */
@@ -1703,8 +1703,8 @@ function FeatureFlagsCard({
   if (flags.length === 0) return null;
   return (
     <Section
-      title="首页功能开关"
-      desc="作者偏好清爽首页:这些首页模块默认关闭,想用哪个再开。只影响这台机器的界面,不动数据。"
+      title="功能开关"
+      desc="这些可选模块默认关闭,想用哪个再开。只影响这台机器的界面,不动案件数据。"
     >
       <div className="space-y-1">
         {flags.map((f) => (

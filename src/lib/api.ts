@@ -21,6 +21,7 @@ import type {
   CaseWithDocs,
   CourtFilingJob,
   CourtFilingEnvReport,
+  Document,
   ExtractedFields,
   FeishuCalendarEvent,
   LawyerProfile,
@@ -77,6 +78,36 @@ export function listCases(): Promise<Case[]> {
 /** 取案件详情 + 该案件所有文档。 */
 export function getCaseWithDocs(id: string): Promise<CaseWithDocs> {
   return invoke<CaseWithDocs>("get_case_with_docs", { id });
+}
+
+export interface InsightBucket {
+  label: string;
+  count: number;
+  ratio: number;
+  amount_total: number;
+}
+
+export interface LawyerInsightsReport {
+  total_cases: number;
+  active_cases: number;
+  closed_cases: number;
+  analyzed_cases: number;
+  amount_cases: number;
+  total_claim_amount: number;
+  average_claim_amount: number | null;
+  top_causes: InsightBucket[];
+  top_courts: InsightBucket[];
+  our_side_mix: InsightBucket[];
+  stage_mix: InsightBucket[];
+  strengths: string[];
+  data_gaps: string[];
+  next_questions: string[];
+  markdown: string;
+}
+
+/** 基于本机案件数据生成办案画像。只读统计,不上传。 */
+export function getLawyerInsights(): Promise<LawyerInsightsReport> {
+  return invoke<LawyerInsightsReport>("get_lawyer_insights");
 }
 
 /** 删除一个案件(级联删除关联文档)。不动原始文件夹。 */
@@ -284,7 +315,7 @@ export function verifyYuandianKey(apiKey: string): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_yuandian_key", { apiKey });
 }
 
-/** 2026-05-25 V0.1.8:检测远程最新版本(官网公开的 version.json)。
+/** 2026-05-25 V0.1.8:检测远程最新版本(分发站点的 version.json)。
  *  失败时 has_update=false + error 字段填上原因,前端可静默忽略。*/
 export function checkForUpdate(): Promise<UpdateInfo> {
   return invoke<UpdateInfo>("check_for_update");
@@ -467,6 +498,11 @@ export function exportReportHtml(caseId: string, savePath: string): Promise<stri
 /** 导出案件报告为 Word .docx(走 macOS textutil)。返回实际写入路径。 */
 export function exportReportDocx(caseId: string, savePath: string): Promise<string> {
   return invoke<string>("export_report_docx", { caseId, savePath });
+}
+
+/** 导出办案画像 Markdown。返回实际写入路径。 */
+export function exportLawyerInsightsMarkdown(savePath: string): Promise<string> {
+  return invoke<string>("export_lawyer_insights_markdown", { savePath });
 }
 
 /** 2026-05-25 V0.1.7 · 通用 MD → HTML 导出(任意 MD 路径 + 标题)。 */
@@ -2009,6 +2045,26 @@ export function createCaseLog(
     rawInput,
     organizedMarkdown,
   });
+}
+
+export function generateCaseWorkReport(caseId: string): Promise<string> {
+  return invoke<string>("generate_case_work_report", { caseId });
+}
+
+export function exportCaseWorkReportDocx(
+  caseId: string,
+  savePath: string,
+  contentMd: string | null,
+): Promise<string> {
+  return invoke<string>("export_case_work_report_docx", {
+    caseId,
+    savePath,
+    contentMd,
+  });
+}
+
+export function generateClosingMaterials(caseId: string): Promise<Document> {
+  return invoke<Document>("generate_closing_materials", { caseId });
 }
 
 export function organizeCaseLog(caseId: string, rawInput: string): Promise<string> {

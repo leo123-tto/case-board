@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   BookMarked,
   BookOpen,
+  ClipboardList,
   FolderSearch,
   FolderSync,
   Loader2,
@@ -71,6 +72,8 @@ export function CaseView({
   refreshingFiles,
   onOpenReport,
   reportLoading,
+  onGenerateClosingMaterials,
+  closingMaterialsLoading,
   onReloadCase,
   editingDoc,
   onCloseEditor,
@@ -96,6 +99,8 @@ export function CaseView({
   refreshingFiles: boolean;
   onOpenReport: () => void;
   reportLoading: boolean;
+  onGenerateClosingMaterials: () => void;
+  closingMaterialsLoading: boolean;
   /** 2026-05-27 V0.1.13+ chat artifact 完成后的轻量 reload(只重读 DB,不 sync 源文件夹) */
   onReloadCase: () => void;
   /** V0.3 D1+D2 · 写作模式:当前在编辑器里打开的文书(null = 看板模式) */
@@ -116,6 +121,7 @@ export function CaseView({
   const [showCourtFiling] = useFeatureFlag("case_court_filing");
   const [showTodos] = useFeatureFlag("case_todos");
   const [showWorkLogs] = useFeatureFlag("case_work_logs");
+  const [showWorkReports] = useFeatureFlag("case_work_reports");
 
   // Phase 3:文档标记(重要/忽略 + 原被告)。按案件加载,标记后重载。
   const [tags, setTags] = useState<DocumentTag[]>([]);
@@ -436,6 +442,20 @@ export function CaseView({
             </Button>
             <button
               type="button"
+              onClick={onGenerateClosingMaterials}
+              disabled={!selectedCase || closingMaterialsLoading}
+              className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+              title="生成线下归档表格可复制的结案材料要素"
+              aria-label="生成结案材料"
+            >
+              {closingMaterialsLoading ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <ClipboardList className="size-4" />
+              )}
+            </button>
+            <button
+              type="button"
               onClick={handleDistill}
               disabled={
                 !selectedCase || distilling || !selectedCase?.case_report_path
@@ -549,6 +569,7 @@ export function CaseView({
                     domain={domain}
                     showTodos={showTodos}
                     showWorkLogs={showWorkLogs}
+                    showWorkReports={showWorkReports}
                     onWorkLogSaved={onReloadCase}
                   />
 

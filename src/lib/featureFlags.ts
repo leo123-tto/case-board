@@ -23,6 +23,7 @@ export type FeatureFlagName =
   | "case_court_filing"
   | "case_todos"
   | "case_work_logs"
+  | "case_work_reports"
   | "reference_materials";
 
 export interface FeatureFlagMeta {
@@ -75,6 +76,14 @@ export const FEATURE_FLAGS: FeatureFlagMeta[] = [
     title: "案件工作记录",
     description:
       "开启后在案件详情显示工作记录，可直接保存，或选择由 AI 整理后保存。",
+    defaultValue: false,
+    location: "settings",
+  },
+  {
+    name: "case_work_reports",
+    title: "案件工作汇报",
+    description:
+      "开启后在案件详情显示工作汇报，可按需汇总案件概况、办案时间轴和工作记录，并导出 Word。",
     defaultValue: false,
     location: "settings",
   },

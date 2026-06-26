@@ -40,6 +40,7 @@ import { EditableField } from "./EditableField";
 import { SortableCard } from "./SortableCard";
 import { TodosCard } from "@/components/TodosCard";
 import { CaseWorkLogSection } from "../CaseWorkLogSection";
+import { CaseWorkReportSection } from "../CaseWorkReportSection";
 
 /**
  * 案件画像主视图。
@@ -61,6 +62,7 @@ export function CaseSnapshotView({
   domain = "civil",
   showTodos = false,
   showWorkLogs = false,
+  showWorkReports = false,
   onWorkLogSaved,
 }: {
   caseData: Case;
@@ -70,6 +72,7 @@ export function CaseSnapshotView({
   domain?: "civil" | "criminal";
   showTodos?: boolean;
   showWorkLogs?: boolean;
+  showWorkReports?: boolean;
   onWorkLogSaved?: () => void;
 }) {
   // 刑事 tab 只做「标签级」适配(老板:先复刻框架 + 能做的轻适配,不深改字段管线)。
@@ -222,7 +225,7 @@ export function CaseSnapshotView({
   /* ---------- 6 张卡片渲染器,按 ov.resolveOrder 顺序排版 ---------- */
   const defaultSectionOrder = [
     TITLES.BASIC,
-    ...(showTodos || showWorkLogs ? [TITLES.TODOS] : []),
+    ...(showTodos || showWorkLogs || showWorkReports ? [TITLES.TODOS] : []),
     // ≥2 个审级才显示历程卡(单审级时与基本信息重复);紧跟基本信息,最新审级在上
     ...(instances.length >= 2 ? [TITLES.INSTANCES] : []),
     TITLES.COURT,
@@ -282,7 +285,7 @@ export function CaseSnapshotView({
         </CardSection>
       ),
     },
-    ...(showTodos || showWorkLogs
+    ...(showTodos || showWorkLogs || showWorkReports
       ? [
           {
             id: TITLES.TODOS,
@@ -304,6 +307,12 @@ export function CaseSnapshotView({
                   <CaseWorkLogSection
                     caseId={caseData.id}
                     onSaved={onWorkLogSaved}
+                  />
+                )}
+                {showWorkReports && (
+                  <CaseWorkReportSection
+                    caseId={caseData.id}
+                    caseName={caseData.name}
                   />
                 )}
               </div>

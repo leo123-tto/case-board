@@ -1014,6 +1014,7 @@ export interface CaseLog {
   content: string;
   source: "manual" | "ai" | null;
   source_doc_id: string | null;
+  source_path: string | null;
   created_at: string;
 }
 

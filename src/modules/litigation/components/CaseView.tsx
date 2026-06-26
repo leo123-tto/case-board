@@ -164,9 +164,9 @@ export function CaseView({
     [reloadTags],
   );
   const onMarkCategory = useCallback(
-    async (docId: string, value: string | null) => {
+    async (docIds: string[], value: string | null) => {
       try {
-        await setDocumentCategory(docId, value);
+        await setDocumentCategory(docIds, value);
         await reloadTags();
       } catch (e) {
         toast(`分类失败:${e}`, "error");
@@ -210,11 +210,19 @@ export function CaseView({
   );
   // 「整理中」状态走跨组件存储(切标签页 CaseView 卸载重挂也保持),不再用本地 useState。
   const organizing = useOrganizing(caseId);
-  const onAiOrganize = useCallback(() => {
+  const onAiOrganize = useCallback(async () => {
     if (!caseId) return;
+    const renameFiles = await confirmDialog(
+      "AI 自动整理会给材料打重要度、归类、当事人侧等标签。是否同时生成更规整的看板显示名？\n\n选择「不改名」后仍会继续整理分类，原文件名和看板显示名都不会被 AI 改动。",
+      {
+        title: "AI 自动整理",
+        okLabel: "需要改名",
+        cancelLabel: "不改名",
+      },
+    );
     markOrganizeStarted(caseId);
     // 命令在后端跑完(切页不打断);完成/失败靠 Tauri 事件,spinner 清除由 organizeStatus 全局监听管。
-    aiOrganizeCase(caseId).catch(() => {});
+    aiOrganizeCase(caseId, renameFiles).catch(() => {});
   }, [caseId]);
   // AI 整理完成/失败事件:刷新当前打开的案件 + 提示(spinner 清除在 organizeStatus 里全局做)。
   useEffect(() => {

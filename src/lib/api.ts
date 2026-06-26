@@ -182,10 +182,11 @@ export function setDocumentPartySide(
 
 /** 人工设文档分类(单值,六选一;value=null 清空)。 */
 export function setDocumentCategory(
-  documentId: string,
+  documentIds: string | string[],
   value: string | null,
 ): Promise<void> {
-  return invoke("set_document_category", { documentId, value });
+  const ids = Array.isArray(documentIds) ? documentIds : [documentIds];
+  return invoke("set_document_category", { documentIds: ids, value });
 }
 
 /** 人工设证据倾向(单值):value=有利|不利|中性 或 null(清空)。documentIds 多个=整批。 */
@@ -205,8 +206,11 @@ export function setDocumentSubmissionStage(
 }
 
 /** 🪄 AI 自动整理:一次 LLM 调用判整案材料的 重要度+归类+显示名,写 ai_suggest。返回写入数。 */
-export function aiOrganizeCase(caseId: string): Promise<number> {
-  return invoke("ai_organize_case", { caseId });
+export function aiOrganizeCase(
+  caseId: string,
+  renameFiles = true,
+): Promise<number> {
+  return invoke("ai_organize_case", { caseId, renameFiles });
 }
 
 /** 人工设文档板内显示名(右键重命名);name=null/空 → 清回原文件名。纯元数据,不动原件。 */

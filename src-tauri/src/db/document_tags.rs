@@ -287,6 +287,17 @@ pub async fn set_importance_batch(
     Ok(())
 }
 
+pub async fn set_category_batch(
+    pool: &SqlitePool,
+    document_ids: &[String],
+    value: Option<&str>,
+) -> Result<(), String> {
+    for id in document_ids {
+        set_category(pool, id, value).await?;
+    }
+    Ok(())
+}
+
 pub async fn set_evidence_attitude_batch(
     pool: &SqlitePool,
     document_ids: &[String],

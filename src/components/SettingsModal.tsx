@@ -759,48 +759,6 @@ export function SettingsModal({
                   </Section>
               )}
 
-              {/* ── 功能开关:首页日程日历 ── */}
-              {tab === "toggles" && (
-                  <Section
-                    title="首页日程日历(可选)"
-                    desc="把开庭/续封、带日期的待办、手动提醒汇总到首页日历;默认关闭,想体验就开,随时可关。"
-                  >
-                    <label className="flex items-center justify-between gap-3">
-                      <span className="text-xs text-muted-foreground">
-                        {settings.home_calendar_enabled
-                          ? "已开启 — 首页显示"
-                          : "已关闭 — 不显示"}
-                      </span>
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={settings.home_calendar_enabled}
-                        onClick={() =>
-                          updateField(
-                            "home_calendar_enabled",
-                            !settings.home_calendar_enabled,
-                          )
-                        }
-                        className={cn(
-                          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
-                          settings.home_calendar_enabled
-                            ? "bg-sky-600"
-                            : "bg-muted",
-                        )}
-                      >
-                        <span
-                          className={cn(
-                            "inline-block size-4 rounded-full bg-white shadow transition-transform",
-                            settings.home_calendar_enabled
-                              ? "translate-x-4"
-                              : "translate-x-0.5",
-                          )}
-                        />
-                      </button>
-                    </label>
-                  </Section>
-              )}
-
               {/* ── 通用:微信扫码加群(缩略图悬停放大;托管 lawtools.top,过期换图不必重新发版) ── */}
               {tab === "general" && (
                   <Section title="微信扫码加群" fill>
@@ -1477,10 +1435,16 @@ export function SettingsModal({
 
               {/* ── 功能开关:首页清爽开关(featureFlags)── */}
               {tab === "toggles" && (
-                <FeatureFlagsCard
-                  values={featureFlagDraft}
-                  onChange={updateFeatureFlag}
-                />
+                <div className={cn(isPage && "lg:col-span-2")}>
+                  <FeatureFlagsCard
+                    values={featureFlagDraft}
+                    onChange={updateFeatureFlag}
+                    homeCalendarEnabled={settings.home_calendar_enabled}
+                    onHomeCalendarChange={(enabled) =>
+                      updateField("home_calendar_enabled", enabled)
+                    }
+                  />
+                </div>
               )}
 
               {/* ── 数据源:外部工具(MCP)白名单(企查查/万得/北大法宝 等远程 HTTP)──
@@ -1695,18 +1659,27 @@ function Field({
 function FeatureFlagsCard({
   values,
   onChange,
+  homeCalendarEnabled,
+  onHomeCalendarChange,
 }: {
   values: Partial<Record<FeatureFlagName, boolean>>;
   onChange: (name: FeatureFlagName, value: boolean) => void;
+  homeCalendarEnabled: boolean;
+  onHomeCalendarChange: (enabled: boolean) => void;
 }) {
   const flags = FEATURE_FLAGS.filter((f) => f.location === "settings");
-  if (flags.length === 0) return null;
   return (
     <Section
       title="功能开关"
       desc="这些可选模块默认关闭,想用哪个再开。只影响这台机器的界面,不动案件数据。"
     >
-      <div className="space-y-1">
+      <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
+        <SettingsSwitchRow
+          title="首页日程日历"
+          description="把开庭/续封、带日期的待办、手动提醒汇总到首页日历。默认关闭,想体验就开,随时可关。"
+          on={homeCalendarEnabled}
+          onChange={() => onHomeCalendarChange(!homeCalendarEnabled)}
+        />
         {flags.map((f) => (
           <FeatureFlagToggle
             key={f.name}
@@ -1717,6 +1690,45 @@ function FeatureFlagsCard({
         ))}
       </div>
     </Section>
+  );
+}
+
+function SettingsSwitchRow({
+  title,
+  description,
+  on,
+  onChange,
+}: {
+  title: string;
+  description: string;
+  on: boolean;
+  onChange: () => void;
+}) {
+  return (
+    <div className="flex min-h-[76px] items-center justify-between gap-3 rounded-md border border-border bg-background/50 p-3">
+      <div className="min-w-0">
+        <p className="text-sm font-medium text-foreground">{title}</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={on}
+        aria-label={title}
+        onClick={onChange}
+        className={cn(
+          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
+          on ? "bg-sky-600" : "bg-muted",
+        )}
+      >
+        <span
+          className={cn(
+            "inline-block size-4 rounded-full bg-white shadow transition-transform",
+            on ? "translate-x-4" : "translate-x-0.5",
+          )}
+        />
+      </button>
+    </div>
   );
 }
 
@@ -1731,32 +1743,12 @@ function FeatureFlagToggle({
 }) {
   const meta = FEATURE_FLAGS.find((f) => f.name === name)!;
   return (
-    <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-background/50 p-3">
-      <div className="min-w-0">
-        <p className="text-sm font-medium text-foreground">{meta.title}</p>
-        <p className="mt-0.5 text-xs text-muted-foreground">
-          {meta.description}
-        </p>
-      </div>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={on}
-        aria-label={meta.title}
-        onClick={() => onChange(name, !on)}
-        className={cn(
-          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
-          on ? "bg-sky-600" : "bg-muted",
-        )}
-      >
-        <span
-          className={cn(
-            "inline-block size-4 rounded-full bg-white shadow transition-transform",
-            on ? "translate-x-4" : "translate-x-0.5",
-          )}
-        />
-      </button>
-    </div>
+    <SettingsSwitchRow
+      title={meta.title}
+      description={meta.description}
+      on={on}
+      onChange={() => onChange(name, !on)}
+    />
   );
 }
 

@@ -12,7 +12,7 @@ import { FeedbackButton } from "@/components/FeedbackButton";
 import { ModuleTabs } from "@/components/ModuleTabs";
 // 私人专属功能接缝(双轨发布模型):开源仓返回 [] → 无「独立」顶层 tab。
 import { getPrivateTopTabs } from "@/private";
-import { HomeView } from "@/components/HomeView";
+import { HomeView, type UpcomingEvent } from "@/components/HomeView";
 import { HomeDropZone } from "@/components/HomeDropZone";
 import { isCriminalCase, splitCasesByDomain } from "@/lib/caseDomain";
 import { RunningTaskOverlay } from "@/components/RunningTaskOverlay";
@@ -1073,6 +1073,14 @@ function MainApp() {
     setSelectedId(caseId);
     setView("detail");
   };
+  const openHomeEvent = (event: UpcomingEvent) => {
+    if (!event.caseId) return;
+    setSelectedId(event.caseId);
+    setView("detail");
+    if (event.sourceDoc) {
+      setViewerDoc(event.sourceDoc);
+    }
+  };
   const goHome = () => {
     setView("home");
   };
@@ -1132,6 +1140,7 @@ function MainApp() {
           cases={civilCases}
           userDisplayName={userDisplayName}
           onPickCase={pickCase}
+          onOpenEvent={openHomeEvent}
           onImport={handleImport}
           onDeleteCase={handleDeleteCaseById}
           onDeleteCases={handleDeleteCases}
@@ -1181,6 +1190,7 @@ function MainApp() {
           cases={criminalCases}
           userDisplayName={userDisplayName}
           onPickCase={pickCase}
+          onOpenEvent={openHomeEvent}
           onImport={handleImport}
           onDeleteCase={handleDeleteCaseById}
           onDeleteCases={handleDeleteCases}

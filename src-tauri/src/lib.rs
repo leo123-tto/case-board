@@ -770,10 +770,10 @@ async fn set_document_party_side(
 #[tauri::command]
 async fn set_document_category(
     pool: tauri::State<'_, SqlitePool>,
-    document_id: String,
+    document_ids: Vec<String>,
     value: Option<String>,
 ) -> Result<(), String> {
-    db::document_tags::set_category(pool.inner(), &document_id, value.as_deref()).await
+    db::document_tags::set_category_batch(pool.inner(), &document_ids, value.as_deref()).await
 }
 
 /// 人工设证据倾向(单值):value=有利/不利/中性 或 None 清空。多个 document_ids = 整批。
@@ -873,8 +873,9 @@ async fn ai_organize_case(
     app: tauri::AppHandle,
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
+    rename_files: Option<bool>,
 ) -> Result<usize, String> {
-    let result = ai_organize_inner(pool.inner(), &case_id).await;
+    let result = ai_organize_inner(pool.inner(), &case_id, rename_files.unwrap_or(true)).await;
     match &result {
         Ok(n) => {
             let _ = app.emit(
@@ -892,7 +893,11 @@ async fn ai_organize_case(
     result
 }
 
-async fn ai_organize_inner(pool: &SqlitePool, case_id: &str) -> Result<usize, String> {
+async fn ai_organize_inner(
+    pool: &SqlitePool,
+    case_id: &str,
+    rename_files: bool,
+) -> Result<usize, String> {
     let settings = settings::read_settings().map_err(|e| e.to_string())?;
     let config = llm::LlmConfig::from_settings(&settings);
     let docs = documents_db::list_documents_by_case(pool, case_id)
@@ -1001,8 +1006,10 @@ async fn ai_organize_inner(pool: &SqlitePool, case_id: &str) -> Result<usize, St
                 .await;
             }
             // 显示名建议:仅当无人工改名时写(set_ai_display_name 内部保证人工永优先;空名跳过)
-            if let Some(name) = r.name.as_deref() {
-                let _ = documents_db::set_ai_display_name(pool, &r.id, name).await;
+            if rename_files {
+                if let Some(name) = r.name.as_deref() {
+                    let _ = documents_db::set_ai_display_name(pool, &r.id, name).await;
+                }
             }
             n += 1;
         }

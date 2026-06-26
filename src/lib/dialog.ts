@@ -11,12 +11,12 @@ import { confirm as tauriConfirm } from "@tauri-apps/plugin-dialog";
  */
 export function confirmDialog(
   message: string,
-  opts?: { title?: string; okLabel?: string; danger?: boolean },
+  opts?: { title?: string; okLabel?: string; cancelLabel?: string; danger?: boolean },
 ): Promise<boolean> {
   return tauriConfirm(message, {
     title: opts?.title ?? "请确认",
     kind: opts?.danger ? "warning" : "info",
     okLabel: opts?.okLabel ?? "确定",
-    cancelLabel: "取消",
+    cancelLabel: opts?.cancelLabel ?? "取消",
   });
 }

@@ -19,7 +19,7 @@ pub struct DocClassification {
     pub id: String,
     /// 重要 / 普通 / 忽略
     pub importance: String,
-    /// 起诉材料 / 证据 / 法院文书 / 对方材料 / 程序文书 / 其他
+    /// 起诉材料 / 证据 / 法院文书 / 对方材料 / 程序文书 / 参考材料 / 其他
     pub category: String,
     /// 原告 / 被告 / 第三人。可多值;判断不出则空数组。
     #[serde(default)]
@@ -49,7 +49,8 @@ const SYSTEM_PROMPT: &str = r###"你是资深律师助理,擅长把一堆杂乱�
    - "普通":一般材料。
    - "忽略":明显无关、重复、空白、宣传/模板/广告、与本案无实质关系的材料；参考案例、参考判决和检索资料默认忽略。
 2. `category`(**只能从这七个里选一个**):起诉材料 / 证据 / 法院文书 / 对方材料 / 程序文书 / 参考材料 / 其他。
-3. `party_side`:数组,只能填 "原告" / "被告" / "第三人"。按材料提交主体或内容归属判断;例如原告证据填["原告"],被告证据填["被告"],法院文书/传票/裁定可空数组;一份材料同时涉及多方可多填。
+   - 身份证、营业执照、法定代表人身份证明、主体资格证明、被告身份信息、被告身份证等用于立案/起诉的身份材料,默认归入 "起诉材料",不要归入 "证据" 或 "对方材料"。
+3. `party_side`:数组,只能填 "原告" / "被告" / "第三人"。优先按材料提交主体/用途判断,不要因为证件主体、文件名里的当事人身份就机械归属。例如原告起诉时随附的原告身份证、被告身份证、被告身份信息、被告营业执照,都属于原告方起诉材料,填["原告"],不要因为证件主体是被告就填["被告"]。只有文件名、目录或正文明确显示是被告/第三人应诉、答辩、举证时提交的本方主体材料,才填对应的["被告"]或["第三人"]。法院文书/传票/裁定可空数组;一份材料同时涉及多方可多填。
 4. `evidence_attitude`:只能填 "有利" / "不利" / "中性" 或空字符串。站在材料提交方自身立场判断;证据能支持该方主张=有利,明显削弱该方=不利,仅程序/背景=中性。非证据材料填空字符串。
 5. `submission_stage`:只能填 "起诉/答辩随附" / "举证期限内" / "补充提交" / "二审新证据" / "未提交或待确认" 或空字符串。根据文件名、目录、文书内容判断;拿不准填"未提交或待确认";非诉讼提交材料填空字符串。
 6. `name`:给这份材料起一个**简洁、能一眼看懂、带类型前缀**的中文显示名,用于在看板里替代杂乱的原始文件名。规则:
@@ -203,7 +204,67 @@ pub async fn classify_documents(
         .ok_or_else(|| LlmError::ResponseFormat("AI 整理:响应无 content".to_string()))?;
 
     let cleaned = super::extract_json_from_content(content);
-    let result = serde_json::from_str::<ClassifyResult>(&cleaned)
+    let mut result = serde_json::from_str::<ClassifyResult>(&cleaned)
         .map_err(|e| LlmError::ContentJson(format!("{}\n---原始---\n{}", e, cleaned)))?;
+    normalize_identity_material_classifications(docs, &mut result.items);
     Ok(result.items)
+}
+
+fn normalize_identity_material_classifications(
+    docs: &[OrganizeDocInput],
+    results: &mut [DocClassification],
+) {
+    let by_id: std::collections::HashMap<&str, &OrganizeDocInput> =
+        docs.iter().map(|doc| (doc.id.as_str(), doc)).collect();
+    for result in results {
+        let Some(doc) = by_id.get(result.id.as_str()) else {
+            continue;
+        };
+        if is_filing_identity_material(doc) && !is_explicit_defense_identity_material(doc) {
+            result.category = "起诉材料".into();
+            result.party_side = vec!["原告".into()];
+            result.evidence_attitude = Some(String::new());
+            if result
+                .submission_stage
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                result.submission_stage = Some("起诉/答辩随附".into());
+            }
+        }
+    }
+}
+
+fn is_filing_identity_material(doc: &OrganizeDocInput) -> bool {
+    let hay = format!("{} {}", doc.filename, doc.snippet);
+    [
+        "身份证",
+        "身份信息",
+        "身份证明",
+        "主体资格",
+        "营业执照",
+        "统一社会信用代码",
+        "法定代表人证明",
+        "法定代表人身份证明",
+        "被告身份",
+    ]
+    .iter()
+    .any(|keyword| hay.contains(keyword))
+}
+
+fn is_explicit_defense_identity_material(doc: &OrganizeDocInput) -> bool {
+    let hay = format!("{} {}", doc.filename, doc.snippet);
+    [
+        "答辩",
+        "应诉",
+        "反诉",
+        "被告提交",
+        "被告举证",
+        "被告证据",
+        "第三人提交",
+    ]
+    .iter()
+    .any(|keyword| hay.contains(keyword))
 }

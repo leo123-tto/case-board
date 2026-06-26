@@ -9,6 +9,7 @@ export async function loadHearingDisplayDetail(
   docs: Document[],
   isoDate: string,
   readMd: (path: string) => Promise<string>,
+  courtName?: string | null,
 ): Promise<HearingDisplayDetail | null> {
   const candidates = docs
     .map((doc) => {
@@ -16,7 +17,10 @@ export async function loadHearingDisplayDetail(
       const matchedKeyDates = (fields?.key_dates ?? []).filter(
         (kd) => kd.event_type.includes("开庭") && kd.date === isoDate,
       );
-      const detailFromFields = extractHearingDetailFromKeyDates(matchedKeyDates);
+      const detailFromFields = extractHearingDetailFromKeyDates(
+        matchedKeyDates,
+        courtName,
+      );
       const score =
         scoreHearingDoc(doc) +
         (matchedKeyDates.length > 0 ? 4 : 0) +
@@ -44,7 +48,7 @@ export async function loadHearingDisplayDetail(
     if (candidate.doc.extracted_text_path) {
       try {
         const raw = await readMd(candidate.doc.extracted_text_path);
-        const detailFromMd = extractHearingDetailFromText(raw, isoDate);
+        const detailFromMd = extractHearingDetailFromText(raw, isoDate, courtName);
         const merged = mergeHearingDetails(
           candidate.detailFromFields,
           detailFromMd,
@@ -66,10 +70,12 @@ export async function loadHearingDisplayDetail(
 export function extractHearingDetailFromText(
   raw: string,
   isoDate: string,
+  courtName?: string | null,
 ): HearingDisplayDetail {
   const text = normalizeText(raw);
   const dateZh = isoToChineseDate(isoDate);
   const escapedDate = escapeRegExp(dateZh);
+  const locationSegment = extractHearingLocationSegment(text);
 
   const arrivalTime =
     firstCapture(text, [
@@ -90,12 +96,7 @@ export function extractHearingDetailFromText(
       /(第\s*[0-9一二三四五六七八九十百]+(?:号)?法庭)/,
     ]) ?? null;
 
-  const address =
-    firstCapture(text, [
-      /(?:地址|送达地址|开庭地点|应到地点)\s*[:：]?\s*(.{0,60}?(?:路|街|道|巷|大道|号).{0,20}?(?:室|楼|层|号)?)(?=(?:传唤事由|应到时间|庭审时间|注意事项|第\s*[0-9一二三四五六七八九十百]+(?:号)?法庭|$))/,
-      /(?:地址|送达地址|开庭地点|应到地点|应到处所)\s*[:：]?\s*([^\s，。；]{0,40}(?:路|街|道|巷|大道|号)[^，。；\n]{0,20}(?:室|楼|层|号)?)/,
-      /((?:[\u4e00-\u9fa5]{2,}(?:省|市|区|县)){1,4}[\u4e00-\u9fa5A-Za-z0-9\-]{2,}(?:路|街|道|巷|大道|号)[^，。；\n]{0,24}(?:室|楼|层|号)?)/,
-    ]) ?? null;
+  const address = extractHearingAddress(text, locationSegment, courtName);
 
   const timeParts = [
     arrivalTime ? `到场 ${compactTime(arrivalTime)}` : null,
@@ -111,6 +112,7 @@ export function extractHearingDetailFromText(
 
 function extractHearingDetailFromKeyDates(
   keyDates: KeyDate[],
+  courtName?: string | null,
 ): HearingDisplayDetail {
   const merged: HearingDisplayDetail = {
     timeText: null,
@@ -119,7 +121,7 @@ function extractHearingDetailFromKeyDates(
   for (const kd of keyDates) {
     const note = kd.note?.trim();
     if (!note) continue;
-    const parsed = extractHearingDetailFromText(note, kd.date ?? "");
+    const parsed = extractHearingDetailFromText(note, kd.date ?? "", courtName);
     if (!merged.timeText && parsed.timeText) merged.timeText = parsed.timeText;
     if (!merged.locationText && parsed.locationText) {
       merged.locationText = parsed.locationText;
@@ -167,6 +169,56 @@ function firstCapture(text: string, regexes: RegExp[]): string | null {
     if (value) return value;
   }
   return null;
+}
+
+function extractHearingLocationSegment(text: string): string | null {
+  return firstCapture(text, [
+    /(?:应到处所|开庭地点|开庭处所|应到地点)\s*[:：]?\s*(.{0,100}?)(?=(?:被传唤人地址|送达地址|住所地|住址|通讯地址|传唤事由|应到时间|庭审时间|开庭时间|注意事项|$))/,
+  ]);
+}
+
+function extractHearingAddress(
+  text: string,
+  locationSegment: string | null,
+  courtName?: string | null,
+): string | null {
+  const courtAddress = firstCapture(text, [
+    /(?:法院地址|法庭地址|审判庭地址|开庭地址)\s*[:：]?\s*([^\s，。；]{0,50}(?:路|街|道|巷|大道|号)[^，。；\n]{0,30}(?:室|楼|层|号)?)/,
+  ]);
+  if (courtAddress && !isPartyAddressFragment(courtAddress, courtName)) {
+    return courtAddress;
+  }
+
+  const fromLabeledLocation = locationSegment
+    ? firstCapture(locationSegment, [
+        /((?:[\u4e00-\u9fa5]{2,}(?:省|市|区|县)){0,4}[\u4e00-\u9fa5A-Za-z0-9\-]{2,}(?:路|街|道|巷|大道|号)[^，。；\n]{0,24}(?:室|楼|层|号)?)/,
+      ])
+    : null;
+  if (fromLabeledLocation && !isPartyAddressFragment(fromLabeledLocation, courtName)) {
+    return fromLabeledLocation;
+  }
+
+  if (/(?:被传唤人地址|送达地址|住所地|住址|通讯地址)/.test(text)) {
+    return null;
+  }
+
+  const fallback = firstCapture(text, [
+    /((?:[\u4e00-\u9fa5]{2,}(?:省|市|区|县)){1,4}[\u4e00-\u9fa5A-Za-z0-9\-]{2,}(?:路|街|道|巷|大道|号)[^，。；\n]{0,24}(?:室|楼|层|号)?)/,
+  ]);
+  return fallback && !isPartyAddressFragment(fallback, courtName) ? fallback : null;
+}
+
+function isPartyAddressFragment(value: string, courtName?: string | null): boolean {
+  if (/(?:被传唤人地址|送达地址|住所地|住址|通讯地址)/.test(value)) return true;
+  if (!looksLikeAddress(value)) return false;
+  const courtToken = courtName?.trim().slice(0, 2);
+  return !!courtToken && !value.includes(courtToken);
+}
+
+function looksLikeAddress(value: string): boolean {
+  return /(?:省|市|区|县).*(?:路|街|道|巷|大道|号)|(?:路|街|道|巷|大道).*(?:号|室|楼|层)/.test(
+    value,
+  );
 }
 
 function compactTime(value: string): string {

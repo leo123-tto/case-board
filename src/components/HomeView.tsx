@@ -72,6 +72,21 @@ import {
   type HearingDisplayDetail,
 } from "./homeHearingDetails";
 import {
+  extractPreservationTextInfo,
+  type PreservationTextInfo,
+} from "./homePreservationEvents";
+import {
+  buildCaseCalendarEvents,
+  buildImportantCaseReminders,
+  diffDays,
+  eventUrgency,
+  isPreservationOrUnsealDoc,
+  parseDate,
+  PRESERVATION_RE,
+  todayDate,
+  type HomeReminderEvent,
+} from "./homeReminderEngine";
+import {
   compareCasesByStatusThenTime,
   resolveCaseStatus,
   STATUS_LIST,
@@ -83,6 +98,7 @@ export interface HomeViewProps {
   cases: Case[];
   userDisplayName: string | null;
   onPickCase: (caseId: string) => void;
+  onOpenEvent?: (event: UpcomingEvent) => void;
   onImport: () => void;
   /** 右键卡片「删除」→ 删除案件(只删数据库记录,不动原始文件夹)。由 App 弹确认 + 刷新列表。 */
   onDeleteCase: (caseId: string) => void;
@@ -95,7 +111,6 @@ export interface HomeViewProps {
 type ViewMode = "grid" | "list";
 type SortKey = "status" | "amount" | "filed_at" | "hearing";
 type SortDir = "asc" | "desc";
-type EventKind = "hearing" | "deadline" | "todo" | "manual";
 
 interface CaseDisplayFields {
   caseNo: string | null;
@@ -116,27 +131,13 @@ interface CaseRow {
   nearestHearing: string | null;
 }
 
-export interface UpcomingEvent {
-  kind: EventKind;
-  date: string;
-  daysFromNow: number;
-  type: string;
-  note?: string | null;
-  timeText?: string | null;
-  locationText?: string | null;
-  caseName: string;
-  caseId: string;
-  court?: string | null;
-  /** 仅 kind="manual"(独立日历日程):calendar_events.id,用于删除 */
-  id?: string;
-}
-
-const PRESERVATION_RE = /保全|续封|查封|冻结/;
+export type UpcomingEvent = HomeReminderEvent;
 
 export function HomeView({
   cases,
   userDisplayName,
   onPickCase,
+  onOpenEvent,
   onImport,
   onDeleteCase,
   onDeleteCases,
@@ -167,6 +168,9 @@ export function HomeView({
   const [feishuEnabled, setFeishuEnabled] = useState(false);
   const [hearingDetails, setHearingDetails] = useState<
     Record<string, HearingDisplayDetail>
+  >({});
+  const [preservationTextInfo, setPreservationTextInfo] = useState<
+    Record<string, PreservationTextInfo>
   >({});
   // 2026-06-16 · 首页清爽开关(设置页「功能开关」tab,默认关,逐设备生效)
   const [filterBarOn] = useFeatureFlag("home_filter_bar");
@@ -338,7 +342,11 @@ export function HomeView({
   const activeCases = defaultSorted
     .filter(({ status }) => status.id !== "closed" && status.id !== "mediated")
     .map(({ caseData }) => caseData);
-  const upcomingEventsBase = buildUpcomingEvents(activeCases);
+  const upcomingEventsBase = buildImportantCaseReminders(
+    activeCases,
+    docsByCase,
+    preservationTextInfo,
+  );
   const upcomingEvents = useMemo(
     () =>
       upcomingEventsBase.map((event) => ({
@@ -352,10 +360,15 @@ export function HomeView({
     .map(upcomingEventKey)
     .join("||");
   const calendarEvents = [
-    ...buildAllCalendarEvents(activeCases),
+    ...buildCaseCalendarEvents(activeCases, docsByCase, preservationTextInfo),
     ...buildTodoEvents(openTodos),
     ...buildManualEvents(manualEvents),
   ];
+  const openEvent = (event: UpcomingEvent) => {
+    if (!event.caseId) return;
+    if (onOpenEvent) onOpenEvent(event);
+    else onPickCase(event.caseId);
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -374,6 +387,7 @@ export function HomeView({
             docsByCase[event.caseId] ?? [],
             event.date,
             readTextFile,
+            event.court,
           );
           return [upcomingEventKey(event), detail] as const;
         }),
@@ -389,6 +403,38 @@ export function HomeView({
       cancelled = true;
     };
   }, [docsByCase, hearingEventsSeed]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const candidates = Object.values(docsByCase)
+      .flat()
+      .filter((doc) => doc.extracted_text_path && isPreservationOrUnsealDoc(doc));
+    if (candidates.length === 0) {
+      setPreservationTextInfo({});
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    (async () => {
+      const pairs = await Promise.all(
+        candidates.map(async (doc) => {
+          try {
+            const raw = await readTextFile(doc.extracted_text_path!);
+            const info = extractPreservationTextInfo(raw);
+            return [doc.id, info] as const;
+          } catch {
+            return [doc.id, { schedules: [], unsealDate: null }] as const;
+          }
+        }),
+      );
+      if (!cancelled) setPreservationTextInfo(Object.fromEntries(pairs));
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [docsByCase]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -544,7 +590,7 @@ export function HomeView({
                 </Button>
               </div>
             </div>
-            <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
+            <ImportantDates events={upcomingEvents} onPickCase={openEvent} />
           </div>
 
           {/* 飞书日历开启 → 月历视图(替代本地日程日历卡);否则按本地开关显示原日程卡 */}
@@ -562,7 +608,7 @@ export function HomeView({
             <div className="mb-8">
               <CalendarPanel
                 events={calendarEvents}
-                onPickCase={onPickCase}
+                onPickCase={openEvent}
                 onAddEvent={handleAddCalendarEvent}
                 onDeleteEvent={handleDeleteCalendarEvent}
               />
@@ -1266,7 +1312,7 @@ function ImportantDates({
   onPickCase,
 }: {
   events: UpcomingEvent[];
-  onPickCase: (caseId: string) => void;
+  onPickCase: (event: UpcomingEvent) => void;
 }) {
   const prominent = events.filter((e) => eventUrgency(e) !== "normal");
   const later = events.filter((e) => eventUrgency(e) === "normal");
@@ -1309,7 +1355,7 @@ function ImportantDates({
                   key={`${e.caseId}-${e.date}-p${i}`}
                   e={e}
                   variant="prominent"
-                  onPick={() => onPickCase(e.caseId)}
+                  onPick={() => onPickCase(e)}
                 />
               ))}
             </ul>
@@ -1327,7 +1373,7 @@ function ImportantDates({
                     key={`${e.caseId}-${e.date}-l${i}`}
                     e={e}
                     variant="compact"
-                    onPick={() => onPickCase(e.caseId)}
+                    onPick={() => onPickCase(e)}
                   />
                 ))}
               </ul>
@@ -1583,7 +1629,7 @@ function EventRow({
           ? ShieldAlert
           : AlertTriangle;
   const countdown =
-    e.daysFromNow === 0 ? "D-DAY" : e.daysFromNow > 0 ? `D-${e.daysFromNow}` : `逾期${-e.daysFromNow}天`;
+    e.daysFromNow === 0 ? "今天" : e.daysFromNow > 0 ? `${e.daysFromNow}天` : `逾期${-e.daysFromNow}天`;
 
   if (variant === "compact") {
     const cdCls =
@@ -1602,7 +1648,11 @@ function EventRow({
         >
           <Icon className="size-3 shrink-0 text-muted-foreground/60" />
           <span className={`shrink-0 font-mono text-caption font-medium ${cdCls}`}>{countdown}</span>
-          <span className="shrink-0 text-xs text-foreground">{e.type}</span>
+          {e.kind !== "hearing" && (
+            <span className="shrink-0 text-xs text-foreground">
+              {isPreserv ? preservationTitle(e.type) : e.type}
+            </span>
+          )}
           <span className="truncate text-caption text-muted-foreground">· {e.caseName}</span>
         </button>
       </li>
@@ -1638,8 +1688,11 @@ function EventRow({
       : "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
   const primaryDetail =
     e.kind === "hearing"
-      ? [e.timeText, e.locationText].filter(Boolean).join(" · ") || null
-      : null;
+      ? [e.timeText, e.court, e.locationText].filter(Boolean).join(" · ") || null
+      : isPreserv
+        ? preservationDetail(e)
+        : null;
+  const displayNote = e.kind === "hearing" || isPreserv ? null : e.note;
 
   return (
     <li>
@@ -1656,7 +1709,11 @@ function EventRow({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <Icon className={`size-3.5 shrink-0 ${iconCls}`} />
-            <span className="text-sm font-semibold text-foreground">{e.type}</span>
+            {e.kind !== "hearing" && (
+              <span className="text-sm font-semibold text-foreground">
+                {isPreserv ? preservationTitle(e.type) : e.type}
+              </span>
+            )}
             {hint && <span className={`rounded px-1.5 py-0.5 text-caption font-medium ${hintCls}`}>{hint}</span>}
           </div>
           {primaryDetail && (
@@ -1664,15 +1721,50 @@ function EventRow({
               {primaryDetail}
             </p>
           )}
-          {e.note && e.note !== primaryDetail && (
-            <p className="mt-0.5 truncate text-xs text-muted-foreground">{e.note}</p>
+          {displayNote && displayNote !== primaryDetail && (
+            <p className="mt-0.5 truncate text-xs text-muted-foreground">{displayNote}</p>
           )}
           <p className="mt-0.5 truncate text-xs text-foreground/80">{e.caseName}</p>
-          {e.court && <p className="mt-0.5 truncate text-caption text-muted-foreground/70">{e.court}</p>}
+          {e.court && e.kind !== "hearing" && (
+            <p className="mt-0.5 truncate text-caption text-muted-foreground/70">{e.court}</p>
+          )}
         </div>
       </button>
     </li>
   );
+}
+
+function preservationTitle(type: string): string {
+  if (/续封/.test(type)) return "续封到期";
+  if (/查封/.test(type)) return "查封到期";
+  if (/冻结/.test(type)) return "冻结到期";
+  return "保全到期";
+}
+
+function preservationDetail(e: UpcomingEvent): string | null {
+  const judgeText = preservationJudgeText(e);
+  const phoneText = preservationPhoneText(e);
+  return [`到期 ${e.date}`, judgeText, phoneText].filter(Boolean).join(" · ") || null;
+}
+
+function preservationJudgeText(e: UpcomingEvent): string | null {
+  const judges = e.judges?.filter(Boolean) ?? [];
+  if (judges.length > 0) return `法官 ${judges.join("、")}`;
+  const contact = e.courtContacts?.find((c) => isJudgeRole(c.role) && c.name);
+  return contact?.name ? `法官 ${contact.name}` : null;
+}
+
+function preservationPhoneText(e: UpcomingEvent): string | null {
+  const judgeNames = new Set((e.judges ?? []).filter(Boolean));
+  const contact =
+    e.courtContacts?.find(
+      (c) => c.phone && ((c.name && judgeNames.has(c.name)) || isJudgeRole(c.role)),
+    ) ?? e.courtContacts?.find((c) => c.phone);
+  return contact?.phone ? `电话 ${contact.phone}` : null;
+}
+
+function isJudgeRole(role: string | null | undefined): boolean {
+  return !!role && /法官|审判员|审判长|承办人|法官助理|书记员/.test(role);
 }
 
 function CalendarPanel({
@@ -1682,7 +1774,7 @@ function CalendarPanel({
   onDeleteEvent,
 }: {
   events: UpcomingEvent[];
-  onPickCase: (caseId: string) => void;
+  onPickCase: (event: UpcomingEvent) => void;
   onAddEvent: (date: string, title: string) => void | Promise<void>;
   onDeleteEvent: (id: string) => void | Promise<void>;
 }) {
@@ -1791,7 +1883,7 @@ function CalendarPanel({
               <button
                 key={`${event.caseId}-${event.date}-${index}`}
                 type="button"
-                onClick={() => onPickCase(event.caseId)}
+                onClick={() => onPickCase(event)}
                 className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted/60"
               >
                 <span className={cn("size-2 shrink-0 rounded-full", calendarDotClass(event))} />
@@ -1935,11 +2027,11 @@ function CalendarPanel({
                   {isManual ? (
                     <span className="flex-1 font-medium text-foreground">{event.type}</span>
                   ) : (
-                    <button
-                      type="button"
-                      onClick={() => onPickCase(event.caseId)}
-                      className="flex flex-1 items-center gap-2 overflow-hidden text-left"
-                    >
+                      <button
+                        type="button"
+                        onClick={() => onPickCase(event)}
+                        className="flex flex-1 items-center gap-2 overflow-hidden text-left"
+                      >
                       <span className="shrink-0 font-medium text-foreground">{event.type}</span>
                       <span className="truncate text-muted-foreground">{event.caseName}</span>
                     </button>
@@ -2076,110 +2168,6 @@ function findNearestFutureHearing(c: Case): string | null {
   return best;
 }
 
-function buildUpcomingEvents(cases: Case[]): UpcomingEvent[] {
-  const events: UpcomingEvent[] = [];
-  const now = todayDate();
-  for (const c of cases) {
-    const caseName = c.agg_cause || c.name;
-    let nearestHearing: UpcomingEvent | null = null;
-    for (const kd of readKeyDates(c)) {
-      if (kd.event?.includes("开庭") && kd.date) {
-        const d = parseDate(kd.date);
-        if (d) {
-          const daysFromNow = diffDays(d, now);
-          if (daysFromNow >= 0 && daysFromNow <= 365) {
-            if (!nearestHearing || daysFromNow < nearestHearing.daysFromNow) {
-              nearestHearing = {
-                kind: "hearing",
-                date: kd.date,
-                daysFromNow,
-                type: kd.event,
-                note: kd.note ?? null,
-                caseName,
-                caseId: c.id,
-                court: c.agg_court,
-              };
-            }
-          }
-        }
-      }
-      // 2026-06-14:重要提醒只留"开庭 + 续封/保全"两类真要紧的。其余到期项
-      // (上诉期/举证期限等)交给底下日程日历显示,这里不重复堆。
-      if (kd.expires_at && PRESERVATION_RE.test(kd.event ?? "到期")) {
-        const d = parseDate(kd.expires_at);
-        if (d) {
-          const daysFromNow = diffDays(d, now);
-          if (daysFromNow >= -30 && daysFromNow <= 365) {
-            events.push({
-              kind: "deadline",
-              date: kd.expires_at,
-              daysFromNow,
-              type: kd.event ?? "到期",
-              note: kd.note ?? null,
-              caseName,
-              caseId: c.id,
-              court: c.agg_court,
-            });
-          }
-        }
-      }
-    }
-    if (nearestHearing) events.push(nearestHearing);
-  }
-  const rank = { overdue: 0, urgent: 1, normal: 2 } as const;
-  return events
-    .sort((a, b) => {
-      const ra = rank[eventUrgency(a)];
-      const rb = rank[eventUrgency(b)];
-      if (ra !== rb) return ra - rb;
-      if (a.daysFromNow !== b.daysFromNow) return a.daysFromNow - b.daysFromNow;
-      if (a.kind !== b.kind) return a.kind === "hearing" ? -1 : 1;
-      return 0;
-    })
-    .slice(0, 12);
-}
-
-function buildAllCalendarEvents(cases: Case[]): UpcomingEvent[] {
-  const events: UpcomingEvent[] = [];
-  const now = todayDate();
-  for (const c of cases) {
-    const caseName = c.agg_cause || c.name;
-    for (const kd of readKeyDates(c)) {
-      if (kd.event?.includes("开庭") && kd.date) {
-        const d = parseDate(kd.date);
-        if (d) {
-          events.push({
-            kind: "hearing",
-            date: kd.date,
-            daysFromNow: diffDays(d, now),
-            type: kd.event,
-            note: kd.note ?? null,
-            caseName,
-            caseId: c.id,
-            court: c.agg_court,
-          });
-        }
-      }
-      if (kd.expires_at) {
-        const d = parseDate(kd.expires_at);
-        if (d) {
-          events.push({
-            kind: "deadline",
-            date: kd.expires_at,
-            daysFromNow: diffDays(d, now),
-            type: kd.event ?? "到期",
-            note: kd.note ?? null,
-            caseName,
-            caseId: c.id,
-            court: c.agg_court,
-          });
-        }
-      }
-    }
-  }
-  return events.sort((a, b) => a.date.localeCompare(b.date));
-}
-
 /** 带日期的待办(绑案件)→ 日历事件,kind="todo"。 */
 function buildTodoEvents(todos: OpenTodoRow[]): UpcomingEvent[] {
   const now = todayDate();
@@ -2239,12 +2227,6 @@ function readKeyDates(c: Case): Array<{
   }
 }
 
-function eventUrgency(e: UpcomingEvent): "overdue" | "urgent" | "normal" {
-  if (e.daysFromNow < 0) return "overdue";
-  if (e.kind === "hearing") return e.daysFromNow <= 30 ? "urgent" : "normal";
-  return e.daysFromNow <= 90 ? "urgent" : "normal";
-}
-
 function calendarDotClass(e: UpcomingEvent): string {
   if (e.daysFromNow < 0 || e.daysFromNow <= 7) return "bg-red-500";
   if (e.daysFromNow <= 30) return "bg-amber-500";
@@ -2264,23 +2246,6 @@ function buildCalendarDays(cursor: Date): Array<{ date: Date }> {
     date.setDate(start.getDate() + index);
     return { date };
   });
-}
-
-function parseDate(value: string): Date | null {
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return null;
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
-function todayDate(): Date {
-  const now = new Date();
-  now.setHours(0, 0, 0, 0);
-  return now;
-}
-
-function diffDays(a: Date, b: Date): number {
-  return Math.round((a.getTime() - b.getTime()) / 86400000);
 }
 
 function upcomingEventKey(event: UpcomingEvent): string {

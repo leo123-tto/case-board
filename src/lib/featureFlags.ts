@@ -24,6 +24,7 @@ export type FeatureFlagName =
   | "case_todos"
   | "case_work_logs"
   | "case_work_reports"
+  | "case_ai_organize_filters"
   | "reference_materials";
 
 export interface FeatureFlagMeta {
@@ -84,6 +85,14 @@ export const FEATURE_FLAGS: FeatureFlagMeta[] = [
     title: "案件工作汇报",
     description:
       "开启后在案件详情显示工作汇报，可按需汇总案件概况、办案时间轴和工作记录，并导出 Word。",
+    defaultValue: false,
+    location: "settings",
+  },
+  {
+    name: "case_ai_organize_filters",
+    title: "AI 整理筛选条",
+    description:
+      "开启后在案件详情的 AI 视图下显示材料筛选条，可按重要度、归类、当事人侧和证据倾向快速筛材料。",
     defaultValue: false,
     location: "settings",
   },

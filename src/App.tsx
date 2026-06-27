@@ -24,6 +24,7 @@ import { VersionChip } from "@/components/VersionChip";
 import { toast, dismissToast, ToastViewport } from "@/components/ui/toast";
 import { TransactionModule } from "@/modules/transaction";
 import { ToolsModule } from "@/modules/tools";
+import { MemoryModule } from "@/modules/memory/MemoryModule";
 import type { InterestPrefill } from "@/modules/tools/calculators/InterestCalculator";
 import { TeamModule } from "@/modules/team/TeamModule";
 import { ExecutionModule } from "@/modules/execution";
@@ -1073,6 +1074,21 @@ function MainApp() {
     setSelectedId(caseId);
     setView("detail");
   };
+  const handleCaseStatusChanged = useCallback(
+    (caseId: string, status: string | null) => {
+      const patch = {
+        workflow_status: status,
+        workflow_status_locked: status == null ? 0 : 1,
+      };
+      setCases((prev) =>
+        prev.map((c) => (c.id === caseId ? { ...c, ...patch } : c)),
+      );
+      setSelectedCase((prev) =>
+        prev?.id === caseId ? { ...prev, ...patch } : prev,
+      );
+    },
+    [],
+  );
   const openHomeEvent = (event: UpcomingEvent) => {
     if (!event.caseId) return;
     setSelectedId(event.caseId);
@@ -1144,6 +1160,7 @@ function MainApp() {
           onImport={handleImport}
           onDeleteCase={handleDeleteCaseById}
           onDeleteCases={handleDeleteCases}
+          onCaseStatusChanged={handleCaseStatusChanged}
           onImportFolder={handleCalendarImport}
         />
       </HomeDropZone>
@@ -1194,6 +1211,7 @@ function MainApp() {
           onImport={handleImport}
           onDeleteCase={handleDeleteCaseById}
           onDeleteCases={handleDeleteCases}
+          onCaseStatusChanged={handleCaseStatusChanged}
           onImportFolder={handleCalendarImport}
         />
       </HomeDropZone>
@@ -1238,6 +1256,7 @@ function MainApp() {
             routeNonce={toolsRoute.nonce}
           />
         )}
+        {activeModule === "memory" && <MemoryModule />}
         {activeModule === "team" && <TeamModule />}
         {activeModule === "settings" && (
           <div className="h-full overflow-auto bg-background">

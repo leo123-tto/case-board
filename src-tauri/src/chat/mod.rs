@@ -29,6 +29,7 @@ pub mod hooks;
 pub mod loop_guard;
 pub mod mcp_bridge;
 pub mod mcp_paste;
+pub mod memory_extract;
 pub mod model_router;
 pub mod parallel;
 pub mod prefix_cache;

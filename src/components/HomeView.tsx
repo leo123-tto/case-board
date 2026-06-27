@@ -104,6 +104,8 @@ export interface HomeViewProps {
   onDeleteCase: (caseId: string) => void;
   /** 批量删除选中案件(筛选工具栏「多选」模式)。由 App 弹一次确认 + 逐个删 + 刷新列表。 */
   onDeleteCases: (caseIds: string[]) => void;
+  /** 状态修改成功后通知顶层案件列表同步,避免其他模块拿旧 workflow_status。 */
+  onCaseStatusChanged?: (caseId: string, status: StatusId | null) => void;
   /** 飞书日历:点日历事件后导入对应案件文件夹(反查案件池表→有则直接导,否则弹选择器)。 */
   onImportFolder?: (eventTitle: string) => void;
 }
@@ -141,6 +143,7 @@ export function HomeView({
   onImport,
   onDeleteCase,
   onDeleteCases,
+  onCaseStatusChanged,
   onImportFolder,
 }: HomeViewProps) {
   const greeting = getGreeting(userDisplayName);
@@ -252,7 +255,13 @@ export function HomeView({
   }, []);
 
   const casesWithOverride = cases.map((c) =>
-    c.id in statusOverride ? { ...c, workflow_status: statusOverride[c.id] } : c,
+    c.id in statusOverride
+      ? {
+          ...c,
+          workflow_status: statusOverride[c.id],
+          workflow_status_locked: statusOverride[c.id] == null ? 0 : 1,
+        }
+      : c,
   );
 
   const caseRows = useMemo<CaseRow[]>(
@@ -445,6 +454,7 @@ export function HomeView({
     setStatusOverride((m) => ({ ...m, [caseId]: status }));
     try {
       await updateWorkflowStatus(caseId, status);
+      onCaseStatusChanged?.(caseId, status);
       if (status === "closed") {
         toast(
           "案件已结案。可进详情页点「沉淀为办案经验」存入知识库,日后同类案可检索复用",
@@ -1032,7 +1042,7 @@ function CaseCard({
       <div className="absolute right-3 top-3">
         <StatusPicker
           status={status}
-          isManual={caseData.workflow_status != null}
+          isManual={caseData.workflow_status_locked === 1}
           onPick={onChangeStatus}
         />
       </div>
@@ -1141,7 +1151,7 @@ function CaseListRow({
       </div>
       <StatusPicker
         status={status}
-        isManual={caseData.workflow_status != null}
+        isManual={caseData.workflow_status_locked === 1}
         onPick={onChangeStatus}
       />
       <span className="inline-flex items-center gap-0.5 text-caption text-muted-foreground">

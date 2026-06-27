@@ -25,6 +25,8 @@ import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { MarkdownModal } from "@/components/MarkdownModal";
 import { formatYuan } from "@/lib/format";
+import { normalizeCaseStatusText } from "@/lib/caseSnapshot";
+import { todayIsoLocal } from "@/lib/date";
 import { confirmDialog } from "@/lib/dialog";
 import {
   type Case,
@@ -82,6 +84,10 @@ export function ExecutionDetailView({
   const isLocked = task !== null;
 
   useEffect(() => {
+    setCurrent(caseData);
+  }, [caseData]);
+
+  useEffect(() => {
     let cancelled = false;
     listPayments(caseData.id)
       .then((p) => {
@@ -96,6 +102,7 @@ export function ExecutionDetailView({
   const totalPaid = payments.reduce((s, p) => s + p.amount, 0);
   const remaining =
     current.agg_claim_amount != null ? Math.max(0, current.agg_claim_amount - totalPaid) : null;
+  const statusText = normalizeCaseStatusText(current.agg_status_text);
 
   const handleAddPayment = async (input: {
     amount: number;
@@ -394,9 +401,9 @@ export function ExecutionDetailView({
                 {current.case_summary}
               </p>
             )}
-            {current.agg_status_text && (
+            {statusText && (
               <p className="mt-1 text-xs text-muted-foreground/80">
-                {current.agg_status_text}
+                {statusText}
               </p>
             )}
           </div>
@@ -851,7 +858,7 @@ function PaymentsCard({
 }) {
   const [showInput, setShowInput] = useState(false);
   const [amount, setAmount] = useState("");
-  const [paidAt, setPaidAt] = useState(() => new Date().toISOString().slice(0, 10));
+  const [paidAt, setPaidAt] = useState(() => todayIsoLocal());
   const [note, setNote] = useState("");
 
   const submit = () => {

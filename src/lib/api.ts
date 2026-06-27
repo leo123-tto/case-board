@@ -18,13 +18,19 @@ import type {
 import type {
   Case,
   CaseInstance,
+  CaseMemory,
   CaseWithDocs,
   CourtFilingJob,
   CourtFilingEnvReport,
   Document,
   ExtractedFields,
   FeishuCalendarEvent,
+  GlobalMemory,
   LawyerProfile,
+  MemoryNote,
+  MemoryVaultStatus,
+  MemoryCandidate,
+  SaveMemoryNoteInput,
   NewCaseInstance,
   ImportPlan,
   ImportResult,
@@ -319,7 +325,7 @@ export function verifyYuandianKey(apiKey: string): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_yuandian_key", { apiKey });
 }
 
-/** 2026-05-25 V0.1.8:检测远程最新版本(分发站点的 version.json)。
+/** 2026-05-25 V0.1.8:检测远程最新版本(公开站点的 version.json)。
  *  失败时 has_update=false + error 字段填上原因,前端可静默忽略。*/
 export function checkForUpdate(): Promise<UpdateInfo> {
   return invoke<UpdateInfo>("check_for_update");
@@ -554,6 +560,63 @@ export function saveEditorDoc(
   contentMd: string,
 ): Promise<EditorSaveResult> {
   return invoke<EditorSaveResult>("save_editor_doc", { docId, title, contentMd });
+}
+
+/* ------------------------------------------------------------------ */
+/* 案件 AI 记忆                                                        */
+/* ------------------------------------------------------------------ */
+
+export function listCaseMemories(
+  caseId: string,
+  includeDisabled = false,
+): Promise<CaseMemory[]> {
+  return invoke<CaseMemory[]>("list_case_memories", {
+    caseId,
+    includeDisabled,
+  });
+}
+
+export function listGlobalMemories(): Promise<GlobalMemory[]> {
+  return invoke<GlobalMemory[]>("list_global_memories");
+}
+
+export function loadMemoryVault(): Promise<MemoryVaultStatus> {
+  return invoke<MemoryVaultStatus>("load_memory_vault");
+}
+
+export function saveMemoryNote(input: SaveMemoryNoteInput): Promise<MemoryNote> {
+  return invoke<MemoryNote>("save_memory_note", { input });
+}
+
+export function listMemoryCandidates(caseId: string | null): Promise<MemoryCandidate[]> {
+  return invoke<MemoryCandidate[]>("list_memory_candidates", { caseId });
+}
+
+export function acceptMemoryCandidate(id: string): Promise<void> {
+  return invoke<void>("accept_memory_candidate", { id });
+}
+
+export function ignoreMemoryCandidate(id: string): Promise<number> {
+  return invoke<number>("ignore_memory_candidate", { id });
+}
+
+export function createCaseMemory(
+  caseId: string,
+  content: string,
+): Promise<CaseMemory> {
+  return invoke<CaseMemory>("create_case_memory", { caseId, content });
+}
+
+export function updateCaseMemory(
+  id: string,
+  content: string,
+  status = "active",
+): Promise<CaseMemory> {
+  return invoke<CaseMemory>("update_case_memory", { id, content, status });
+}
+
+export function disableCaseMemory(id: string): Promise<number> {
+  return invoke<number>("disable_case_memory", { id });
 }
 
 /* ------------------------------------------------------------------ */

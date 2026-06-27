@@ -37,6 +37,7 @@ import {
   teamSyncNow,
   teamView,
 } from "@/lib/api";
+import { daysFromToday, todayIsoLocal } from "@/lib/date";
 import type {
   DiscoveredTeam,
   RosterMember,
@@ -779,7 +780,7 @@ function PermEditor({
 /** 全队重要日期横条:聚合可见成员未来的关键日期。 */
 function TeamKeyDates({ view }: { view: TeamView }) {
   const upcoming = useMemo(() => {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = todayIsoLocal();
     const items: { date: string; event: string; who: string; caseName: string }[] = [];
     for (const m of view.members) {
       for (const c of m.cases) {
@@ -803,9 +804,7 @@ function TeamKeyDates({ view }: { view: TeamView }) {
       </p>
       <div className="flex flex-wrap gap-2">
         {upcoming.map((it, i) => {
-          const days = Math.round(
-            (new Date(it.date).getTime() - Date.now()) / (24 * 3600 * 1000),
-          );
+          const days = daysFromToday(it.date) ?? 0;
           const urgent = days <= 30;
           return (
             <span
@@ -966,7 +965,7 @@ function CaseCard({
   const pending = caseEdits.filter((e) => e.status === "pending");
 
   // 下一个未来日期(提醒位);最新进展(摘要位,老板需求:显示时间轴最新发生的事)
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayIsoLocal();
   const nextUpcoming = c.key_dates.find((d) => d.date >= today);
   return (
     <div
@@ -1137,7 +1136,7 @@ function TeamCaseDetail({
     (e) => e.case_id === c.id && e.status === "pending" && e.editor_id === myId,
   );
   const f = freshness(owner.updated_at);
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayIsoLocal();
   const timeline = [...c.key_dates].sort((a, b) => b.date.localeCompare(a.date));
 
   async function submitNote() {

@@ -8,6 +8,7 @@
  */
 
 import type { Case, Document } from "@/lib/types";
+import { todayIsoLocal } from "@/lib/date";
 
 /** 工作流状态 ID(对应数据库 cases.workflow_status 字段值) */
 export type StatusId =
@@ -178,7 +179,7 @@ export function inferCaseStatus(
   }
 
   // 4. 开庭已发生(最晚开庭 ≤ 今天) / 有庭审笔录
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayIsoLocal();
   const hadHearing = keyDates.some(
     (k) => k.event_type === "开庭" && k.date && k.date <= today,
   );
@@ -233,10 +234,42 @@ export function resolveCaseStatus(
   keyDates: Array<{ event_type: string; date: string | null }> = [],
 ): StatusDef {
   const manual = caseData.workflow_status as StatusId | null;
-  if (manual && manual in STATUS_DEFS) {
+  if (caseData.workflow_status_locked === 1 && manual && manual in STATUS_DEFS) {
     return STATUS_DEFS[manual];
   }
-  return STATUS_DEFS[inferCaseStatus(caseData, documents, keyDates)];
+  const effectiveKeyDates =
+    keyDates.length > 0 ? keyDates : readAggKeyDates(caseData.agg_key_dates);
+  const inferred = inferCaseStatus(caseData, documents, effectiveKeyDates);
+
+  // LLM 写入的 workflow_status 是抽取当日的一次性判断,不能像用户手工锁定一样
+  // 永久压过日期推断。只有自动推断完全没有线索时,才把它当兜底显示值。
+  if (inferred === "intake" && manual && manual in STATUS_DEFS) {
+    return STATUS_DEFS[manual];
+  }
+  return STATUS_DEFS[inferred];
+}
+
+function readAggKeyDates(
+  json: string | null,
+): Array<{ event_type: string; date: string | null }> {
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((d) => ({
+        event_type:
+          typeof d?.event_type === "string"
+            ? d.event_type
+            : typeof d?.event === "string"
+              ? d.event
+              : "",
+        date: typeof d?.date === "string" ? d.date : null,
+      }))
+      .filter((d) => d.event_type);
+  } catch {
+    return [];
+  }
 }
 
 /** 列表排序(作者 2026-05-24 e):

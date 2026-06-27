@@ -20,6 +20,7 @@ pub mod ingest;
 pub mod lifecycle;
 pub mod llm;
 pub mod local_kb;
+pub mod memory_vault;
 pub mod proc_util;
 // 私人专属功能 Rust 侧(双轨发布模型)。开源仓此文件为桩(命令返回 Err),照样编译。
 pub mod case_bundle;
@@ -557,7 +558,7 @@ async fn verify_openai_compat_key(
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:分发站点的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:公开站点的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -4807,6 +4808,111 @@ async fn list_chat_history(
     chat::list_chat_history_impl(pool.inner(), &case_id, limit).await
 }
 
+#[tauri::command]
+async fn list_case_memories(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    include_disabled: Option<bool>,
+) -> Result<Vec<crate::db::case_memories::CaseMemory>, String> {
+    crate::db::case_memories::list(pool.inner(), &case_id, include_disabled.unwrap_or(false))
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn list_global_memories(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<crate::db::case_memories::GlobalMemory>, String> {
+    crate::db::case_memories::list_active_global_memories(pool.inner())
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+fn load_memory_vault() -> Result<crate::memory_vault::MemoryVaultStatus, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    crate::memory_vault::load_vault_status(&settings)
+}
+
+#[tauri::command]
+fn save_memory_note(
+    input: crate::memory_vault::SaveMemoryNoteInput,
+) -> Result<crate::memory_vault::MemoryNote, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    crate::memory_vault::save_note(&settings, input)
+}
+
+#[tauri::command]
+async fn list_memory_candidates(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: Option<String>,
+) -> Result<Vec<crate::db::case_memories::MemoryCandidate>, String> {
+    crate::db::case_memories::list_pending_candidates(pool.inner(), case_id.as_deref())
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn accept_memory_candidate(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+) -> Result<(), String> {
+    match crate::db::case_memories::accept_candidate(pool.inner(), &id).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.contains("全局") || e.contains("不是案件") || e.contains("不是全局") => {
+            crate::db::case_memories::accept_candidate_as_global(pool.inner(), &id)
+                .await
+                .map(|_| ())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[tauri::command]
+async fn ignore_memory_candidate(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+) -> Result<u64, String> {
+    crate::db::case_memories::ignore_candidate(pool.inner(), &id)
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn create_case_memory(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    content: String,
+) -> Result<crate::db::case_memories::CaseMemory, String> {
+    crate::db::case_memories::create(pool.inner(), &case_id, &content, "manual", "active").await
+}
+
+#[tauri::command]
+async fn update_case_memory(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+    content: String,
+    status: Option<String>,
+) -> Result<crate::db::case_memories::CaseMemory, String> {
+    crate::db::case_memories::update(
+        pool.inner(),
+        &id,
+        &content,
+        status.as_deref().unwrap_or("active"),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn disable_case_memory(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+) -> Result<u64, String> {
+    crate::db::case_memories::disable(pool.inner(), &id)
+        .await
+        .map_err(db_err)
+}
+
 /// 取消进行中的 chat。message_id 必须跟 case_chat 入参的 message_id 相同。
 #[tauri::command]
 fn cancel_chat(registry: tauri::State<'_, chat::ChatCancelRegistry>, message_id: String) -> bool {
@@ -5834,6 +5940,16 @@ pub fn run() {
             case_chat,
             detach_chat_window,
             list_chat_history,
+            list_case_memories,
+            list_global_memories,
+            load_memory_vault,
+            save_memory_note,
+            list_memory_candidates,
+            accept_memory_candidate,
+            ignore_memory_candidate,
+            create_case_memory,
+            update_case_memory,
+            disable_case_memory,
             cancel_chat,
             clear_chat_history,
             // MCP 数据源接入(粘贴识别 + 连接测试)

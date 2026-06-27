@@ -2,7 +2,7 @@
  * 微信交流群二维码(已裁成方形,撑满不变形)。
  *
  * 微信群二维码 7 天失效、无永久码 —— 所以**托管在 lawtools.top**,过期换图不用重新发版:
- * 作者把新码(裁成方形)替换 发布仓的 `caseboard/group-qr.jpg` 并 push,全员次日生效。
+ * 维护者把新码(裁成方形)替换公开站点的 `caseboard/group-qr.jpg` 后,全员次日生效。
  * `?d=今天` 每日 cache-bust(绕 Cloudflare 缓存)。
  * 远程加载失败(离线 / 未上线)→ 回退打包的本地副本 `public/group-qr.jpg`。
  *
@@ -10,6 +10,7 @@
  */
 import { useState } from "react";
 
+import { todayIsoLocal } from "@/lib/date";
 import { cn } from "@/lib/utils";
 
 const REMOTE = "https://lawtools.top/caseboard/group-qr.jpg";
@@ -22,7 +23,7 @@ export function GroupQrCode({
   size?: number;
   className?: string;
 }) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayIsoLocal();
   const [src, setSrc] = useState(`${REMOTE}?d=${today}`);
   const [usedLocal, setUsedLocal] = useState(false);
   // 本地兜底也带 cache-bust:换图后(同名文件)绕开浏览器旧缓存,避免显示裁剪前的旧图

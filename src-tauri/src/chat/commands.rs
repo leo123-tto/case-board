@@ -27,7 +27,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::chat::agent_loop::{run_chat_with_tools, AgentLoopRequest};
-use crate::chat::constitution::build_system_prompt;
+use crate::chat::constitution::build_system_prompt_with_memory;
 use crate::chat::context::TaskType;
 use crate::chat::model_router::route_model;
 use crate::chat::prompts::task_user_prompt;
@@ -295,8 +295,34 @@ pub async fn case_chat_impl(
     let attached_ids: Vec<String> = attached_doc_ids_clone.clone().unwrap_or_default();
     // based_on:本轮喂进上下文的「材料文档」id(写 chat_messages.based_on);原由 build_context 返回
     let based_on_doc_ids = crate::chat::constitution::material_doc_ids(&docs, &attached_ids);
-    let constitution_prompt =
-        build_system_prompt(&case, &docs, &attached_ids, input.editing_doc_id.as_deref());
+    let case_memories = crate::db::case_memories::list_active(pool, &input.case_id)
+        .await
+        .map_err(|e| format!("读取案件记忆失败: {}", e))?
+        .into_iter()
+        .map(|m| m.content)
+        .collect::<Vec<_>>();
+    let mut global_memories = crate::db::case_memories::list_active_global_memories(pool)
+        .await
+        .map_err(|e| format!("读取全局记忆失败: {}", e))?
+        .into_iter()
+        .map(|m| m.content)
+        .collect::<Vec<_>>();
+    let memory_modes = allowed_memory_modes_for_chat(task, input.editing_doc_id.is_some());
+    match crate::memory_vault::build_prompt_pack_for_modes(&settings, &memory_modes) {
+        Ok(pack) => global_memories.extend(pack.items),
+        Err(e) => crate::dlog!("[memory] 读取 Markdown 记忆库失败: {}", e),
+    }
+    let global_memories = cap_prompt_memories(global_memories, 8_000, "全局记忆");
+    let case_memories = cap_prompt_memories(case_memories, 6_000, "本案记忆");
+    let constitution_prompt = build_system_prompt_with_memory(
+        &case,
+        &docs,
+        &attached_ids,
+        input.editing_doc_id.as_deref(),
+        settings.ai_soul_md.as_deref(),
+        &global_memories,
+        &case_memories,
+    );
 
     let registry_tools = ToolRegistry::default_v0_2();
     // V0.3.6 · 外部 MCP server(白名单,默认空 = 零开销零变化)。连/列失败的 server 跳过+dlog,不拖垮 chat。
@@ -486,6 +512,21 @@ pub async fn case_chat_impl(
             .await
             .map_err(|e| format!("入库 assistant 消息失败: {}", e))?;
 
+            match persist_memory_candidates_from_turn(
+                pool,
+                &input.case_id,
+                &user_msg_id,
+                &assistant_id,
+                &input.user_message,
+                &assistant_content,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => crate::dlog!("[memory] 新增 {} 条候选记忆", n),
+                Ok(_) => {}
+                Err(e) => crate::dlog!("[memory] 生成候选记忆失败: {}", e),
+            }
+
             // chat 完成后后台增量索引:本轮若调过 get_law_article/get_case_detail,新缓存的
             // 法条/案例补进语义索引(单飞 + 无新增早退,所以多数轮次是廉价 no-op)。
             crate::spawn_kb_auto_index(app.clone());
@@ -595,6 +636,39 @@ pub async fn clear_chat_history_impl(pool: &SqlitePool, case_id: &str) -> Result
 // =============================================================================
 // 内部 helper
 // =============================================================================
+
+async fn persist_memory_candidates_from_turn(
+    pool: &SqlitePool,
+    case_id: &str,
+    user_message_id: &str,
+    assistant_message_id: &str,
+    user_text: &str,
+    assistant_text: &str,
+) -> Result<usize, String> {
+    let drafts = crate::chat::memory_extract::extract_memory_candidates_from_turn(
+        case_id,
+        user_text,
+        assistant_text,
+    );
+    if drafts.is_empty() {
+        return Ok(0);
+    }
+    let event = crate::db::case_memories::record_turn_event(
+        pool,
+        Some(case_id),
+        user_message_id,
+        assistant_message_id,
+        user_text,
+        assistant_text,
+    )
+    .await?;
+    let mut created = 0;
+    for draft in drafts {
+        crate::db::case_memories::create_candidate_from_draft(pool, &event.id, &draft).await?;
+        created += 1;
+    }
+    Ok(created)
+}
 
 /// 从历史里截最近 N 对 user/assistant,总字符不超 budget。
 ///
@@ -782,6 +856,58 @@ fn sanitize_error(s: &str) -> String {
 /// (保留入参以兼容调用点;若将来出现真正支持 required 的非思考模型,在此一处放开即可。)
 fn resolve_tool_choice(_needs_tools: bool, _model: &str) -> &'static str {
     "auto"
+}
+
+fn cap_prompt_memories(items: Vec<String>, char_budget: usize, label: &str) -> Vec<String> {
+    let budget = char_budget.max(500);
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    let mut omitted = 0usize;
+
+    for item in items {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let len = trimmed.chars().count() + 1;
+        if used + len <= budget {
+            used += len;
+            out.push(trimmed.to_string());
+        } else {
+            omitted += 1;
+        }
+    }
+
+    if omitted > 0 {
+        while !out.is_empty() && budget.saturating_sub(used) < 120 {
+            if let Some(removed) = out.pop() {
+                used = used.saturating_sub(removed.chars().count() + 1);
+                omitted += 1;
+            }
+        }
+        let mut summary =
+            format!("[压缩{label}] 另有 {omitted} 条记忆因上下文预算限制未展开;本轮优先遵守用户最新指令、案件材料和工具结果。");
+        let remaining = budget.saturating_sub(used);
+        if summary.chars().count() > remaining {
+            summary = summary.chars().take(remaining).collect();
+        }
+        if !summary.is_empty() {
+            out.push(summary);
+        }
+    }
+
+    out
+}
+
+fn allowed_memory_modes_for_chat(task: TaskType, editing_doc: bool) -> Vec<&'static str> {
+    let mut modes = vec!["global_prompt", "case_prompt"];
+    if task.needs_tools() {
+        modes.push("tool_prompt");
+    }
+    if editing_doc || matches!(task, TaskType::VerifyMyDraft) {
+        modes.push("writing_prompt");
+    }
+    modes
 }
 
 // =============================================================================

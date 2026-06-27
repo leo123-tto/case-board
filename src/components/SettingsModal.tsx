@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
 import { confirmDialog } from "@/lib/dialog";
+import { todayIsoLocal } from "@/lib/date";
 
 import { Button } from "@/components/ui/button";
 import { HoverHint } from "@/components/HoverHint";
@@ -1021,6 +1022,26 @@ export function SettingsModal({
               {/* ── 大脑:云端 AI 后端 + DeepSeek / MiniMax(切换后只显示所选后端)── */}
               {tab === "brain" && (
                 <>
+                  <Section title="AI Soul">
+                    <Field
+                      label="全局工作风格"
+                      hint="写长期偏好和协作习惯,例如回答结构、风险提示口径、默认称呼。不要写具体案件事实。"
+                    >
+                      <textarea
+                        value={settings.ai_soul_md ?? ""}
+                        onChange={(e) =>
+                          updateField("ai_soul_md", e.target.value || null)
+                        }
+                        rows={5}
+                        placeholder="例:先给结论,再列依据和风险;事实不明确时先追问;法律文书表达正式克制。"
+                        className={cn(inputCls, "min-h-[112px] resize-y leading-relaxed")}
+                      />
+                      <p className="mt-1 text-label text-muted-foreground">
+                        AI Soul 会注入案件 AI 助手,但优先级低于系统规则、当前问题、案件材料和工具返回。
+                      </p>
+                    </Field>
+                  </Section>
+
                   <Section title="云端 AI 后端">
                     <Field label="提供商">
                       <select
@@ -2383,7 +2404,7 @@ function LocalKbCard({
   async function handleExport() {
     setError(null);
     try {
-      const today = new Date().toISOString().slice(0, 10);
+      const today = todayIsoLocal();
       const picked = await dialogSave({
         defaultPath: `caseboard-kb-share-${today}.zip`,
         filters: [{ name: "Zip", extensions: ["zip"] }],

@@ -117,6 +117,28 @@ export function CaseView({
 }) {
   const groups = groupByStage(documents);
   const aiArtifacts = documents.filter((d) => d.is_ai_artifact);
+  const chatDataVersion = useMemo(
+    () =>
+      [
+        selectedCase?.id ?? "",
+        selectedCase?.updated_at ?? "",
+        selectedCase?.agg_computed_at ?? "",
+        documents.length,
+        documents
+          .map((d) =>
+            [
+              d.id,
+              d.modified_at ?? "",
+              d.created_at,
+              d.display_name ?? "",
+              d.extraction_status,
+              d.deleted_at ?? "",
+            ].join(":"),
+          )
+          .join("|"),
+      ].join("::"),
+    [selectedCase?.id, selectedCase?.updated_at, selectedCase?.agg_computed_at, documents],
+  );
   // 辅助在线立案默认隐藏(实验性 + 依赖本机 Python),在「在线立案」工具里开关
   const [showCourtFiling] = useFeatureFlag("case_court_filing");
   const [showTodos] = useFeatureFlag("case_todos");
@@ -622,6 +644,9 @@ export function CaseView({
           key="case-chat"
           caseId={selectedCase?.id ?? null}
           caseName={selectedCase?.name ?? null}
+          caseData={selectedCase}
+          documents={documents}
+          dataVersion={chatDataVersion}
           onArtifactCreated={onArtifactCreated}
           editingDocId={editingDoc?.id ?? null}
           onBeforeSend={flushEditorBeforeSend}

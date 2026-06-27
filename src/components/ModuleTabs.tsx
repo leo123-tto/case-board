@@ -10,6 +10,7 @@
 import { useLayoutEffect, useRef, useState, type ComponentType } from "react";
 import {
   Briefcase,
+  Brain,
   FileQuestion,
   Gavel,
   Home,
@@ -32,6 +33,7 @@ export type ModuleId =
   | "execution"
   | "transaction"
   | "tools"
+  | "memory"
   | "team"
   | "settings";
 
@@ -46,6 +48,7 @@ const MODULES: { id: string; label: string; icon: TabIcon; beta?: boolean }[] = 
   { id: "execution", label: "执行", icon: Gavel },
   { id: "transaction", label: "非诉", icon: FileQuestion },
   { id: "tools", label: "工具", icon: Wrench },
+  { id: "memory", label: "记忆", icon: Brain },
   // 2026-06-10 团队版 Phase 1:LAN 接力同步团队看板(未入团显示引导页)
   { id: "team", label: "团队", icon: Users },
   { id: "settings", label: "设置", icon: SettingsIcon },

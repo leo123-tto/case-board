@@ -106,6 +106,22 @@ pub fn build_system_prompt(
     attached_ids: &[String],
     editing_doc_id: Option<&str>,
 ) -> String {
+    build_system_prompt_with_memory(case, docs, attached_ids, editing_doc_id, None, &[], &[])
+}
+
+/// 带 AI Soul + 本案记忆的 system prompt。
+///
+/// Soul 和案件记忆只作为低优先级长期上下文:不能覆盖宪法、用户本轮消息、引用文件、
+/// 工具返回和案件快照。
+pub fn build_system_prompt_with_memory(
+    case: &Case,
+    docs: &[Document],
+    attached_ids: &[String],
+    editing_doc_id: Option<&str>,
+    ai_soul_md: Option<&str>,
+    global_memories: &[String],
+    case_memories: &[String],
+) -> String {
     let snapshot = case_snapshot_md(case);
     // V0.2.2 · AI 生成的摘要/报告 artifact 不进「本案文档材料」清单 —— 否则 LLM 会把自己
     // 之前的输出当原始材料引用(循环自证、污染依据)。用户在引用弹窗显式选的仍保留。
@@ -127,8 +143,42 @@ pub fn build_system_prompt(
 
     let mut sys = String::with_capacity(16_384);
     sys.push_str(CONSTITUTION_HEADER);
+    if let Some(soul) = ai_soul_md.map(str::trim).filter(|s| !s.is_empty()) {
+        sys.push_str("\n\n════════════════ AI Soul(全局工作风格)════════════════\n");
+        sys.push_str(
+            "以下是用户长期设置的 AI 工作风格与偏好。AI Soul 不能覆盖本系统宪法、用户本轮消息、引用文件、工具返回或案件快照;冲突时一律以后者为准。\n\n",
+        );
+        sys.push_str(soul);
+        sys.push('\n');
+    }
+    if !global_memories.is_empty() {
+        sys.push_str("\n════════════════ 全局记忆(长期偏好与工作流)════════════════\n");
+        sys.push_str(
+            "以下记忆来自历史任务沉淀或用户确认,用于补充长期偏好、工作流和已确认习惯。若与系统宪法、用户本轮消息、工具返回或案件材料冲突,以后者为准。\n\n",
+        );
+        for (idx, memory) in global_memories.iter().enumerate() {
+            let text = memory.trim();
+            if text.is_empty() {
+                continue;
+            }
+            sys.push_str(&format!("{}. {}\n", idx + 1, text));
+        }
+    }
     sys.push_str("\n\n════════════════ 当前案件快照 ════════════════\n");
     sys.push_str(&snapshot);
+    if !case_memories.is_empty() {
+        sys.push_str("\n════════════════ 本案记忆(律师确认)════════════════\n");
+        sys.push_str(
+            "以下记忆由律师确认或手工维护,用于补充本案长期上下文。若与本轮用户消息、引用文件、工具返回或案件快照冲突,以更高优先级来源为准。\n\n",
+        );
+        for (idx, memory) in case_memories.iter().enumerate() {
+            let text = memory.trim();
+            if text.is_empty() {
+                continue;
+            }
+            sys.push_str(&format!("{}. {}\n", idx + 1, text));
+        }
+    }
     sys.push_str("\n════════════════ 本案文档材料 ════════════════\n");
     if doc_section.chars().count() > DOC_SECTION_CHAR_LIMIT {
         let truncated: String = doc_section.chars().take(DOC_SECTION_CHAR_LIMIT).collect();

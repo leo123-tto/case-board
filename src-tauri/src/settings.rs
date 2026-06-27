@@ -251,6 +251,8 @@ pub struct Settings {
     pub chat_loop_max_iters: Option<u32>,
     /// chat 单条消息最多引用文档数(默认 5)
     pub chat_max_attached: Option<u32>,
+    /// AI Soul:全局 AI 助手工作风格 / 长期偏好。只作为低优先级风格约束,不能覆盖系统宪法。
+    pub ai_soul_md: Option<String>,
     /// V0.3.6 · 外部 MCP server 白名单(CaseBoard 当客户端消费其工具)。默认空 = 桥接关闭、零行为变化。
     /// 每项 `{name, transport:{type:"stdio",command,args,env}|{type:"http",url}, enabled}`,详 ADR-0008。
     pub mcp_servers: Vec<McpServerConfig>,

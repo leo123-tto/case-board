@@ -31,6 +31,7 @@ import {
   type KbImportResult,
   type KbStatus,
 } from "@/lib/api";
+import { todayIsoLocal } from "@/lib/date";
 import { formatBytes } from "@/lib/format";
 
 /** 错误透传(跟 CaseChatPanel/Settings 一致:真错原文,不替换固定文案)。 */
@@ -96,7 +97,7 @@ export function KbShareTool() {
     setError(null);
     setExportResult(null);
     try {
-      const today = new Date().toISOString().slice(0, 10);
+      const today = todayIsoLocal();
       const picked = await dialogSave({
         defaultPath: `caseboard-kb-share-${today}.zip`,
         filters: [{ name: "知识库资料包", extensions: ["zip"] }],

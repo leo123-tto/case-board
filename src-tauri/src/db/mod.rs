@@ -21,6 +21,7 @@ pub mod bookmarks;
 pub mod calendar_events;
 pub mod case_instances;
 pub mod case_logs;
+pub mod case_memories;
 pub mod cases;
 pub mod chat;
 pub mod chat_tasks;
@@ -98,7 +99,7 @@ pub async fn init_pool(db_path: &str) -> Result<SqlitePool, DbError> {
 
     // 2026-06-15:跑迁移前先对齐 _sqlx_migrations 校验值,根治「migration N ... has been modified」
     // 启动崩溃。病根 = 双轨发布(私人仓 vs 开源仓)对**同一批已发布迁移**做了去身份化注释改动
-    // (旧站点路径→正式站点路径、本地路径→泛化),SQL 一字未改但 SHA-384 变了 → 老用户 DB 里
+    // (分发域名、本地路径等注释泛化),SQL 一字未改但 SHA-384 变了 → 老用户 DB 里
     // 存的旧校验值对不上新二进制内嵌值 → sqlx 启动中止(release 是 panic=abort,直接闪退)。
     // 详见 docs/反馈问题排查-2026-06-15.md。
     reconcile_migration_checksums(&pool).await?;

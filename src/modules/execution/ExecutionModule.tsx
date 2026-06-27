@@ -14,9 +14,10 @@
  */
 
 import { Gavel, Loader2 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { formatYuan } from "@/lib/format";
+import { normalizeCaseStatusText } from "@/lib/caseSnapshot";
 import type { Case, CourtContact, Document } from "@/lib/types";
 import { parseJsonArray } from "@/lib/types";
 import { getCaseWithDocs, listCases } from "@/lib/api";
@@ -34,13 +35,21 @@ export function ExecutionModule({ onCalculateInterest }: Props) {
   const [cases, setCases] = useState<Case[]>([]);
   const [docsByCase, setDocsByCase] = useState<Record<string, Document[]>>({});
   const [loading, setLoading] = useState(true);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const reloadExecutionCases = useCallback(
+    async ({ showSpinner = false }: { showSpinner?: boolean } = {}) => {
+      if (showSpinner) setLoading(true);
       try {
         const all = await listCases();
-        if (cancelled) return;
+        if (!mountedRef.current) return;
         setCases(all);
         // 每个案件拉 docs 给 inferStatus 用(跟首页 HomeView 同源)
         const pairs = await Promise.all(
@@ -53,16 +62,36 @@ export function ExecutionModule({ onCalculateInterest }: Props) {
             }
           }),
         );
-        if (cancelled) return;
+        if (!mountedRef.current) return;
         setDocsByCase(Object.fromEntries(pairs));
+        setSelectedCase((current) =>
+          current ? (all.find((c) => c.id === current.id) ?? current) : null,
+        );
       } finally {
-        if (!cancelled) setLoading(false);
+        if (mountedRef.current) setLoading(false);
       }
-    })();
-    return () => {
-      cancelled = true;
+    },
+    [],
+  );
+
+  useEffect(() => {
+    reloadExecutionCases({ showSpinner: true }).catch(() => {
+      if (mountedRef.current) setLoading(false);
+    });
+  }, [reloadExecutionCases]);
+
+  useEffect(() => {
+    const refreshOnFocus = () => {
+      if (document.visibilityState === "hidden") return;
+      void reloadExecutionCases().catch(() => {});
     };
-  }, []);
+    window.addEventListener("focus", refreshOnFocus);
+    document.addEventListener("visibilitychange", refreshOnFocus);
+    return () => {
+      window.removeEventListener("focus", refreshOnFocus);
+      document.removeEventListener("visibilitychange", refreshOnFocus);
+    };
+  }, [reloadExecutionCases]);
 
   // 2026-05-24 j-3 修:用 resolveCaseStatus(workflow_status 优先[手工/LLM 推断] > 文档自动推断)— 跟首页 chip 同源
   const executionCases = useMemo(
@@ -166,6 +195,7 @@ function ExecutionCard({
   onOpen: () => void;
 }) {
   const defendants = parseJsonArray(caseData.agg_defendants);
+  const statusText = normalizeCaseStatusText(caseData.agg_status_text);
   const keyDates = parseKeyDates(caseData.agg_key_dates);
   // 优先展示"执行立案 / 申请保全 / 续封 / 财产查询" 节点
   const executionDates = keyDates.filter((d) =>
@@ -253,9 +283,9 @@ function ExecutionCard({
         </div>
       )}
 
-      {caseData.agg_status_text && (
+      {statusText && (
         <p className="mt-3 line-clamp-2 text-xs text-muted-foreground/80">
-          {caseData.agg_status_text}
+          {statusText}
         </p>
       )}
     </button>

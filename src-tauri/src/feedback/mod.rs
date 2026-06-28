@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 自动收集的诊断信息(给反馈 MD 用)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +49,10 @@ pub struct DiagnosticInfo {
 
     /// 2026-05-26 V0.1.11:磁盘 / DB 大小 / 路径权限 / RAM 等系统级诊断
     pub system_info: SystemInfo,
+
+    /// 2026-06-28:本地 KB / 记忆目录诊断。只含路径、权限、计数,不含记忆正文。
+    #[serde(default)]
+    pub kb_memory: KbMemoryDiagnostic,
 
     /// 2026-05-26 V0.1.11:App 自身最近的 stderr 日志(diagnostic_log ring buffer 快照)
     /// 最多 200 行,新→旧(每行已 sanitize_paths,不含 /Users/.../<case-name>/ 路径)
@@ -209,6 +213,20 @@ pub struct SystemInfo {
     pub pdftoppm_available: bool,
 }
 
+/// 本地 KB / 记忆目录诊断。反馈只收路径状态与数量,不读取记忆正文。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KbMemoryDiagnostic {
+    pub local_kb_enabled: Option<bool>,
+    pub local_kb_root_configured: Option<String>,
+    pub local_kb_root_resolved: Option<String>,
+    pub local_kb_state: String,
+    pub memory_root_resolved: Option<String>,
+    pub memory_root_exists: bool,
+    pub memory_root_writable: bool,
+    pub memory_notes_count: Option<u64>,
+    pub memory_error: Option<String>,
+}
+
 /// 前端 console 上报的错误条目(2026-05-26 V0.1.11)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsoleError {
@@ -240,7 +258,7 @@ pub struct RecentFailure {
     pub created_at: String,
     /// 2026-05-25 V0.1.8 加:抽取失败的具体原因(三轮重试全失败后落库的 last_error)。
     /// 输出到反馈 MD 前会经 `sanitize_paths` 把绝对路径替换成 `<path>/<basename>`,
-    /// 防止泄漏当事人姓名出现在路径里(如 `/<root>/.../<某当事人名>/...`)。
+    /// 防止泄漏当事人姓名出现在路径里(如 `<home>/.../张三/...`)。
     pub last_error: Option<String>,
 }
 
@@ -398,6 +416,54 @@ fn collect_system_info() -> SystemInfo {
     }
 }
 
+fn can_write_dir(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(format!(".caseboard_write_probe_{}", uuid::Uuid::new_v4()));
+    match std::fs::write(&probe, b"x") {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn collect_kb_memory_diagnostic(settings: &crate::settings::Settings) -> KbMemoryDiagnostic {
+    let local_kb_state = match crate::local_kb::status::detect_kb_status(settings) {
+        crate::local_kb::status::KbStatus::Bound { .. } => "bound",
+        crate::local_kb::status::KbStatus::Unbound { .. } => "unbound",
+        crate::local_kb::status::KbStatus::PermissionDenied { .. } => "permission_denied",
+    }
+    .to_string();
+
+    let mut out = KbMemoryDiagnostic {
+        local_kb_enabled: settings.local_kb_enabled,
+        local_kb_root_configured: settings.local_kb_root.clone(),
+        local_kb_state,
+        ..KbMemoryDiagnostic::default()
+    };
+
+    match crate::memory_vault::resolve_memory_paths_from_settings(settings) {
+        Ok(paths) => {
+            out.local_kb_root_resolved = Some(paths.kb_root.to_string_lossy().to_string());
+            out.memory_root_resolved = Some(paths.memory_root.to_string_lossy().to_string());
+            out.memory_root_exists = paths.memory_root.is_dir();
+            out.memory_root_writable = can_write_dir(&paths.memory_root);
+            if out.memory_root_exists {
+                match crate::memory_vault::list_notes_in_root(&paths.memory_root) {
+                    Ok(notes) => out.memory_notes_count = Some(notes.len() as u64),
+                    Err(e) => out.memory_error = Some(e),
+                }
+            }
+        }
+        Err(e) => out.memory_error = Some(e),
+    }
+
+    out
+}
+
 /// 从 DB + settings + 系统调用收集诊断信息。
 ///
 /// `console_errors`:前端打开反馈弹窗时把累积的 console.error / window.onerror 数组传过来。
@@ -511,6 +577,7 @@ pub async fn collect(
     // 2026-05-26 V0.1.11 加:settings 脱敏快照 + 系统级 + stderr ring buffer + 前端 console
     let settings_snapshot = build_settings_snapshot(&settings);
     let system_info = collect_system_info();
+    let kb_memory = collect_kb_memory_diagnostic(&settings);
     let stderr_tail = crate::diagnostic_log::snapshot();
 
     // 2026-05-26 V0.1.12:最近 200 条抽取 metrics + 按 backend 聚合
@@ -546,6 +613,7 @@ pub async fn collect(
         recent_failures,
         settings_snapshot,
         system_info,
+        kb_memory,
         stderr_tail,
         console_errors,
         metrics_tail,
@@ -1273,6 +1341,61 @@ fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
     ));
     md.push('\n');
 
+    // 2026-06-28:本地 KB / 记忆目录诊断。排查 Windows Known Folder、只读目录、
+    // `~/Documents/知识库` 未展开等问题时,这段比单纯错误弹窗更有用。
+    {
+        let km = &info.kb_memory;
+        md.push_str("## 本地 KB / 记忆诊断\n\n");
+        md.push_str(&format!(
+            "- KB 开关:{}\n",
+            match km.local_kb_enabled {
+                Some(true) => "启用",
+                Some(false) => "关闭",
+                None => "未设置",
+            }
+        ));
+        md.push_str(&format!(
+            "- KB 状态:{}\n",
+            match km.local_kb_state.as_str() {
+                "bound" => "已绑定",
+                "permission_denied" => "**无权限/不可读写**",
+                "unbound" => "未绑定或路径不存在",
+                other => other,
+            }
+        ));
+        md.push_str(&format!(
+            "- KB 配置路径:`{}`\n",
+            km.local_kb_root_configured
+                .as_deref()
+                .unwrap_or("(未设置,使用默认 Documents/知识库)")
+        ));
+        md.push_str(&format!(
+            "- KB 解析路径:`{}`\n",
+            km.local_kb_root_resolved.as_deref().unwrap_or("(无法解析)")
+        ));
+        md.push_str(&format!(
+            "- 记忆目录:`{}`\n",
+            km.memory_root_resolved.as_deref().unwrap_or("(无法解析)")
+        ));
+        md.push_str(&format!(
+            "- 记忆目录存在:{} · 可写:{}\n",
+            if km.memory_root_exists { "是" } else { "否" },
+            if km.memory_root_writable {
+                "是"
+            } else {
+                "**否**"
+            },
+        ));
+        match km.memory_notes_count {
+            Some(n) => md.push_str(&format!("- 记忆文件数:{}\n", n)),
+            None => md.push_str("- 记忆文件数:(未统计)\n"),
+        }
+        if let Some(err) = &km.memory_error {
+            md.push_str(&format!("- 记忆检测错误:`{}`\n", err));
+        }
+        md.push('\n');
+    }
+
     // 2026-05-26 V0.1.11:App 自身 stderr ring buffer
     if !info.stderr_tail.is_empty() {
         md.push_str(&format!(
@@ -1423,13 +1546,13 @@ fn provider_display(p: &str) -> &str {
 
 /// 把错误信息里的绝对路径替换成 `<path>/<basename>`,防止案件路径(常含当事人名)泄漏。
 ///
-/// 例:`/<root>/<user>/<某当事人名>/foo.pdf` → `<path>/foo.pdf`
+/// 例:`<home>/cases/张三/foo.pdf` → `<path>/foo.pdf`
 ///
 /// 只匹配 macOS 常见的根前缀。
 ///
 /// **已知限制**:**含空格的路径**(如 `/Users/x/Nutstore Files/y/z.pdf`)只能正确处理
 /// **引号包围**的版本(`"..."` / `'...'` / `` `...` ``).无引号 unquoted 路径会在
-/// 第一个空格切断,留下后段(如 `Files/<某当事人名>/z.pdf` 仍含敏感名).MinerU CLI 通常会
+/// 第一个空格切断,留下后段(如 `Files/张三/z.pdf` 仍含敏感名).MinerU CLI 通常会
 /// 引号包围 path,std::io::Error::Display 不含 path,所以这个简化可接受;但**绝不要**
 /// 把不可信用户输入喂进 sanitize_paths——它只用于工具 stderr 等受控来源.
 pub(crate) fn sanitize_paths(s: &str) -> String {

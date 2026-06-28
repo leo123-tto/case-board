@@ -13,8 +13,10 @@ import {
   Loader2,
   Pencil,
   RefreshCw,
+  Search,
   Sparkles,
   Trash2,
+  X,
 } from "lucide-react";
 
 import { type Document, STAGE_ORDER } from "@/lib/types";
@@ -23,6 +25,7 @@ import { cn, docDisplayName } from "@/lib/utils";
 import { useFeatureFlag } from "@/lib/featureFlags";
 
 import { type GroupKey } from "../lib/groupByStage";
+import { documentMatchesSearch } from "../lib/documentSearch";
 import {
   buildFileTree,
   collectDocs,
@@ -889,6 +892,7 @@ function OrganizeView({
     attitudes: new Set(),
     stages: new Set(),
     aiOnly: false,
+    query: "",
   });
 
   const filteredDocs = useMemo(
@@ -1040,6 +1044,7 @@ interface OrganizeFilters {
   attitudes: Set<EvidenceAttitude>;
   stages: Set<SubmissionStage>;
   aiOnly: boolean;
+  query: string;
 }
 
 function emptyOrganizeFilters(): OrganizeFilters {
@@ -1050,6 +1055,7 @@ function emptyOrganizeFilters(): OrganizeFilters {
     attitudes: new Set(),
     stages: new Set(),
     aiOnly: false,
+    query: "",
   };
 }
 
@@ -1060,7 +1066,8 @@ function hasActiveOrganizeFilters(filters: OrganizeFilters): boolean {
     filters.categories.size > 0 ||
     filters.parties.size > 0 ||
     filters.attitudes.size > 0 ||
-    filters.stages.size > 0
+    filters.stages.size > 0 ||
+    filters.query.trim().length > 0
   );
 }
 
@@ -1080,6 +1087,7 @@ function matchesOrganizeFilters(
   filters: OrganizeFilters,
 ): boolean {
   const mark = markMap.get(doc.id) ?? EMPTY_MARK;
+  if (!documentMatchesSearch(doc, mark, filters.query)) return false;
   if (filters.aiOnly && !docHasAiSuggestion(doc, mark)) return false;
   if (filters.importance.size > 0) {
     const importance = mark.importance ?? "普通";
@@ -1153,6 +1161,26 @@ function OrganizeFilterBar({
         >
           AI 建议
         </FilterChip>
+        <div className="relative ml-auto min-w-[180px] max-w-full flex-1 sm:flex-none">
+          <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+          <input
+            type="text"
+            value={filters.query}
+            onChange={(e) => onChange({ ...filters, query: e.target.value })}
+            placeholder="搜文件名/标签…"
+            className="h-7 w-full rounded-md border border-border bg-background pl-7 pr-6 text-xs text-foreground placeholder:text-muted-foreground/60 focus:border-foreground focus:outline-none focus:ring-1 focus:ring-foreground/20 sm:w-52"
+          />
+          {filters.query && (
+            <button
+              type="button"
+              onClick={() => onChange({ ...filters, query: "" })}
+              aria-label="清除搜索"
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+            >
+              <X className="size-3.5" />
+            </button>
+          )}
+        </div>
         <span className="mx-1 text-border">|</span>
         {PARTY_SIDES.map((party) => (
           <FilterChip

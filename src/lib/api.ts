@@ -325,7 +325,7 @@ export function verifyYuandianKey(apiKey: string): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_yuandian_key", { apiKey });
 }
 
-/** 2026-05-25 V0.1.8:检测远程最新版本(公开站点的 version.json)。
+/** 2026-05-25 V0.1.8:检测远程最新版本(公开分发仓库的 version.json)。
  *  失败时 has_update=false + error 字段填上原因,前端可静默忽略。*/
 export function checkForUpdate(): Promise<UpdateInfo> {
   return invoke<UpdateInfo>("check_for_update");
@@ -588,6 +588,31 @@ export function saveMemoryNote(input: SaveMemoryNoteInput): Promise<MemoryNote> 
   return invoke<MemoryNote>("save_memory_note", { input });
 }
 
+export interface HomeGreetingInput {
+  display_name: string | null;
+  weather_summary: string | null;
+  active_case_count: number | null;
+  reminder_summaries: string[];
+  assistant_mode: string | null;
+  local_date: string;
+  time_of_day: string | null;
+  force_refresh: boolean | null;
+}
+
+export interface HomeGreetingResponse {
+  text: string;
+  source: "ai" | "fallback" | string;
+  generated_at: string;
+  memory_used_count: number;
+  error: string | null;
+}
+
+export function generateHomeGreeting(
+  input: HomeGreetingInput,
+): Promise<HomeGreetingResponse> {
+  return invoke<HomeGreetingResponse>("generate_home_greeting", { input });
+}
+
 export function listMemoryCandidates(caseId: string | null): Promise<MemoryCandidate[]> {
   return invoke<MemoryCandidate[]>("list_memory_candidates", { caseId });
 }
@@ -716,6 +741,9 @@ export interface Payment {
   amount: number;
   paid_at: string;
   note: string | null;
+  source_document_id: string | null;
+  source_path: string | null;
+  source_filename: string | null;
   created_at: string;
 }
 
@@ -724,6 +752,9 @@ export interface NewPayment {
   amount: number;
   paid_at: string;
   note: string | null;
+  source_document_id?: string | null;
+  source_path?: string | null;
+  source_filename?: string | null;
 }
 
 export function addPayment(p: NewPayment): Promise<Payment> {
@@ -998,6 +1029,18 @@ export interface SystemInfo {
   pdftoppm_available: boolean;
 }
 
+export interface KbMemoryDiagnostic {
+  local_kb_enabled: boolean | null;
+  local_kb_root_configured: string | null;
+  local_kb_root_resolved: string | null;
+  local_kb_state: string;
+  memory_root_resolved: string | null;
+  memory_root_exists: boolean;
+  memory_root_writable: boolean;
+  memory_notes_count: number | null;
+  memory_error: string | null;
+}
+
 export interface MetricSample {
   filename: string;
   ext: string;
@@ -1046,6 +1089,8 @@ export interface FeedbackDiagnostic {
   }[];
   settings_snapshot: SettingsSnapshot;
   system_info: SystemInfo;
+  /** 2026-06-28:本地 KB / 记忆目录诊断,不含记忆正文 */
+  kb_memory: KbMemoryDiagnostic;
   stderr_tail: string[];
   console_errors: ConsoleError[];
   /** 2026-05-26 V0.1.12:最近 200 条抽取性能埋点(stage/backend/耗时/字数/成败) */

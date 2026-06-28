@@ -108,6 +108,7 @@ export function ExecutionModule({ onCalculateInterest }: Props) {
     return (
       <ExecutionDetailView
         caseData={selectedCase}
+        documents={docsByCase[selectedCase.id] ?? []}
         onBack={() => setSelectedCase(null)}
         onCalculateInterest={onCalculateInterest}
       />

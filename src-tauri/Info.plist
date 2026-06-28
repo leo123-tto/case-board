@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>用于在首页根据当前位置显示今日天气。</string>
+  <key>NSLocationUsageDescription</key>
+  <string>用于在首页根据当前位置显示今日天气。</string>
+</dict>
+</plist>

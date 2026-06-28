@@ -20,6 +20,13 @@ use crate::llm::global_extract::{
 };
 use crate::llm::LlmConfig;
 
+#[derive(Debug, Clone)]
+struct PaymentSourceDoc {
+    id: String,
+    filename: String,
+    source_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalExtractReport {
     pub case_id: String,
@@ -53,9 +60,16 @@ pub async fn run_global_extract(
     let start = std::time::Instant::now();
 
     // 1. 拿 done 文档清单 + extracted_text_path
-    type DocRow = (String, Option<String>, Option<String>, Option<String>);
+    type DocRow = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    );
     let rows: Vec<DocRow> = match sqlx::query_as(
-        "SELECT filename, category, stage, extracted_text_path \
+        "SELECT id, filename, category, stage, extracted_text_path, source_path \
          FROM documents \
          WHERE case_id = ? AND deleted_at IS NULL AND extraction_status = 'done' \
          ORDER BY filename",
@@ -113,7 +127,8 @@ pub async fn run_global_extract(
 
     // 2. 读 MD 文件内容(本地 IO,blocking,但量小可接受)
     let mut docs: Vec<DocInput> = Vec::with_capacity(rows.len());
-    for (filename, category, stage, text_path) in &rows {
+    let mut payment_sources: Vec<PaymentSourceDoc> = Vec::with_capacity(rows.len());
+    for (id, filename, category, stage, text_path, source_path) in &rows {
         if crate::ingest::pipeline::is_archival_category(category.as_deref()) {
             continue;
         }
@@ -122,12 +137,19 @@ pub async fn run_global_extract(
             continue;
         };
         match std::fs::read_to_string(p) {
-            Ok(content) => docs.push(DocInput {
-                filename: filename.clone(),
-                category: category.clone(),
-                stage: stage.clone(),
-                text_md: content,
-            }),
+            Ok(content) => {
+                docs.push(DocInput {
+                    filename: filename.clone(),
+                    category: category.clone(),
+                    stage: stage.clone(),
+                    text_md: content,
+                });
+                payment_sources.push(PaymentSourceDoc {
+                    id: id.clone(),
+                    filename: filename.clone(),
+                    source_path: source_path.clone(),
+                });
+            }
             Err(e) => crate::dlog!("[global_extract] 读 {} 失败:{}", p, e),
         }
     }
@@ -188,7 +210,9 @@ pub async fn run_global_extract(
                 crate::dlog!("[global_extract] 写 case_instances 失败:{}", e);
             }
             // 还款自动入账(幂等,标 [AI识别])
-            if let Err(e) = write_repayments(pool, case_id, &r.table.repayments).await {
+            if let Err(e) =
+                write_repayments(pool, case_id, &r.table.repayments, &payment_sources).await
+            {
                 crate::dlog!("[global_extract] 写还款记录失败:{}", e);
             }
             (true, report_path.is_some(), report_path, None)
@@ -305,6 +329,7 @@ async fn write_repayments(
     pool: &SqlitePool,
     case_id: &str,
     items: &[RepaymentExtract],
+    sources: &[PaymentSourceDoc],
 ) -> Result<(), sqlx::Error> {
     for it in items {
         let Some(amount) = it.amount else { continue };
@@ -318,15 +343,33 @@ async fn write_repayments(
             );
             continue;
         };
-        let exists: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM case_payments WHERE case_id = ? AND amount = ? AND paid_at = ?",
+        let source = resolve_payment_source(it.source_filename.as_deref(), sources);
+        let existing: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, source_document_id FROM case_payments \
+             WHERE case_id = ? AND amount = ? AND paid_at = ? \
+             ORDER BY created_at DESC LIMIT 1",
         )
         .bind(case_id)
         .bind(amount)
         .bind(paid_at)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await?;
-        if exists > 0 {
+        if let Some((id, existing_source_document_id)) = existing {
+            if existing_source_document_id.is_none() {
+                if let Some(src) = source {
+                    sqlx::query(
+                        "UPDATE case_payments \
+                         SET source_document_id = ?, source_path = ?, source_filename = ? \
+                         WHERE id = ?",
+                    )
+                    .bind(&src.id)
+                    .bind(&src.source_path)
+                    .bind(&src.filename)
+                    .bind(&id)
+                    .execute(pool)
+                    .await?;
+                }
+            }
             continue;
         }
         let mut note = String::from("[AI识别]");
@@ -345,11 +388,36 @@ async fn write_repayments(
                 amount,
                 paid_at: paid_at.to_string(),
                 note: Some(note),
+                source_document_id: source.map(|s| s.id.clone()),
+                source_path: source.map(|s| s.source_path.clone()),
+                source_filename: source.map(|s| s.filename.clone()),
             },
         )
         .await?;
     }
     Ok(())
+}
+
+fn resolve_payment_source<'a>(
+    source_filename: Option<&str>,
+    sources: &'a [PaymentSourceDoc],
+) -> Option<&'a PaymentSourceDoc> {
+    let filename = source_filename?.trim();
+    if filename.is_empty() {
+        return None;
+    }
+    if let Some(exact) = sources.iter().find(|s| s.filename == filename) {
+        return Some(exact);
+    }
+    let matches: Vec<&PaymentSourceDoc> = sources
+        .iter()
+        .filter(|s| s.filename.contains(filename) || filename.contains(&s.filename))
+        .collect();
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
 }
 
 /// D3-1:空集合 → None(配合 SQL COALESCE 跳过覆盖),非空才序列化为 JSON。

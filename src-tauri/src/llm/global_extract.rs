@@ -90,6 +90,8 @@ pub struct RepaymentExtract {
     pub paid_at: Option<String>, // YYYY-MM-DD
     pub payer: Option<String>,
     pub note: Option<String>,
+    /// 与 corpus 里的文档标题完全一致的文件名,用于回连源文件核对。
+    pub source_filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -182,7 +184,7 @@ const SYSTEM_PROMPT_COMBINED: &str = r###"你是资深律师助理,精通法律�
     "summary": "案件一句话概括(50 字内)",
     "our_side": "我方代理立场:原告方/被告方/第三人/反诉混合/null",
     "instances": [{"level":"一审","case_no":"该审级案号或null","authority":"该审级承办机关全称或null","authority_type":"法院或仲裁委或其他","handlers":[{"name":"姓名或null","role":"审判员/仲裁员/书记员","phone":null}],"party_roles":[{"name":"张三","role":"该审级称谓(原告/被告/上诉人/被上诉人/申请人/被申请人)","is_our_side":true,"note":"原审被告 等文书自带对应关系或null"}],"filed_at":"YYYY-MM-DD或null","result":"该审级结果或null","note":"发回重审等边缘情况说明或null"}],
-    "repayments": [{"amount":100000,"paid_at":"YYYY-MM-DD或null","payer":"付款人或null","note":"来源说明(如 银行转账截图)或null"}]
+    "repayments": [{"amount":100000,"paid_at":"YYYY-MM-DD或null","payer":"付款人或null","note":"来源说明(如 银行转账截图)或null","source_filename":"该笔付款所在文档的文件名或null"}]
   },
   "report_md": "## 案件概况\n...完整 Markdown 报告..."
 }
@@ -245,6 +247,7 @@ const SYSTEM_PROMPT_COMBINED: &str = r###"你是资深律师助理,精通法律�
    - 我方支出(诉讼费 / 保全费 / 律师费)**不是还款**,不要进 repayments
    - 调解书/和解协议里**约定的**分期还款计划是计划不是实际付款,不进 repayments(那是 key_dates 的还款期)
    - note 一句话说明来源(如"银行转账截图")
+   - source_filename 必须填写该笔付款所在的文档文件名,且必须与上方文档分段标题里的文件名完全一致;若无法确定是哪一份,填 null,不要猜
 
 # report_md 结构(用 ## 二级标题,顺序固定)
 

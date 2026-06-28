@@ -105,7 +105,7 @@ function FeedbackModal({ onClose }: { onClose: () => void }) {
     }
   };
 
-  // ── 成功态:显示文件位置 + Finder 打开按钮 + 一键邮件 ──
+  // ── 成功态:显示文件位置 + Finder 打开按钮 ──
   if (savedPath) {
     return (
       <SavedFeedbackPanel savedPath={savedPath} onClose={onClose} />
@@ -213,8 +213,7 @@ function SavedFeedbackPanel({
         </div>
 
         <p className="text-xs text-muted-foreground">
-          反馈已保存为 Markdown 文件(不含案件名 / 当事人 / 文档内容)。点「在 Finder
-          中显示」即可手动发送给项目维护者。
+          反馈文件只保存在本机。可以先在 Finder 中查看,确认后再自行发送给项目维护者。
         </p>
 
         <div className="flex flex-wrap justify-end gap-2 pt-2">
@@ -225,7 +224,7 @@ function SavedFeedbackPanel({
           >
             在 Finder 中显示
           </Button>
-          <Button size="sm" onClick={onClose}>
+          <Button size="sm" variant="outline" onClick={onClose}>
             完成
           </Button>
         </div>
@@ -238,6 +237,7 @@ function SavedFeedbackPanel({
 function DiagnosticPreview({ diag }: { diag: FeedbackDiagnostic }) {
   const s = diag.settings_snapshot;
   const sys = diag.system_info;
+  const km = diag.kb_memory;
   return (
     <div className="space-y-1 border-t border-border bg-card/50 px-3 py-2.5 font-mono text-label text-foreground">
       <Row k="App 版本" v={diag.app_version} />
@@ -279,6 +279,13 @@ function DiagnosticPreview({ diag }: { diag: FeedbackDiagnostic }) {
         k="pdftotext"
         v={sys.pdftotext_available ? "可用" : "未装(走 OCR 兜底)"}
       />
+      <Row
+        k="记忆目录"
+        v={`${km.memory_root_exists ? "存在" : "未建"} / ${
+          km.memory_root_writable ? "可写" : "不可写"
+        }`}
+      />
+      {km.memory_error && <Row k="记忆错误" v={km.memory_error} />}
       {diag.recent_failures.length > 0 && (
         <>
           <div className="my-1 h-px bg-border/50" />

@@ -67,6 +67,7 @@ import { parseJsonArray } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { CalendarBoard } from "./CalendarBoard";
+import { HomeCompanionStrip } from "./HomeCompanionStrip";
 import {
   loadHearingDisplayDetail,
   type HearingDisplayDetail,
@@ -177,6 +178,7 @@ export function HomeView({
   >({});
   // 2026-06-16 · 首页清爽开关(设置页「功能开关」tab,默认关,逐设备生效)
   const [filterBarOn] = useFeatureFlag("home_filter_bar");
+  const [homeCompanionOn] = useFeatureFlag("home_companion");
   const [ticktickOn] = useFeatureFlag("home_ticktick");
 
   const reloadManualEvents = () => {
@@ -364,6 +366,10 @@ export function HomeView({
       })),
     [hearingDetails, upcomingEventsBase],
   );
+  const assistantReminderSummaries = useMemo(
+    () => buildAssistantReminderSummaries(upcomingEvents),
+    [upcomingEvents],
+  );
   const hearingEventsSeed = upcomingEventsBase
     .filter((event) => event.kind === "hearing")
     .map(upcomingEventKey)
@@ -378,6 +384,29 @@ export function HomeView({
     if (onOpenEvent) onOpenEvent(event);
     else onPickCase(event.caseId);
   };
+
+  function buildAssistantReminderSummaries(events: UpcomingEvent[]): string[] {
+    return events.slice(0, 4).map((event) => {
+      const distance =
+        event.daysFromNow < 0
+          ? `已过 ${Math.abs(event.daysFromNow)} 天`
+          : event.daysFromNow === 0
+            ? "今天"
+            : `${event.daysFromNow} 天后`;
+      const label =
+        event.kind === "hearing"
+          ? "开庭"
+          : event.type?.trim() || (event.kind === "deadline" ? "期限" : "日程");
+      const urgency = eventUrgency(event);
+      const urgentText = urgency === "urgent" ? "紧急" : urgency === "overdue" ? "逾期" : "提醒";
+      return `${urgentText} · ${distance} · ${formatShortDate(event.date)} · ${label}`;
+    });
+  }
+
+  function formatShortDate(date: string): string {
+    const match = date.match(/^\d{4}-(\d{2})-(\d{2})$/);
+    return match ? `${match[1]}/${match[2]}` : date;
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -580,7 +609,14 @@ export function HomeView({
       <div className="flex-1 overflow-auto">
         <div className="mx-auto max-w-6xl px-8 py-8">
           <div className="mb-10 grid grid-cols-1 gap-6 md:grid-cols-2">
-            <div>
+            <div className="relative md:pr-40">
+              <Button
+                onClick={onImport}
+                className="absolute right-0 top-0 hidden border border-border bg-background text-foreground shadow-sm hover:bg-muted md:inline-flex"
+              >
+                <FolderOpen className="size-3.5" />
+                导入案件
+              </Button>
               <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
                 OVERVIEW · {monthLabel}
               </p>
@@ -590,15 +626,20 @@ export function HomeView({
               <p className="mt-2 text-sm text-muted-foreground">
                 你正在办 {cases.length} 个案件,扫一眼今天的进度。
               </p>
-              <div className="mt-5 flex gap-2">
-                <Button
-                  onClick={onImport}
-                  className="bg-foreground text-background hover:bg-foreground/90"
-                >
-                  <FolderOpen className="size-3.5" />
-                  导入案件文件夹
-                </Button>
-              </div>
+              {homeCompanionOn && (
+                <HomeCompanionStrip
+                  displayName={userDisplayName}
+                  activeCaseCount={activeCases.length}
+                  reminderSummaries={assistantReminderSummaries}
+                />
+              )}
+              <Button
+                onClick={onImport}
+                className="mt-5 bg-foreground text-background hover:bg-foreground/90 md:hidden"
+              >
+                <FolderOpen className="size-3.5" />
+                导入案件
+              </Button>
             </div>
             <ImportantDates events={upcomingEvents} onPickCase={openEvent} />
           </div>

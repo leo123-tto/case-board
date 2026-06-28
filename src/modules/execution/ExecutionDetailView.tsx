@@ -12,6 +12,7 @@ import {
   ArrowLeft,
   BookOpen,
   Calculator,
+  FileText,
   Gavel,
   Phone,
   Plus,
@@ -24,6 +25,7 @@ import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { MarkdownModal } from "@/components/MarkdownModal";
+import { SourceDocumentViewerDrawer } from "@/components/SourceDocumentViewerDrawer";
 import { formatYuan } from "@/lib/format";
 import { normalizeCaseStatusText } from "@/lib/caseSnapshot";
 import { todayIsoLocal } from "@/lib/date";
@@ -31,6 +33,7 @@ import { confirmDialog } from "@/lib/dialog";
 import {
   type Case,
   type CourtContact,
+  type Document,
   type PartyContact,
   parseJsonArray,
 } from "@/lib/types";
@@ -58,14 +61,17 @@ import { CaseWorkLogSection } from "@/modules/litigation/components/CaseWorkLogS
 
 export function ExecutionDetailView({
   caseData,
+  documents,
   onBack,
   onCalculateInterest,
 }: {
   caseData: Case;
+  documents?: Document[];
   onBack: () => void;
   onCalculateInterest?: (prefill: InterestPrefill) => void;
 }) {
   const [current, setCurrent] = useState<Case>(caseData);
+  const [sourceDocs, setSourceDocs] = useState<Document[]>(documents ?? []);
   const [reportOpen, setReportOpen] = useState(false);
   // 元典 P1 状态
   const [yuandianResult, setYuandianResult] = useState<YuandianP1Response | null>(null);
@@ -76,6 +82,7 @@ export function ExecutionDetailView({
   const [fullReportOpen, setFullReportOpen] = useState(false);
   // 还款记录
   const [payments, setPayments] = useState<Payment[]>([]);
+  const [paymentSourceOpen, setPaymentSourceOpen] = useState<Document | null>(null);
   const [showTodos] = useFeatureFlag("case_todos");
   const [showWorkLogs] = useFeatureFlag("case_work_logs");
 
@@ -86,6 +93,16 @@ export function ExecutionDetailView({
   useEffect(() => {
     setCurrent(caseData);
   }, [caseData]);
+
+  useEffect(() => {
+    setSourceDocs(documents ?? []);
+  }, [documents]);
+
+  const refreshPayments = async () => {
+    const p = await listPayments(caseData.id);
+    setPayments(p);
+    return p;
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -251,6 +268,7 @@ export function ExecutionDetailView({
           setYuandianResult(r);
           const fresh = await getCaseWithDocs(current.id);
           setCurrent(fresh.case);
+          setSourceDocs(fresh.documents);
           if (fresh.case.risk_assessment_path) {
             setRiskOpen(true);
           } else if (r.assessment.error) {
@@ -284,6 +302,7 @@ export function ExecutionDetailView({
           }
           const fresh = await getCaseWithDocs(current.id);
           setCurrent(fresh.case);
+          setSourceDocs(fresh.documents);
           if (fresh.case.deep_dive_report_path) {
             setDeepDiveOpen(true);
           }
@@ -329,6 +348,7 @@ export function ExecutionDetailView({
           }
           const fresh = await getCaseWithDocs(current.id);
           setCurrent(fresh.case);
+          setSourceDocs(fresh.documents);
           if (fresh.case.full_report_path) {
             setFullReportOpen(true);
           }
@@ -360,6 +380,8 @@ export function ExecutionDetailView({
           }
           const fresh = await getCaseWithDocs(current.id);
           setCurrent(fresh.case);
+          setSourceDocs(fresh.documents);
+          await refreshPayments().catch(() => {});
           if (fresh.case.case_report_path) setReportOpen(true);
         } catch (e) {
           alert(`报告生成失败:${e}`);
@@ -656,8 +678,10 @@ export function ExecutionDetailView({
           {/* 还款记录 */}
           <PaymentsCard
             payments={payments}
+            sourceDocs={sourceDocs}
             onAdd={handleAddPayment}
             onDelete={handleDeletePayment}
+            onOpenSource={setPaymentSourceOpen}
           />
 
           {(showTodos || showWorkLogs) && (
@@ -719,6 +743,14 @@ export function ExecutionDetailView({
             mdPath: current.full_report_path,
             title: `${current.name}_完整报告`,
           }}
+        />
+      )}
+
+      {paymentSourceOpen && (
+        <SourceDocumentViewerDrawer
+          doc={paymentSourceOpen}
+          caseFolder={current.source_folder}
+          onClose={() => setPaymentSourceOpen(null)}
         />
       )}
     </main>
@@ -849,12 +881,16 @@ function RiskAssessmentCard({
 /* ============ 还款记录卡(2026-05-25)============ */
 function PaymentsCard({
   payments,
+  sourceDocs,
   onAdd,
   onDelete,
+  onOpenSource,
 }: {
   payments: Payment[];
+  sourceDocs: Document[];
   onAdd: (input: { amount: number; paid_at: string; note: string | null }) => void;
   onDelete: (id: string) => void;
+  onOpenSource: (doc: Document) => void;
 }) {
   const [showInput, setShowInput] = useState(false);
   const [amount, setAmount] = useState("");
@@ -963,6 +999,20 @@ function PaymentsCard({
                         AI 识别
                       </span>
                       {p.note.slice("[AI识别]".length).trim() || "—"}
+                      {paymentSourceDoc(p, sourceDocs) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const doc = paymentSourceDoc(p, sourceDocs);
+                            if (doc) onOpenSource(doc);
+                          }}
+                          className="ml-1 inline-flex items-center gap-1 rounded border border-border bg-card px-1.5 py-0.5 text-caption font-medium text-foreground transition-colors hover:bg-muted"
+                          title="在案件看板内打开这笔还款的源文件"
+                        >
+                          <FileText className="size-3" />
+                          查看源文件
+                        </button>
+                      )}
                     </span>
                   ) : (
                     (p.note ?? "—")
@@ -986,6 +1036,42 @@ function PaymentsCard({
       )}
     </section>
   );
+}
+
+function paymentSourceDoc(payment: Payment, docs: Document[]): Document | null {
+  const sourceDoc =
+    (payment.source_document_id
+      ? docs.find((doc) => doc.id === payment.source_document_id)
+      : null) ??
+    (payment.source_path
+      ? docs.find((doc) => doc.source_path === payment.source_path)
+      : null);
+  if (sourceDoc) return sourceDoc;
+  if (!payment.source_path || !payment.source_filename) return null;
+  return {
+    id: payment.source_document_id ?? `payment-source:${payment.id}`,
+    case_id: payment.case_id,
+    source_path: payment.source_path,
+    filename: payment.source_filename,
+    stage: null,
+    category: "还款凭证",
+    is_ai_artifact: false,
+    source: "scan",
+    mime_type: null,
+    size_bytes: 0,
+    modified_at: null,
+    extracted_fields: null,
+    extraction_status: "pending",
+    missing: false,
+    created_at: payment.created_at,
+    deleted_at: null,
+    extracted_text_path: null,
+    cache_key: null,
+    pinned_at: null,
+    ocr_backend_override: null,
+    display_name: null,
+    display_name_source: null,
+  };
 }
 
 function kindLabel(kind: string): string {

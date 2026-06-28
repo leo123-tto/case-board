@@ -13,6 +13,9 @@ pub struct Payment {
     pub amount: f64,
     pub paid_at: String, // YYYY-MM-DD
     pub note: Option<String>,
+    pub source_document_id: Option<String>,
+    pub source_path: Option<String>,
+    pub source_filename: Option<String>,
     pub created_at: String,
 }
 
@@ -22,19 +25,26 @@ pub struct NewPayment {
     pub amount: f64,
     pub paid_at: String,
     pub note: Option<String>,
+    pub source_document_id: Option<String>,
+    pub source_path: Option<String>,
+    pub source_filename: Option<String>,
 }
 
 pub async fn add(pool: &SqlitePool, p: NewPayment) -> Result<Payment, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO case_payments (id, case_id, amount, paid_at, note) \
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO case_payments \
+         (id, case_id, amount, paid_at, note, source_document_id, source_path, source_filename) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&p.case_id)
     .bind(p.amount)
     .bind(&p.paid_at)
     .bind(&p.note)
+    .bind(&p.source_document_id)
+    .bind(&p.source_path)
+    .bind(&p.source_filename)
     .execute(pool)
     .await?;
 

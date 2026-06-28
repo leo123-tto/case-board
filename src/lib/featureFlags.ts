@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback } from "react";
 /**
  * 首页 / 界面功能开关(feature flags)统一机制。
  *
- * 作者偏好「清清爽爽的界面」:首页新功能默认关闭,用户想要再去设置 / 对应功能里打开。
+ * 作者偏好「清清爽爽的界面」:多数首页新功能默认关闭,用户想要再去设置 / 对应功能里打开。
  * 约定:以后首页新增模块 → 在 FEATURE_FLAGS 注册表里加一条即可:
  *   - 设置页「界面 / 首页」分区会自动渲染 location==="settings" 的开关;
  *   - 首页组件用 useFeatureFlag(name) 条件渲染;
@@ -19,6 +19,7 @@ const CHANGE_EVENT = "caseboard:feature-change";
 
 export type FeatureFlagName =
   | "home_filter_bar"
+  | "home_companion"
   | "home_ticktick"
   | "case_court_filing"
   | "case_todos"
@@ -33,7 +34,7 @@ export interface FeatureFlagMeta {
   title: string;
   /** 一句话说明 */
   description: string;
-  /** 默认值(作者偏好:一律默认关,保持清爽) */
+  /** 默认值(大多数默认关;少数确定进入主体验的功能可默认开) */
   defaultValue: boolean;
   /** 开关 UI 主要放在哪:settings=设置页分区渲染;feature=对应功能页自己放 */
   location: "settings" | "feature";
@@ -47,6 +48,14 @@ export const FEATURE_FLAGS: FeatureFlagMeta[] = [
     description:
       "显示首页的排序 / 筛选 / 列表视图 / 多选工具栏。关闭则回到清爽的纯案件卡片网格。",
     defaultValue: false,
+    location: "settings",
+  },
+  {
+    name: "home_companion",
+    title: "首页问候与案卷小助手",
+    description:
+      "在首页空白处显示轻量天气、问候和案卷小助手。默认开启;首屏先用缓存/兜底文案,天气和 AI 后台刷新。",
+    defaultValue: true,
     location: "settings",
   },
   {

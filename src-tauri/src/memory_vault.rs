@@ -71,6 +71,12 @@ pub struct MemoryPromptPack {
     pub compressed: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryVaultPaths {
+    pub kb_root: PathBuf,
+    pub memory_root: PathBuf,
+}
+
 pub fn load_vault_status(settings: &Settings) -> Result<MemoryVaultStatus, String> {
     let root = ensure_memory_root(settings)?;
     let notes = list_notes_in_root(&root)?;
@@ -109,29 +115,50 @@ pub fn build_prompt_pack_for_modes(
     ))
 }
 
-pub(crate) fn resolve_memory_root_from_settings(settings: &Settings) -> Result<PathBuf, String> {
+pub(crate) fn resolve_memory_paths_from_settings(
+    settings: &Settings,
+) -> Result<MemoryVaultPaths, String> {
+    let kb_root = resolve_kb_root_from_settings(settings)?;
+    Ok(MemoryVaultPaths {
+        memory_root: kb_root.join(MEMORY_DIR_NAME),
+        kb_root,
+    })
+}
+
+pub(crate) fn resolve_kb_root_from_settings(settings: &Settings) -> Result<PathBuf, String> {
     if let Some(root) = settings
         .local_kb_root
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return Ok(PathBuf::from(root).join(MEMORY_DIR_NAME));
+        return Ok(PathBuf::from(shellexpand::tilde(root).into_owned()));
     }
 
-    let user_dirs = UserDirs::new().ok_or_else(|| "无法定位用户目录".to_string())?;
-    let documents = user_dirs
-        .document_dir()
-        .ok_or_else(|| "无法定位 Documents 目录".to_string())?;
-    Ok(documents.join(DEFAULT_KB_DIR_NAME).join(MEMORY_DIR_NAME))
+    default_kb_root()
+}
+
+fn default_kb_root() -> Result<PathBuf, String> {
+    if let Some(user_dirs) = UserDirs::new() {
+        if let Some(documents) = user_dirs.document_dir() {
+            return Ok(documents.join(DEFAULT_KB_DIR_NAME));
+        }
+    }
+
+    crate::db::app_data_dir()
+        .map(|p| p.join(DEFAULT_KB_DIR_NAME))
+        .map_err(|e| format!("无法定位 Documents 或应用数据目录: {e}"))
 }
 
 fn ensure_memory_root(settings: &Settings) -> Result<PathBuf, String> {
-    let root = resolve_memory_root_from_settings(settings)?;
-    fs::create_dir_all(&root).map_err(|e| format!("创建记忆目录失败: {e}"))?;
+    let paths = resolve_memory_paths_from_settings(settings)?;
+    crate::local_kb::init::create_empty_kb(&paths.kb_root)
+        .map_err(|e| format!("创建知识库目录失败({}): {e}", paths.kb_root.display()))?;
+    let root = paths.memory_root;
+    fs::create_dir_all(&root).map_err(|e| format!("创建记忆目录失败({}): {e}", root.display()))?;
     for category in CATEGORY_DIRS {
         fs::create_dir_all(root.join(category))
-            .map_err(|e| format!("创建记忆分类目录失败({category}): {e}"))?;
+            .map_err(|e| format!("创建记忆分类目录失败({category}, {}): {e}", root.display()))?;
     }
     let readme = root.join(README_FILE);
     if !readme.exists() {
@@ -139,7 +166,7 @@ fn ensure_memory_root(settings: &Settings) -> Result<PathBuf, String> {
             &readme,
             "# CaseBoard 记忆\n\n这里存放 CaseBoard 的 AI 长期记忆。每条记忆是一个 Markdown 文件,可在 App 的「记忆」页查看和编辑。\n",
         )
-        .map_err(|e| format!("写记忆 README 失败: {e}"))?;
+        .map_err(|e| format!("写记忆 README 失败({}): {e}", readme.display()))?;
     }
     Ok(root)
 }

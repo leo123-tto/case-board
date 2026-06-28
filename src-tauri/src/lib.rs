@@ -1230,12 +1230,15 @@ fn bundled_court_filing_cli_path(app: &tauri::AppHandle) -> Option<String> {
         }
     }
 
-    let dev_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
-        .join(COURT_FILING_CLI_RESOURCE);
-    if dev_path.join("__main__.py").exists() {
-        return Some(dev_path.to_string_lossy().to_string());
+    #[cfg(debug_assertions)]
+    {
+        let dev_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+            .join(COURT_FILING_CLI_RESOURCE);
+        if dev_path.join("__main__.py").exists() {
+            return Some(dev_path.to_string_lossy().to_string());
+        }
     }
 
     None

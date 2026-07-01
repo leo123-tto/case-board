@@ -177,7 +177,7 @@ async fn call_llm_for_greeting(
         .next()
         .map(|c| c.message.content)
         .ok_or_else(|| "LLM 问候 choices 为空".to_string())?;
-    let cleaned = clean_greeting(&raw);
+    let cleaned = safe_home_greeting(&raw, input);
     if cleaned.is_empty() {
         Err("LLM 问候为空".into())
     } else {
@@ -191,13 +191,10 @@ pub(crate) fn build_home_greeting_prompt(input: &HomeGreetingInput, memories: &[
     let weather =
         clean_optional(input.weather_summary.as_deref()).unwrap_or_else(|| "天气未更新".into());
     let time_of_day = clean_optional(input.time_of_day.as_deref()).unwrap_or_else(|| "今天".into());
-    let active_case_count = input
-        .active_case_count
-        .map(|n| format!("在办案件 {n} 个"))
-        .unwrap_or_else(|| "在办案件数未更新".into());
+    let case_load = case_load_context(input.active_case_count);
     let assistant_mode =
         clean_optional(input.assistant_mode.as_deref()).unwrap_or_else(|| "日常值守".into());
-    let reminder_text = clean_reminder_summaries(&input.reminder_summaries);
+    let reminder_context = reminder_context(&input.reminder_summaries);
     let memory_text = if memories.is_empty() {
         "无可用全局记忆。".to_string()
     } else {
@@ -210,24 +207,25 @@ pub(crate) fn build_home_greeting_prompt(input: &HomeGreetingInput, memories: &[
 
     format!(
         "你是案件看板首页的“案件助手”。\n\
-         人设: 克制、可靠、熟悉律师办案节奏,像老同事一样轻轻提醒,不撒娇,不说教。\n\
-         目标: 结合首页案件概况、重要提醒、天气和全局记忆,给用户一句自然、轻、可执行的首页话术。\n\
+         人设: 克制、可靠、熟悉律师办案节奏,像老同事一样提供一点情绪价值,不撒娇,不说教。\n\
+         目标: 主要做日常关心、作息提醒、天气关照或轻微鼓励;案件提醒只占很小比例,因为正式提醒由日历和重要日期承担。\n\
          用户称呼: {display_name}\n\
          日期: {}\n\
          时间段: {time_of_day}\n\
          当前状态: {assistant_mode}\n\
          天气: {weather}\n\
-         案件概况: {active_case_count}\n\
-         重要提醒摘要:\n{reminder_text}\n\
+         案件概况: {case_load}\n\
+         提醒状态: {reminder_context}\n\
          可参考的全局记忆:\n{memory_text}\n\n\
          严格要求:\n\
          1. 只输出一句中文,不要解释,不要引号,不要列表。\n\
          2. 30 字以内优先,最多 46 个汉字。\n\
          3. 不要说“作为 AI”。\n\
          4. 不要提任何案号、当事人、文件路径或具体案件事实。\n\
-         5. 话术要贴合“当前状态”:重点提醒就提醒看紧急项;整理案件就强调抓重点;准备出门就提醒先过一遍;记录事项就强调记清节点;日常值守就轻一点。\n\
-         6. 可以提“今天有提醒”“先看紧急项”“在办案件”,但不要虚构数字。\n\
-         7. 不要鸡汤味太重,要克制、稳、轻。",
+         5. 提醒只作为背景,不得说具体日程、庭审、开庭、待办、截止、到期、案件数量或“几场/几件/几条”。\n\
+         6. 上午可轻微鼓励或夸一句;夜间优先提醒早点休息;天气明显时可提醒带伞/添衣。\n\
+         7. 如果要提提醒,只能泛泛说“提醒区扫一眼”,不要判断今天有没有开庭。\n\
+         8. 不要鸡汤味太重,要克制、稳、轻。",
         input.local_date.trim()
     )
 }
@@ -279,27 +277,59 @@ pub(crate) fn fallback_greeting(display_name: Option<&str>, time_of_day: Option<
     let name = clean_optional(display_name).unwrap_or_else(|| "律师".into());
     let period = clean_optional(time_of_day).unwrap_or_else(|| "今天".into());
     match period.as_str() {
-        "早上" | "上午" => format!("{name},早上先看最要紧的一件事。"),
-        "晚上" | "夜间" => format!("{name},晚上收个尾,别把自己绷太紧。"),
-        _ => format!("{name},今天稳一点,先处理最关键的事。"),
+        "早上" | "上午" => format!("{name},早上开局不错,今天也稳稳推进。"),
+        "中午" => format!("{name},中午缓一口气,下午继续稳住。"),
+        "晚上" => format!("{name},晚上收个尾,差不多就早点休息。"),
+        "夜间" => format!("{name},时间不早了,先把自己照顾好。"),
+        _ => format!("{name},今天稳一点,不用一下子全扛完。"),
     }
 }
 
-fn clean_reminder_summaries(items: &[String]) -> String {
-    let lines = items
-        .iter()
-        .map(|item| item.trim())
-        .filter(|item| !item.is_empty())
-        .take(4)
-        .map(|item| {
-            let clipped: String = item.chars().take(42).collect();
-            format!("- {clipped}")
-        })
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        "- 暂无重要提醒".into()
+pub(crate) fn safe_home_greeting(raw: &str, input: &HomeGreetingInput) -> String {
+    let cleaned = clean_greeting(raw);
+    if cleaned.is_empty() || is_unsafe_schedule_claim(&cleaned) {
+        fallback_greeting(input.display_name.as_deref(), input.time_of_day.as_deref())
     } else {
-        lines.join("\n")
+        cleaned
+    }
+}
+
+fn is_unsafe_schedule_claim(text: &str) -> bool {
+    if text.contains("庭审")
+        || text.contains("开庭")
+        || text.contains("传票")
+        || text.contains("法庭")
+    {
+        return true;
+    }
+    if text.contains("待办") || text.contains("截止") || text.contains("到期") {
+        return true;
+    }
+    let schedule_count = regex::Regex::new(
+        r"([0-9一二两三四五六七八九十]+)\s*(场|件|个|条).{0,8}(提醒|日程|待办|案件|庭审|开庭)",
+    )
+    .expect("valid home greeting schedule regex");
+    schedule_count.is_match(text)
+}
+
+fn reminder_context(items: &[String]) -> &'static str {
+    if items.iter().any(|item| item.contains("逾期")) {
+        "有逾期或高优先级提醒,但提醒只作为背景,不要展开类型和数量。"
+    } else if items.iter().any(|item| item.contains("紧急")) {
+        "有高优先级提醒,但提醒只作为背景,不要展开类型和数量。"
+    } else if items.iter().any(|item| !item.trim().is_empty()) {
+        "有需要留意的事项,但提醒只作为背景,不要展开类型和数量。"
+    } else {
+        "暂无重要提醒。"
+    }
+}
+
+fn case_load_context(count: Option<usize>) -> &'static str {
+    match count {
+        Some(0) => "当前没有在办案件。",
+        Some(1..=7) => "有一些在办案件,但不要输出具体数量。",
+        Some(_) => "在办案件较多,但不要输出具体数量。",
+        None => "案件数量未更新。",
     }
 }
 

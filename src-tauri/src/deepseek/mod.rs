@@ -1,6 +1,6 @@
 //! DeepSeek 余额查询 + 今日消费计算(2026-05-24 e)。
 //!
-//! 思路参考一个 Swift 版 DeepSeek 余额客户端实现:
+//! 参考内部 DeepSeek 用量监控服务的余额计算方式:
 //! - DeepSeek 只提供 `GET https://api.deepseek.com/user/balance`(当前余额),无"今日消费"端点
 //! - 我们靠"昨日快照 vs 今日 fetch 余额 delta"算今日消费
 //! - 每天保存一次快照(`deepseek_balance_snapshots` 表)

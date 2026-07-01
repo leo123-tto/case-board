@@ -33,11 +33,14 @@ const {
   calcFiveStage,
   calculateInterestByPeriod,
   calculateInterestSegments,
+  formatMoney,
 } = require(join(outDir, "interestCalc.js"));
 const { getLprForDate } = require(join(outDir, "lprData.js"));
 
 assert.equal(getLprForDate("2026-06-24", "1y"), 3);
 assert.equal(getLprForDate("2026-06-24", "5y+"), 3.5);
+assert.equal(formatMoney(14432.87), "14,432.87 元");
+assert.equal(formatMoney(611712), "611,712.00 元");
 
 const baseInterest = calculateInterestByPeriod(
   100000,
@@ -73,6 +76,58 @@ assert.equal(segment.baseRate, 3.35);
 assert.equal(segment.multiplier, 1.5);
 assert.equal(segment.rate, 5.025);
 assert.equal(segment.interest, 302.88);
+
+const cappedInterest = calculateInterestByPeriod(
+  100000,
+  "2020-08-10",
+  "2020-08-30",
+  "hybrid",
+  24,
+  "1y",
+  4,
+);
+assert.equal(cappedInterest, 1079.45);
+
+const cappedSegments = calculateInterestSegments(
+  100000,
+  "2020-08-10",
+  "2020-08-30",
+  "hybrid",
+  24,
+  "1y",
+  4,
+);
+assert.deepEqual(
+  cappedSegments.map((s) => ({
+    startDate: s.startDate,
+    endDate: s.endDate,
+    rateType: s.rateType,
+    baseRate: s.baseRate,
+    multiplier: s.multiplier,
+    rate: s.rate,
+    interest: s.interest,
+  })),
+  [
+    {
+      startDate: "2020-08-10",
+      endDate: "2020-08-20",
+      rateType: "hybrid",
+      baseRate: 24,
+      multiplier: 1,
+      rate: 24,
+      interest: 657.53,
+    },
+    {
+      startDate: "2020-08-20",
+      endDate: "2020-08-30",
+      rateType: "hybrid",
+      baseRate: 3.85,
+      multiplier: 4,
+      rate: 15.4,
+      interest: 421.92,
+    },
+  ],
+);
 
 const execution = calcFiveStage(
   {

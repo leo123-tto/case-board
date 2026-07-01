@@ -154,7 +154,7 @@ pub struct Preservation {
     pub amount: Option<f64>,
     /// 起算日期 YYYY-MM-DD
     pub started_at: Option<String>,
-    /// 期限(年),通常 2 或 3
+    /// 期限(年):银行存款/资金 1 年,车辆/动产 2 年,不动产/股权/其他财产权 3 年
     pub duration_years: Option<u32>,
     /// 到期日 YYYY-MM-DD(若文书里直接有写)
     pub expires_at: Option<String>,

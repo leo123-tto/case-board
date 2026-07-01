@@ -218,11 +218,11 @@ function pickCompanionPose({
 }
 
 function companionModeLabel(mode: CompanionMode): string {
-  if (mode === "urgent") return "重点提醒";
-  if (mode === "caseload") return "整理案件";
-  if (mode === "briefcase") return "准备出门";
-  if (mode === "writing") return "记录事项";
-  return "日常值守";
+  if (mode === "urgent") return "日常关心(有提醒背景)";
+  if (mode === "caseload") return "日常关心(案件较多)";
+  if (mode === "briefcase") return "日常关心(准备出门)";
+  if (mode === "writing") return "日常关心(记录节奏)";
+  return "日常关心";
 }
 
 function fallbackGreeting(
@@ -231,13 +231,15 @@ function fallbackGreeting(
   mode: CompanionMode = "neutral",
 ): string {
   const name = displayName?.trim() || "律师";
-  if (mode === "urgent") return `${name},先看今天最紧的提醒。`;
-  if (mode === "caseload") return `${name},在办案件不少,先抓重点推进。`;
-  if (mode === "writing") return `${name},先记清楚关键节点,再动手。`;
-  if (mode === "briefcase") return `${name},今天出门前先过一遍提醒。`;
-  if (period === "上午") return `${name},早上先看最要紧的一件事。`;
-  if (period === "晚上" || period === "夜间") return `${name},晚上收个尾,别把自己绷太紧。`;
-  return `${name},今天稳一点,先处理最关键的事。`;
+  if (mode === "urgent") return `${name},今天先稳住节奏,提醒区稍后扫一眼。`;
+  if (mode === "caseload") return `${name},案子不少,也别一口气全扛完。`;
+  if (mode === "writing") return `${name},先慢一点写,思路清楚最省力。`;
+  if (mode === "briefcase") return `${name},出门前带好东西,路上别太赶。`;
+  if (period === "上午") return `${name},早上开局不错,今天也稳稳推进。`;
+  if (period === "中午") return `${name},中午缓一口气,下午继续稳住。`;
+  if (period === "晚上") return `${name},晚上收个尾,差不多就早点休息。`;
+  if (period === "夜间") return `${name},时间不早了,先把自己照顾好。`;
+  return `${name},今天稳一点,不用一下子全扛完。`;
 }
 
 function stableIndex(seed: string, modulo: number): number {

@@ -567,7 +567,7 @@ async fn verify_openai_compat_key(
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:公开分发仓库的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:分发站点的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -4381,6 +4381,12 @@ async fn find_case_by_case_no(
                 return (Some(c.id.clone()), Some(name));
             }
         }
+        for no in execution_case_numbers_from_case(c) {
+            if court_sms::normalize_case_no(&no) == target {
+                let name = c.agg_cause.clone().unwrap_or_else(|| c.name.clone());
+                return (Some(c.id.clone()), Some(name));
+            }
+        }
     }
     // 审级表兜底:任何审级的案号命中都算(仲裁案号/一审案号/二审案号)
     let inst_rows: Vec<(String, String)> =
@@ -4397,6 +4403,56 @@ async fn find_case_by_case_no(
         }
     }
     (None, None)
+}
+
+fn execution_case_numbers_from_case(c: &cases_db::Case) -> Vec<String> {
+    let mut texts: Vec<String> = Vec::new();
+    if let Some(raw) = c.agg_key_dates.as_deref() {
+        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(raw) {
+            for item in items {
+                let Some(obj) = item.as_object() else {
+                    continue;
+                };
+                let text = ["event", "event_type", "note"]
+                    .iter()
+                    .filter_map(|key| obj.get(*key).and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if text.contains('执') || text.contains("执行") {
+                    texts.push(text);
+                }
+            }
+        }
+    }
+    for text in [
+        c.agg_status_text.as_deref(),
+        c.agg_resolution.as_deref(),
+        c.case_summary.as_deref(),
+        c.name.as_str().into(),
+        c.case_no.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        texts.push(text.to_string());
+    }
+
+    let re = match regex::Regex::new(r"[（(]\s*\d{4}\s*[）)]\s*[^\s，。；;、,]{1,40}?号") {
+        Ok(re) => re,
+        Err(_) => return vec![],
+    };
+    let mut out = Vec::new();
+    for text in texts {
+        for hit in re.find_iter(&text) {
+            let case_no = court_sms::normalize_case_no(hit.as_str());
+            if case_no.contains('执') {
+                out.push(case_no);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// 2026-06-11 反馈修复:按**当事人姓名**反向匹配案件 —— 拿每个案件的当事人名
@@ -5680,10 +5736,6 @@ async fn verify_embedding_key(
 ) -> Result<usize, String> {
     embedding::verify(&endpoint, &model, &api_key).await
 }
-
-// ============================================================================
-// 测试
-// ============================================================================
 
 /// 启动早期(创建 webview 之前)检测系统 WebView 运行时是否可用。
 ///

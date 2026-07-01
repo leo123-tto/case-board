@@ -5,13 +5,13 @@
  *   - 利息计算(interest):多本金 + 各自时间段 + 自定义利率 / LPR;按 LPR 变化点分段
  *   - 执行款(execution):多案件 + 多还款 + 五阶段清偿 + 迟延履行利息
  *
- * 计算逻辑见 ../lib/interestCalc.ts。
+ * 计算逻辑见 ../lib/interestCalc.ts(由旧版网页计算器迁移而来)。
  *
  * 法律依据:利息 / 执行款 两套独立弹窗。
  */
 
 import { useState } from "react";
-import { Plus, Trash2 } from "lucide-react";
+import { Check, Copy, Plus, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { DetailRow, TabBtn } from "./ui";
@@ -34,10 +34,12 @@ import {
   type InterestPrincipal,
   type InterestSegment,
   normalizeLprMultiplier,
+  PRIVATE_LENDING_CAP_SWITCH_DATE,
   type RateType,
   type Repayment,
 } from "../lib/interestCalc";
 import type { LprTerm } from "../lib/lprData";
+import { numberToChineseUppercase } from "../lib/numberToChinese";
 import { todayIso } from "../lib/dateMath";
 
 type Mode = "interest" | "execution";
@@ -211,12 +213,7 @@ function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
       ) : (
         <div className="space-y-3 rounded-md border border-border bg-card px-5 py-4">
           <div>
-            <p className="text-caption uppercase tracking-wider text-muted-foreground">
-              利息合计
-            </p>
-            <p className="mt-1 font-mono text-3xl font-semibold text-foreground">
-              {formatMoney(total)}
-            </p>
+            <AmountHeadline label="利息合计" amount={total} />
           </div>
 
           <dl className="border-t border-border/70 pt-3 text-sm">
@@ -249,7 +246,9 @@ function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
                   <div key={i}>
                     <p className="font-medium">
                       本金 {i + 1}: {formatMoney(x.principal)} · {x.p.startDate} ~ {x.p.endDate} · 共 {x.days} 天
-                      {x.p.rateType === "lpr" && x.lprMultiplier !== 1
+                      {x.p.rateType === "hybrid"
+                        ? ` · ${PRIVATE_LENDING_CAP_SWITCH_DATE} 前 ${x.p.rate || 0}% / 后 LPR × ${formatMultiplier(x.lprMultiplier)}`
+                        : x.p.rateType === "lpr" && x.lprMultiplier !== 1
                         ? ` · LPR × ${formatMultiplier(x.lprMultiplier)}`
                         : ""}
                     </p>
@@ -308,11 +307,106 @@ function formatInterestSegmentFormula(
   if (segment.rateType === "custom") {
     return `${principal} × ${formatRate(segment.rate)}% ÷ 365 × ${segment.days} 天`;
   }
+  if (
+    segment.rateType === "hybrid" &&
+    segment.endDate <= PRIVATE_LENDING_CAP_SWITCH_DATE
+  ) {
+    return `${principal} × 约定年利率 ${formatRate(segment.rate)}% ÷ 365 × ${segment.days} 天`;
+  }
   const rateText =
     segment.multiplier === 1
       ? `LPR ${formatRate(segment.baseRate)}%`
       : `LPR ${formatRate(segment.baseRate)}% × ${formatMultiplier(segment.multiplier)} = ${formatRate(segment.rate)}%`;
   return `${principal} × ${rateText} ÷ 365 × ${segment.days} 天`;
+}
+
+function defaultRateTypePatch(
+  nextRateType: RateType,
+  data: { rate: string; lprTerm: LprTerm; lprMultiplier: string },
+): { rateType: RateType; rate?: string; lprTerm?: LprTerm; lprMultiplier?: string } {
+  if (nextRateType !== "hybrid") return { rateType: nextRateType };
+
+  return {
+    rateType: nextRateType,
+    rate: data.rate.trim() ? data.rate : "24",
+    lprTerm: data.lprTerm || "1y",
+    lprMultiplier:
+      !data.lprMultiplier.trim() || data.lprMultiplier === "1"
+        ? "4"
+        : data.lprMultiplier,
+  };
+}
+
+function AmountHeadline({
+  label,
+  amount,
+  size = "lg",
+}: {
+  label: string;
+  amount: number;
+  size?: "lg" | "sm";
+}) {
+  const [copied, setCopied] = useState(false);
+  const uppercase = `人民币${numberToChineseUppercase(amount)}`;
+  const copyText = `${formatMoney(amount)}（大写：${uppercase}）`;
+  const mainClass =
+    size === "sm"
+      ? "mt-1 font-mono text-2xl font-semibold text-foreground"
+      : "mt-1 font-mono text-3xl font-semibold text-foreground";
+
+  const handleCopy = async () => {
+    await copyToClipboard(copyText);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  };
+
+  return (
+    <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(220px,0.9fr)] sm:items-start">
+      <div>
+        <p className="text-caption uppercase tracking-wider text-muted-foreground">
+          {label}
+        </p>
+        <p className={mainClass}>{formatMoney(amount)}</p>
+      </div>
+      <div className="rounded-md border border-border bg-muted/20 px-3 py-2">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-caption uppercase tracking-wider text-muted-foreground">
+            大写金额
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleCopy}
+            className="h-7 gap-1 px-2 text-xs"
+          >
+            {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+            {copied ? "已复制" : "复制"}
+          </Button>
+        </div>
+        <p className="mt-1 break-words text-sm font-medium leading-relaxed text-foreground">
+          {uppercase}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+async function copyToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  document.body.removeChild(textarea);
 }
 
 function PrincipalRow({
@@ -328,6 +422,10 @@ function PrincipalRow({
   onChange: (patch: Partial<InterestPrincipal>) => void;
   onDelete: () => void;
 }) {
+  const handleRateTypeChange = (nextRateType: RateType) => {
+    onChange(defaultRateTypePatch(nextRateType, data));
+  };
+
   return (
     <div className="rounded-md border border-border bg-card px-4 py-3">
       <div className="mb-2 flex items-center justify-between">
@@ -358,14 +456,15 @@ function PrincipalRow({
         </SmallField>
 
         <SmallField label="利率类型">
-          <div className="flex gap-1.5">
+          <div className="flex flex-wrap gap-1.5">
             <select
               value={data.rateType}
-              onChange={(e) => onChange({ rateType: e.target.value as RateType })}
-              className="flex-1 rounded border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-foreground/50"
+              onChange={(e) => handleRateTypeChange(e.target.value as RateType)}
+              className="min-w-[120px] flex-1 rounded border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-foreground/50"
             >
               <option value="custom">约定利率</option>
               <option value="lpr">LPR</option>
+              <option value="hybrid">约定利率 + LPR分段</option>
             </select>
             {data.rateType === "custom" ? (
               <div className="relative flex-1">
@@ -382,7 +481,7 @@ function PrincipalRow({
                   %
                 </span>
               </div>
-            ) : (
+            ) : data.rateType === "lpr" ? (
               <>
                 <select
                   value={data.lprTerm}
@@ -402,6 +501,48 @@ function PrincipalRow({
                     onChange={(e) => onChange({ lprMultiplier: e.target.value })}
                     className="w-full rounded border border-border bg-background px-2 py-1.5 pr-7 font-mono text-sm outline-none focus:border-foreground/50"
                     aria-label="LPR 倍数"
+                  />
+                  <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">
+                    倍
+                  </span>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="relative w-24">
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.01}
+                    placeholder="24"
+                    value={data.rate}
+                    onChange={(e) => onChange({ rate: e.target.value })}
+                    className="w-full rounded border border-border bg-background px-2 py-1.5 pr-7 font-mono text-sm outline-none focus:border-foreground/50"
+                    aria-label="2020-08-20 前约定年利率"
+                  />
+                  <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">
+                    %
+                  </span>
+                </div>
+                <select
+                  value={data.lprTerm}
+                  onChange={(e) => onChange({ lprTerm: e.target.value as LprTerm })}
+                  className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-foreground/50"
+                  aria-label="2020-08-20 后 LPR 期限"
+                >
+                  <option value="1y">1 年期 LPR</option>
+                  <option value="5y+">5 年期以上 LPR</option>
+                </select>
+                <div className="relative w-24">
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.01}
+                    placeholder="4"
+                    value={data.lprMultiplier}
+                    onChange={(e) => onChange({ lprMultiplier: e.target.value })}
+                    className="w-full rounded border border-border bg-background px-2 py-1.5 pr-7 font-mono text-sm outline-none focus:border-foreground/50"
+                    aria-label="2020-08-20 后 LPR 倍数"
                   />
                   <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">
                     倍
@@ -732,6 +873,10 @@ function CaseRow({
   onChange: (patch: Partial<ExecCaseFormData>) => void;
   onDelete: () => void;
 }) {
+  const handleRateTypeChange = (nextRateType: RateType) => {
+    onChange(defaultRateTypePatch(nextRateType, data));
+  };
+
   return (
     <div className="space-y-2 rounded-md border border-border bg-card px-4 py-3">
       <div className="flex items-center gap-2">
@@ -767,14 +912,15 @@ function CaseRow({
           />
         </SmallField>
         <SmallField label="利率">
-          <div className="flex gap-1.5">
+          <div className="flex flex-wrap gap-1.5">
             <select
               value={data.rateType}
-              onChange={(e) => onChange({ rateType: e.target.value as RateType })}
-              className="flex-1 rounded border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-foreground/50"
+              onChange={(e) => handleRateTypeChange(e.target.value as RateType)}
+              className="min-w-[120px] flex-1 rounded border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-foreground/50"
             >
               <option value="custom">约定利率</option>
               <option value="lpr">LPR</option>
+              <option value="hybrid">约定利率 + LPR分段</option>
             </select>
             {data.rateType === "custom" ? (
               <div className="relative flex-1">
@@ -791,7 +937,7 @@ function CaseRow({
                   %
                 </span>
               </div>
-            ) : (
+            ) : data.rateType === "lpr" ? (
               <>
                 <select
                   value={data.lprTerm}
@@ -811,6 +957,48 @@ function CaseRow({
                     onChange={(e) => onChange({ lprMultiplier: e.target.value })}
                     className="w-full rounded border border-border bg-background px-2 py-1.5 pr-7 font-mono text-sm outline-none focus:border-foreground/50"
                     aria-label="LPR 倍数"
+                  />
+                  <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">
+                    倍
+                  </span>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="relative w-24">
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.01}
+                    placeholder="24"
+                    value={data.rate}
+                    onChange={(e) => onChange({ rate: e.target.value })}
+                    className="w-full rounded border border-border bg-background px-2 py-1.5 pr-7 font-mono text-sm outline-none focus:border-foreground/50"
+                    aria-label="2020-08-20 前约定年利率"
+                  />
+                  <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">
+                    %
+                  </span>
+                </div>
+                <select
+                  value={data.lprTerm}
+                  onChange={(e) => onChange({ lprTerm: e.target.value as LprTerm })}
+                  className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1.5 text-sm outline-none focus:border-foreground/50"
+                  aria-label="2020-08-20 后 LPR 期限"
+                >
+                  <option value="1y">1 年期 LPR</option>
+                  <option value="5y+">5 年期以上 LPR</option>
+                </select>
+                <div className="relative w-24">
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.01}
+                    placeholder="4"
+                    value={data.lprMultiplier}
+                    onChange={(e) => onChange({ lprMultiplier: e.target.value })}
+                    className="w-full rounded border border-border bg-background px-2 py-1.5 pr-7 font-mono text-sm outline-none focus:border-foreground/50"
+                    aria-label="2020-08-20 后 LPR 倍数"
                   />
                   <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">
                     倍
@@ -882,12 +1070,7 @@ function ExecResultMerged({
   return (
     <div className="space-y-3 rounded-md border border-border bg-card px-5 py-4">
       <div>
-        <p className="text-caption uppercase tracking-wider text-muted-foreground">
-          多案合并 · 应付总额
-        </p>
-        <p className="mt-1 font-mono text-3xl font-semibold text-foreground">
-          {formatMoney(result.total)}
-        </p>
+        <AmountHeadline label="多案合并 · 应付总额" amount={result.total} />
       </div>
       <BreakdownDl result={result} />
     </div>
@@ -904,12 +1087,7 @@ function ExecResultSingle({
   return (
     <div className="space-y-3 rounded-md border border-border bg-card px-5 py-4">
       <div>
-        <p className="text-caption uppercase tracking-wider text-muted-foreground">
-          {caseInfo.name} · 应付总额
-        </p>
-        <p className="mt-1 font-mono text-2xl font-semibold text-foreground">
-          {formatMoney(result.total)}
-        </p>
+        <AmountHeadline label={`${caseInfo.name} · 应付总额`} amount={result.total} size="sm" />
       </div>
       <BreakdownDl result={result} />
     </div>

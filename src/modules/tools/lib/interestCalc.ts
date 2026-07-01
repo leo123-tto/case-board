@@ -1,5 +1,5 @@
 /**
- * 利息 / 执行款核心计算。
+ * 利息 / 执行款核心计算 — 由旧版网页计算器迁移而来。
  *
  * 含:
  *   - daysBetween: 两日期之间天数(Math.ceil,半天算一天)
@@ -30,12 +30,14 @@ function isoLocal(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-/** 金额格式化(>= 1 万 → "X.XX 万元",否则 "X.XX 元") */
+/** 金额格式化。法律文书引用优先保留“元”口径,避免复制后再换算万元。 */
 export function formatMoney(amount: number): string {
-  if (Math.abs(amount) >= 10000) {
-    return (amount / 10000).toFixed(2) + " 万元";
-  }
-  return amount.toFixed(2) + " 元";
+  return (
+    amount.toLocaleString("zh-CN", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }) + " 元"
+  );
 }
 
 export function normalizeLprMultiplier(multiplier?: number): number {
@@ -50,15 +52,17 @@ function effectiveLprRate(baseRate: number, multiplier?: number): number {
 
 /* ============================ 利息计算 ============================ */
 
-export type RateType = "custom" | "lpr";
+export const PRIVATE_LENDING_CAP_SWITCH_DATE = "2020-08-20";
+
+export type RateType = "custom" | "lpr" | "hybrid";
 
 export interface InterestPrincipal {
   id: number;
   principal: string; // 输入框值(string,parse 时转 number)
   rateType: RateType;
-  rate: string; // 自定义利率(%),仅 rateType="custom" 时用
-  lprTerm: LprTerm; // LPR 期限,仅 rateType="lpr" 时用
-  lprMultiplier: string; // LPR 倍数,仅 rateType="lpr" 时用
+  rate: string; // 自定义利率(%),rateType="custom"/"hybrid" 时用
+  lprTerm: LprTerm; // LPR 期限,rateType="lpr"/"hybrid" 时用
+  lprMultiplier: string; // LPR 倍数,rateType="lpr"/"hybrid" 时用
   startDate: string;
   endDate: string;
 }
@@ -81,6 +85,37 @@ function calculateInterestRaw(
     if (!customRate || isNaN(customRate)) return 0;
     const days = daysBetween(startDate, endDate);
     return (principal * customRate) / 100 / 365 * days;
+  }
+
+  if (rateType === "hybrid") {
+    let totalInterest = 0;
+    const switchDate = new Date(PRIVATE_LENDING_CAP_SWITCH_DATE);
+
+    if (start < switchDate) {
+      if (!customRate || isNaN(customRate)) return 0;
+
+      const legacyEndDate =
+        end < switchDate ? endDate : PRIVATE_LENDING_CAP_SWITCH_DATE;
+      const legacyDays = daysBetween(startDate, legacyEndDate);
+      totalInterest +=
+        (principal * customRate) / 100 / 365 * legacyDays;
+    }
+
+    const postStartDate =
+      start < switchDate ? PRIVATE_LENDING_CAP_SWITCH_DATE : startDate;
+    if (new Date(endDate) > new Date(postStartDate)) {
+      totalInterest += calculateInterestRaw(
+        principal,
+        postStartDate,
+        endDate,
+        "lpr",
+        0,
+        lprTerm,
+        lprMultiplier,
+      );
+    }
+
+    return totalInterest;
   }
 
   let totalInterest = 0;
@@ -165,6 +200,9 @@ export function calculateInterestSegments(
   lprMultiplier = 1,
 ): InterestSegment[] {
   if (!principal || principal <= 0 || !startDate || !endDate) return [];
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (end <= start) return [];
 
   if (rateType === "custom") {
     const days = daysBetween(startDate, endDate);
@@ -181,6 +219,57 @@ export function calculateInterestSegments(
         interest: Math.round((principal * customRate / 100 / 365 * days) * 100) / 100,
       },
     ];
+  }
+
+  if (rateType === "hybrid") {
+    const segs: InterestSegment[] = [];
+    const switchDate = new Date(PRIVATE_LENDING_CAP_SWITCH_DATE);
+
+    if (start < switchDate) {
+      if (!customRate || isNaN(customRate)) return [];
+
+      const legacyEndDate =
+        end < switchDate ? endDate : PRIVATE_LENDING_CAP_SWITCH_DATE;
+      const legacyDays = daysBetween(startDate, legacyEndDate);
+      if (legacyDays > 0) {
+        segs.push({
+          startDate,
+          endDate: legacyEndDate,
+          days: legacyDays,
+          principal,
+          rateType: "hybrid",
+          baseRate: customRate,
+          multiplier: 1,
+          rate: customRate,
+          interest:
+            Math.round(
+              (principal * customRate / 100 / 365 * legacyDays) *
+                100,
+            ) / 100,
+        });
+      }
+    }
+
+    const postStartDate =
+      start < switchDate ? PRIVATE_LENDING_CAP_SWITCH_DATE : startDate;
+    if (end > new Date(postStartDate)) {
+      segs.push(
+        ...calculateInterestSegments(
+          principal,
+          postStartDate,
+          endDate,
+          "lpr",
+          0,
+          lprTerm,
+          lprMultiplier,
+        ).map((seg) => ({
+          ...seg,
+          rateType: "hybrid" as const,
+        })),
+      );
+    }
+
+    return segs;
   }
 
   // LPR:按"利率实际变化"的点分段(连续相同利率合并)

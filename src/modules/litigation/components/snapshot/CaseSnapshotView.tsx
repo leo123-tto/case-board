@@ -18,6 +18,7 @@ import { type Case, type CaseInstance, type Document } from "@/lib/types";
 import { listCaseInstances } from "@/lib/api";
 import { formatYuan } from "@/lib/format";
 import { computeCaseSnapshot } from "@/lib/caseSnapshot";
+import { extractExecutionCaseNoFromCase, getTrialCaseNo } from "@/lib/caseNumbers";
 import {
   applyFieldOverrides,
   rowKeyOf,
@@ -25,6 +26,7 @@ import {
   type SubtableField,
 } from "@/lib/userOverrides";
 import { useCaseOverrides } from "@/hooks/useCaseOverrides";
+import { resolveCaseStatus } from "@/modules/litigation/lib/inferStatus";
 
 import {
   CardSection,
@@ -99,6 +101,11 @@ export function CaseSnapshotView({
   // LLM snapshot + 用户 overlay
   const rawSnap = computeCaseSnapshot(caseData, documents);
   const snap = applyFieldOverrides(rawSnap, ov.overrides);
+  const caseStatus = resolveCaseStatus(caseData, documents);
+  const executionCaseNo = extractExecutionCaseNoFromCase(caseData);
+  const isExecutionCase = caseStatus.id === "execution" && !!executionCaseNo;
+  const primaryCaseNo = isExecutionCase ? executionCaseNo : snap.case_no;
+  const trialCaseNo = getTrialCaseNo(caseData, instances, snap.case_no);
 
   const amountText = snap.claim_amount ? formatYuan(snap.claim_amount) : null;
   // 编辑态显示纯数字字符串(给用户改);非编辑态显示带 ¥ 千位逗号的格式化值(给人看)。
@@ -607,9 +614,16 @@ export function CaseSnapshotView({
               snap.cause || <Dash />
             )}
           </h2>
-          {(snap.case_no || isEditMode) && (
-            <span className="font-mono text-sm text-muted-foreground">
-              {isEditMode ? (
+          {(primaryCaseNo || isEditMode) && (
+            <span className="flex items-center gap-1.5 font-mono text-sm text-muted-foreground">
+              {isExecutionCase ? (
+                <>
+                  <span className="font-sans text-caption text-muted-foreground">
+                    执行案号
+                  </span>
+                  <span>{executionCaseNo}</span>
+                </>
+              ) : isEditMode ? (
                 <EditableField
                   key={`${caseData.id}:agg_case_no:hero`}
                   initialValue={snap.case_no}
@@ -642,6 +656,25 @@ export function CaseSnapshotView({
             snap.court || <Dash />
           )}
         </p>
+        {isExecutionCase && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            <span>审判案号：</span>
+            {isEditMode ? (
+              <EditableField
+                key={`${caseData.id}:agg_case_no:trial-secondary`}
+                initialValue={snap.case_no}
+                editable
+                onCommit={(v) => ov.setField("agg_case_no", v)}
+                ariaLabel="编辑审判案号"
+                editableClassName="font-mono text-xs"
+                hasOverride={ov.hasFieldOverride("agg_case_no")}
+                onReset={() => ov.clearField("agg_case_no")}
+              />
+            ) : (
+              <span className="font-mono">{trialCaseNo || <Dash />}</span>
+            )}
+          </p>
+        )}
 
         {/* 我方代理立场 + 当事人对峙(2026-06-13:立场驱动报告侧重/AI 立场/各 chip)*/}
         <div className="mt-4 rounded-md bg-muted/40 px-4 py-3">

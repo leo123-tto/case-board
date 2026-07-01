@@ -24,6 +24,8 @@ export interface HomeReminderEvent {
   locationText?: string | null;
   caseName: string;
   caseId: string;
+  caseNo?: string | null;
+  partySummary?: string | null;
   court?: string | null;
   judges?: string[];
   courtContacts?: CourtContact[];
@@ -37,6 +39,7 @@ const PRESERVATION_REMIND_DAYS = 60;
 
 interface BuildOptions {
   onlyReminderWindow: boolean;
+  includeNonPreservationDeadlines: boolean;
 }
 
 interface HearingCandidate {
@@ -52,6 +55,7 @@ interface PreservationCandidate {
   expiresAt: string;
   durationYears: number | null;
   targetLabel: string | null;
+  targetKey: string | null;
   sourceDoc?: Document;
 }
 
@@ -69,6 +73,7 @@ export function buildImportantCaseReminders(
   const events = cases.flatMap((c) =>
     buildCaseReminderEvents(c, docsByCase[c.id] ?? [], textInfoByDoc, now, {
       onlyReminderWindow: true,
+      includeNonPreservationDeadlines: false,
     }),
   );
   const rank = { overdue: 0, urgent: 1, normal: 2 } as const;
@@ -93,6 +98,7 @@ export function buildCaseCalendarEvents(
   const events = cases.flatMap((c) =>
     buildCaseReminderEvents(c, docsByCase[c.id] ?? [], textInfoByDoc, now, {
       onlyReminderWindow: false,
+      includeNonPreservationDeadlines: true,
     }),
   );
   return events.sort((a, b) => a.date.localeCompare(b.date));
@@ -105,7 +111,12 @@ function buildCaseReminderEvents(
   now: Date,
   options: BuildOptions,
 ): HomeReminderEvent[] {
-  const caseName = c.agg_cause || c.name;
+  const caseName = readOverrideString(c, "agg_cause", c.agg_cause) || c.name;
+  const caseNo = readOverrideString(c, "agg_case_no", c.agg_case_no);
+  const court = readOverrideString(c, "agg_court", c.agg_court);
+  const plaintiffs = parseJsonArray(c.agg_plaintiffs);
+  const defendants = parseJsonArray(c.agg_defendants);
+  const partySummary = buildPartySummary(plaintiffs, defendants);
   const judges = parseJsonArray(c.agg_judges);
   const courtContacts = parseCourtContacts(c.agg_court_contacts);
   return [
@@ -117,7 +128,9 @@ function buildCaseReminderEvents(
       note: item.note,
       caseName,
       caseId: c.id,
-      court: c.agg_court,
+      caseNo,
+      partySummary,
+      court,
       judges,
       courtContacts,
       sourceDoc: item.sourceDoc,
@@ -130,23 +143,29 @@ function buildCaseReminderEvents(
       note: item.targetLabel,
       caseName,
       caseId: c.id,
-      court: c.agg_court,
+      caseNo,
+      partySummary,
+      court,
       judges,
       courtContacts,
       sourceDoc: item.sourceDoc,
     })),
-    ...resolveNonPreservationDeadlines(c, now, options).map((kd) => ({
-      kind: "deadline" as const,
-      date: kd.expires_at!,
-      daysFromNow: diffDays(parseDate(kd.expires_at!)!, now),
-      type: kd.event ?? "到期",
-      note: kd.note ?? null,
-      caseName,
-      caseId: c.id,
-      court: c.agg_court,
-      judges,
-      courtContacts,
-    })),
+    ...(options.includeNonPreservationDeadlines
+      ? resolveNonPreservationDeadlines(c, now, options).map((kd) => ({
+          kind: "deadline" as const,
+          date: kd.expires_at!,
+          daysFromNow: diffDays(parseDate(kd.expires_at!)!, now),
+          type: kd.event ?? "到期",
+          note: kd.note ?? null,
+          caseName,
+          caseId: c.id,
+          caseNo,
+          partySummary,
+          court,
+          judges,
+          courtContacts,
+        }))
+      : []),
   ];
 }
 
@@ -199,9 +218,10 @@ function resolvePreservations(
 ): PreservationCandidate[] {
   const unseals = collectUnsealCandidates(docs, textInfoByDoc);
   const candidates = collectPreservationCandidates(docs, textInfoByDoc);
-  const fallback = candidates.length > 0 ? [] : collectPreservationFallback(c);
+  const fallback = candidates.length > 0 ? [] : collectPreservationFallback(c, docs);
+  const current = latestPreservationsByTarget([...candidates, ...fallback]);
 
-  return [...candidates, ...fallback].filter((candidate) => {
+  return current.filter((candidate) => {
     const expires = parseDate(candidate.expiresAt);
     if (!expires) return false;
     const days = diffDays(expires, now);
@@ -232,6 +252,7 @@ function collectPreservationCandidates(
 ): PreservationCandidate[] {
   const out: PreservationCandidate[] = [];
   for (const doc of docs) {
+    if (!isAuthoritativePreservationSourceDoc(doc)) continue;
     for (const schedule of textInfoByDoc[doc.id]?.schedules ?? []) {
       out.push(fromSchedule(schedule, doc));
     }
@@ -244,7 +265,8 @@ function collectPreservationCandidates(
   return dedupePreservations(out);
 }
 
-function collectPreservationFallback(c: Case): PreservationCandidate[] {
+function collectPreservationFallback(c: Case, docs: Document[]): PreservationCandidate[] {
+  if (!docs.some(isAuthoritativePreservationSourceDoc)) return [];
   return readKeyDates(c)
     .filter((kd) => kd.expires_at && PRESERVATION_RE.test(kd.event ?? ""))
     .map((kd) => ({
@@ -253,6 +275,7 @@ function collectPreservationFallback(c: Case): PreservationCandidate[] {
       expiresAt: kd.expires_at!,
       durationYears: null,
       targetLabel: kd.note ?? null,
+      targetKey: preservationTargetKeyFromText(kd.note),
     }));
 }
 
@@ -262,6 +285,7 @@ function collectUnsealCandidates(
 ): UnsealCandidate[] {
   const out: UnsealCandidate[] = [];
   for (const doc of docs) {
+    if (!isAuthoritativePreservationSourceDoc(doc)) continue;
     const textDate = textInfoByDoc[doc.id]?.unsealDate;
     if (textDate) out.push({ date: textDate, sourceDoc: doc });
     const fields = parseExtractedFields(doc.extracted_fields);
@@ -289,6 +313,7 @@ function fromSchedule(
     expiresAt: schedule.expiresAt,
     durationYears: schedule.durationYears,
     targetLabel: schedule.targetLabel,
+    targetKey: preservationTargetKeyFromText(schedule.targetLabel),
     sourceDoc,
   };
 }
@@ -307,6 +332,7 @@ function fromExtractedPreservation(
     expiresAt,
     durationYears: p.duration_years,
     targetLabel: preservationTargetLabel(p.target),
+    targetKey: preservationTargetKeyFromText(p.target),
     sourceDoc,
   };
 }
@@ -323,17 +349,53 @@ function dedupePreservations(items: PreservationCandidate[]): PreservationCandid
   return [...byKey.values()];
 }
 
+function latestPreservationsByTarget(items: PreservationCandidate[]): PreservationCandidate[] {
+  const byTarget = new Map<string, PreservationCandidate>();
+  for (const item of items) {
+    const key = preservationTargetKey(item);
+    const prev = byTarget.get(key);
+    if (!prev || comparePreservationFreshness(item, prev) > 0) {
+      byTarget.set(key, item);
+    }
+  }
+  return [...byTarget.values()];
+}
+
+function preservationTargetKey(item: PreservationCandidate): string {
+  return `${item.type}|${item.targetKey ?? item.targetLabel ?? ""}`;
+}
+
+function comparePreservationFreshness(
+  a: PreservationCandidate,
+  b: PreservationCandidate,
+): number {
+  const startCmp = a.startedAt.localeCompare(b.startedAt);
+  if (startCmp !== 0) return startCmp;
+  const expireCmp = a.expiresAt.localeCompare(b.expiresAt);
+  if (expireCmp !== 0) return expireCmp;
+  return sourceDocTime(a.sourceDoc) - sourceDocTime(b.sourceDoc);
+}
+
 function preservationTypeFromText(value: string): string {
-  if (/冻/.test(value) || /银行|账户|存款/.test(value)) return "续冻";
+  if (/冻/.test(value) || /银行|账户|存款|股权|股份|出资/.test(value)) return "续冻";
   return "续封";
 }
 
 function preservationTargetLabel(value: string | null | undefined): string | null {
   const text = value ?? "";
   if (/银行|账户|存款/.test(text)) return "银行账户";
+  if (/股权|股份|出资/.test(text)) return "股权";
   if (/车辆|车/.test(text)) return "车辆";
   if (/不动产|房产|房屋|土地/.test(text)) return "不动产";
   return text.trim() || null;
+}
+
+function preservationTargetKeyFromText(value: string | null | undefined): string | null {
+  const normalized = (value ?? "")
+    .replace(/\s+/g, "")
+    .replace(/[，。；;:：、,.]/g, "")
+    .trim();
+  return normalized || null;
 }
 
 function hearingSessionKey(candidate: HearingCandidate): string {
@@ -363,8 +425,27 @@ function isUnsealEvent(value: string): boolean {
 }
 
 export function isPreservationOrUnsealDoc(doc: Document): boolean {
+  return isAuthoritativePreservationSourceDoc(doc);
+}
+
+function isAuthoritativePreservationSourceDoc(doc: Document): boolean {
+  if (isCaseWorkLogDoc(doc)) return true;
+  if (isPreservationApplicationDoc(doc)) return false;
   const hay = `${doc.category ?? ""} ${doc.filename}`;
-  return /保全|续封|续冻|查封|冻结|解封|解除查封|解除冻结|解除保全|扣押/.test(hay);
+  return (
+    /保全|续封|续冻|查封|冻结|解封|解除查封|解除冻结|解除保全|扣押/.test(hay) &&
+    /法院|人民法院|裁定|协助执行|通知书|告知书|回执|查封|冻结|扣押|续封|续冻|解封|解除/.test(hay)
+  );
+}
+
+function isCaseWorkLogDoc(doc: Document): boolean {
+  return doc.source === "case_note" || doc.category === "工作记录";
+}
+
+function isPreservationApplicationDoc(doc: Document): boolean {
+  const hay = `${doc.category ?? ""} ${doc.filename}`;
+  return /保全申请|财产保全申请|申请保全|申请书/.test(hay) &&
+    !/法院|人民法院|裁定|协助执行|通知书|告知书|回执|查封|冻结|扣押|续封|续冻|解封|解除/.test(hay);
 }
 
 function parseExtractedFields(json: string | null): ExtractedFields | null {
@@ -420,6 +501,31 @@ export function parseCourtContacts(json: string | null): CourtContact[] {
   } catch {
     return [];
   }
+}
+
+function readOverrideString(c: Case, path: string, base: string | null): string | null {
+  if (!c.user_overrides_json) return base;
+  try {
+    const parsed = JSON.parse(c.user_overrides_json) as {
+      fields?: Record<string, string | null>;
+    };
+    return path in (parsed.fields ?? {}) ? (parsed.fields ?? {})[path] : base;
+  } catch {
+    return base;
+  }
+}
+
+function buildPartySummary(plaintiffs: string[], defendants: string[]): string | null {
+  const left = summarizePartySide(plaintiffs);
+  const right = summarizePartySide(defendants);
+  if (left && right) return `${left} vs ${right}`;
+  return left || right || null;
+}
+
+function summarizePartySide(names: string[]): string | null {
+  const cleaned = names.map((name) => name.trim()).filter(Boolean);
+  if (cleaned.length === 0) return null;
+  return `${cleaned[0]}${cleaned.length > 1 ? `等${cleaned.length}人` : ""}`;
 }
 
 export function eventUrgency(e: HomeReminderEvent): "overdue" | "urgent" | "normal" {

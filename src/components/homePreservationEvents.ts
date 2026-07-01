@@ -1,4 +1,4 @@
-export type PreservationAssetKind = "bank" | "vehicle" | "realEstate";
+export type PreservationAssetKind = "bank" | "vehicle" | "equity" | "realEstate";
 
 export interface PreservationSchedule {
   kind: PreservationAssetKind;
@@ -23,7 +23,8 @@ export function extractPreservationTextInfo(raw: string): PreservationTextInfo {
 
 export function extractPreservationSchedulesFromText(raw: string): PreservationSchedule[] {
   const text = normalizeText(raw);
-  const startedAt = extractPreservationStartDate(text);
+  const dateWindow = extractPreservationDateWindow(text);
+  const startedAt = dateWindow?.startedAt ?? extractPreservationStartDate(text);
   if (!startedAt) return [];
 
   const specs: Array<{
@@ -48,6 +49,13 @@ export function extractPreservationSchedulesFromText(raw: string): PreservationS
       matches: [/车辆.*?(?:查封)?期限为?二年/, /车辆.*?(?:查封)?期限为?2年/],
     },
     {
+      kind: "equity",
+      type: "续冻",
+      targetLabel: "股权",
+      durationYears: 3,
+      matches: [/股权.*?(?:冻结)?期限为?三年/, /股权.*?(?:冻结)?期限为?3年/],
+    },
+    {
       kind: "realEstate",
       type: "续封",
       targetLabel: "不动产",
@@ -64,7 +72,7 @@ export function extractPreservationSchedulesFromText(raw: string): PreservationS
       targetLabel: spec.targetLabel,
       startedAt,
       durationYears: spec.durationYears,
-      expiresAt: addYears(startedAt, spec.durationYears),
+      expiresAt: dateWindow?.expiresAt ?? addYears(startedAt, spec.durationYears),
     }));
 }
 
@@ -82,7 +90,24 @@ export function addYears(isoDate: string, years: number): string {
   return `${year + years}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
+function extractPreservationDateWindow(
+  text: string,
+): { startedAt: string; expiresAt: string } | null {
+  const date = DATE_EXPR;
+  const match = text.match(new RegExp(`自(${date})(?:起|开始)?(?:至|到)(${date})止?`));
+  if (!match) return null;
+  const startedAt = parseDateExpression(match[1]);
+  const expiresAt = parseDateExpression(match[2]);
+  return startedAt && expiresAt ? { startedAt, expiresAt } : null;
+}
+
 function extractPreservationStartDate(text: string): string | null {
+  const explicitStart = text.match(new RegExp(`自(${DATE_EXPR})(?:起|开始)`));
+  if (explicitStart) {
+    const parsed = parseDateExpression(explicitStart[1]);
+    if (parsed) return parsed;
+  }
+
   const dates = [
     ...Array.from(text.matchAll(/(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/g)).map(
       (m) => toIsoDate(Number(m[1]), Number(m[2]), Number(m[3])),
@@ -106,6 +131,21 @@ function normalizeText(raw: string): string {
 function toIsoDate(year: number, month: number, day: number): string | null {
   if (year < 1900 || month < 1 || month > 12 || day < 1 || day > 31) return null;
   return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function parseDateExpression(value: string): string | null {
+  const arabic = value.match(/(20\d{2})年(\d{1,2})月(\d{1,2})日/);
+  if (arabic) {
+    return toIsoDate(Number(arabic[1]), Number(arabic[2]), Number(arabic[3]));
+  }
+  const chinese = value.match(
+    /([二〇零一二三四五六七八九十]{4})年([一二三四五六七八九十]{1,3})月([一二三四五六七八九十]{1,3})日/,
+  );
+  if (!chinese) return null;
+  const year = parseChineseYear(chinese[1]);
+  const month = parseChineseNumber(chinese[2]);
+  const day = parseChineseNumber(chinese[3]);
+  return year && month && day ? toIsoDate(year, month, day) : null;
 }
 
 function parseChineseYear(value: string): number | null {
@@ -147,3 +187,6 @@ const CHINESE_NUMBER: Record<string, number> = {
   八: 8,
   九: 9,
 };
+
+const DATE_EXPR =
+  "(?:20\\d{2}年\\d{1,2}月\\d{1,2}日|[二〇零一二三四五六七八九十]{4}年[一二三四五六七八九十]{1,3}月[一二三四五六七八九十]{1,3}日)";

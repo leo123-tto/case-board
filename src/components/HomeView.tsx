@@ -67,6 +67,7 @@ import { parseJsonArray } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { CalendarBoard } from "./CalendarBoard";
+import { countOpenCaseRows, isOpenCaseStatus } from "./homeCaseCounts";
 import { HomeCompanionStrip } from "./HomeCompanionStrip";
 import {
   loadHearingDisplayDetail,
@@ -349,9 +350,11 @@ export function HomeView({
     }
     return true;
   });
+  const openCaseCount = countOpenCaseRows(caseRows);
+  const visibleOpenCaseCount = countOpenCaseRows(filteredRows);
 
   const activeCases = defaultSorted
-    .filter(({ status }) => status.id !== "closed" && status.id !== "mediated")
+    .filter(({ status }) => isOpenCaseStatus(status.id) && status.id !== "mediated")
     .map(({ caseData }) => caseData);
   const upcomingEventsBase = buildImportantCaseReminders(
     activeCases,
@@ -624,7 +627,7 @@ export function HomeView({
                 {greeting}
               </h1>
               <p className="mt-2 text-sm text-muted-foreground">
-                你正在办 {cases.length} 个案件,扫一眼今天的进度。
+                你正在办 {openCaseCount} 个案件,扫一眼今天的进度。
               </p>
               {homeCompanionOn && (
                 <HomeCompanionStrip
@@ -679,7 +682,7 @@ export function HomeView({
                 <div className="flex items-baseline gap-3">
                   <h2 className="text-lg font-semibold tracking-tight">在办案件</h2>
                   <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-                    {filteredRows.length} / {cases.length} CASES
+                    {visibleOpenCaseCount} / {cases.length} CASES
                   </span>
                 </div>
                 {filterBarOn && (
@@ -1376,9 +1379,9 @@ function ImportantDates({
   return (
     <div className="rounded-xl border border-border bg-card p-5">
       <div className="mb-3 flex items-baseline justify-between">
-        <h2 className="text-sm font-semibold tracking-tight">重要日期</h2>
+        <h2 className="text-sm font-semibold tracking-tight">重要提醒</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-          {events.length} EVENTS
+          {events.length} ALERTS
         </span>
       </div>
       {events.length === 0 ? (
@@ -1386,7 +1389,7 @@ function ImportantDates({
           <CalendarClock className="size-6 text-muted-foreground/40" />
           <p className="mt-2 text-xs text-muted-foreground">暂无近期事件</p>
           <p className="mt-1 text-caption text-muted-foreground/70">
-            导入案件后,开庭日 / 保全续封会自动出现在这里
+            导入案件后,开庭 / 保全续封会自动出现在这里
           </p>
         </div>
       ) : (
@@ -1671,6 +1674,7 @@ function EventRow({
         ? "amber"
         : "muted";
   const isPreserv = e.kind === "deadline" && PRESERVATION_RE.test(e.type);
+  const titleText = eventTitle(e, isPreserv);
   const Icon =
     e.kind === "hearing"
       ? Gavel
@@ -1699,12 +1703,15 @@ function EventRow({
         >
           <Icon className="size-3 shrink-0 text-muted-foreground/60" />
           <span className={`shrink-0 font-mono text-caption font-medium ${cdCls}`}>{countdown}</span>
-          {e.kind !== "hearing" && (
-            <span className="shrink-0 text-xs text-foreground">
-              {isPreserv ? preservationTitle(e.type) : e.type}
+          <span className="shrink-0 text-xs font-medium text-foreground">{titleText}</span>
+          <span className="truncate text-caption text-muted-foreground">
+            · {e.partySummary || e.caseName}
+          </span>
+          {e.caseNo && (
+            <span className="hidden shrink-0 font-mono text-caption text-muted-foreground/70 sm:inline">
+              {e.caseNo}
             </span>
           )}
-          <span className="truncate text-caption text-muted-foreground">· {e.caseName}</span>
         </button>
       </li>
     );
@@ -1739,18 +1746,19 @@ function EventRow({
       : "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
   const primaryDetail =
     e.kind === "hearing"
-      ? [e.timeText, e.court, e.locationText].filter(Boolean).join(" · ") || null
+      ? [e.timeText, e.locationText].filter(Boolean).join(" · ") || null
       : isPreserv
         ? preservationDetail(e)
         : null;
-  const displayNote = e.kind === "hearing" || isPreserv ? null : e.note;
+  const displayNote = e.kind === "hearing" ? e.note : isPreserv ? null : e.note;
+  const metaLines = caseMetaLines(e);
 
   return (
     <li>
       <button
         type="button"
         onClick={onPick}
-        className={`flex w-full items-center gap-3.5 rounded-lg px-3.5 py-3 text-left transition-colors hover:brightness-95 dark:hover:brightness-110 ${box}`}
+        className={`grid w-full grid-cols-[4rem_minmax(0,1fr)] gap-3 rounded-lg px-3.5 py-3 text-left transition-colors hover:brightness-95 sm:grid-cols-[4.25rem_minmax(0,1fr)_minmax(12rem,0.9fr)] dark:hover:brightness-110 ${box}`}
         title={`打开案件 · ${e.caseName}`}
       >
         <div className="shrink-0 text-center">
@@ -1760,11 +1768,7 @@ function EventRow({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <Icon className={`size-3.5 shrink-0 ${iconCls}`} />
-            {e.kind !== "hearing" && (
-              <span className="text-sm font-semibold text-foreground">
-                {isPreserv ? preservationTitle(e.type) : e.type}
-              </span>
-            )}
+            <span className="text-sm font-semibold text-foreground">{titleText}</span>
             {hint && <span className={`rounded px-1.5 py-0.5 text-caption font-medium ${hintCls}`}>{hint}</span>}
           </div>
           {primaryDetail && (
@@ -1775,14 +1779,30 @@ function EventRow({
           {displayNote && displayNote !== primaryDetail && (
             <p className="mt-0.5 truncate text-xs text-muted-foreground">{displayNote}</p>
           )}
-          <p className="mt-0.5 truncate text-xs text-foreground/80">{e.caseName}</p>
-          {e.court && e.kind !== "hearing" && (
-            <p className="mt-0.5 truncate text-caption text-muted-foreground/70">{e.court}</p>
-          )}
+        </div>
+        <div className="col-span-2 min-w-0 space-y-0.5 border-t border-foreground/10 pt-2 sm:col-span-1 sm:border-l sm:border-t-0 sm:py-0 sm:pl-3">
+          {metaLines.map((line, index) => (
+            <p
+              key={`${line.text}-${index}`}
+              className={cn(
+                "truncate text-caption text-muted-foreground",
+                index === 0 && "text-xs font-medium text-foreground/85",
+                line.mono && "font-mono",
+              )}
+              title={line.text}
+            >
+              {line.text}
+            </p>
+          ))}
         </div>
       </button>
     </li>
   );
+}
+
+function eventTitle(e: UpcomingEvent, isPreserv: boolean): string {
+  if (e.kind === "hearing") return "开庭";
+  return isPreserv ? preservationTitle(e.type) : e.type;
 }
 
 function preservationTitle(type: string): string {
@@ -1795,7 +1815,8 @@ function preservationTitle(type: string): string {
 function preservationDetail(e: UpcomingEvent): string | null {
   const judgeText = preservationJudgeText(e);
   const phoneText = preservationPhoneText(e);
-  return [`到期 ${e.date}`, judgeText, phoneText].filter(Boolean).join(" · ") || null;
+  const targetText = e.note ? `标的 ${e.note}` : null;
+  return [`到期 ${e.date}`, targetText, judgeText, phoneText].filter(Boolean).join(" · ") || null;
 }
 
 function preservationJudgeText(e: UpcomingEvent): string | null {
@@ -1816,6 +1837,27 @@ function preservationPhoneText(e: UpcomingEvent): string | null {
 
 function isJudgeRole(role: string | null | undefined): boolean {
   return !!role && /法官|审判员|审判长|承办人|法官助理|书记员/.test(role);
+}
+
+function caseMetaLines(e: UpcomingEvent): Array<{ text: string; mono?: boolean }> {
+  const raw = [
+    e.caseName,
+    e.partySummary,
+    e.caseNo ? { text: e.caseNo, mono: true } : null,
+    e.court,
+  ];
+  const seen = new Set<string>();
+  const lines: Array<{ text: string; mono?: boolean }> = [];
+  for (const item of raw) {
+    const line =
+      typeof item === "string" ? { text: item, mono: false } : item;
+    if (!line) continue;
+    const text = line.text.trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    lines.push({ text, mono: line.mono });
+  }
+  return lines;
 }
 
 function CalendarPanel({
@@ -1930,28 +1972,50 @@ function CalendarPanel({
               暂无近期日程(开庭 / 到期日由案件分析自动汇总到这里)
             </p>
           ) : (
-            summaryEvents.map((event, index) => (
-              <button
-                key={`${event.caseId}-${event.date}-${index}`}
-                type="button"
-                onClick={() => onPickCase(event)}
-                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted/60"
-              >
-                <span className={cn("size-2 shrink-0 rounded-full", calendarDotClass(event))} />
-                <span className="shrink-0 font-mono text-caption text-muted-foreground">
-                  {event.date.slice(5)}
-                </span>
-                <span className="font-medium text-foreground">{event.type}</span>
-                <span className="truncate text-muted-foreground">{event.caseName}</span>
-                <span className="ml-auto shrink-0 font-mono text-caption text-muted-foreground">
-                  {event.daysFromNow === 0
-                    ? "D-DAY"
-                    : event.daysFromNow > 0
-                      ? `D-${event.daysFromNow}`
-                      : `逾期${-event.daysFromNow}天`}
-                </span>
-              </button>
-            ))
+            summaryEvents.map((event, index) => {
+              const isManual = event.kind === "manual";
+              const countdown =
+                event.daysFromNow === 0
+                  ? "D-DAY"
+                  : event.daysFromNow > 0
+                    ? `D-${event.daysFromNow}`
+                    : `逾期${-event.daysFromNow}天`;
+              return (
+                <div
+                  key={`${event.id ?? event.caseId}-${event.date}-${index}`}
+                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-muted/60"
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!isManual) onPickCase(event);
+                    }}
+                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                  >
+                    <span className={cn("size-2 shrink-0 rounded-full", calendarDotClass(event))} />
+                    <span className="shrink-0 font-mono text-caption text-muted-foreground">
+                      {event.date.slice(5)}
+                    </span>
+                    <span className="shrink-0 font-medium text-foreground">{event.type}</span>
+                    <span className="truncate text-muted-foreground">{event.caseName}</span>
+                    <span className="ml-auto shrink-0 font-mono text-caption text-muted-foreground">
+                      {countdown}
+                    </span>
+                  </button>
+                  {isManual && event.id && (
+                    <button
+                      type="button"
+                      onClick={() => void onDeleteEvent(event.id!)}
+                      aria-label="删除日程"
+                      title="删除日程"
+                      className="shrink-0 rounded p-0.5 text-muted-foreground transition hover:bg-destructive/10 hover:text-destructive"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </button>
+                  )}
+                </div>
+              );
+            })
           )}
         </div>
       ) : (
@@ -2095,7 +2159,8 @@ function CalendarPanel({
                       type="button"
                       onClick={() => void onDeleteEvent(event.id!)}
                       aria-label="删除日程"
-                      className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
+                      title="删除日程"
+                      className="shrink-0 rounded p-0.5 text-muted-foreground transition hover:bg-destructive/10 hover:text-destructive"
                     >
                       <Trash2 className="size-3.5" />
                     </button>

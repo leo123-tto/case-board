@@ -18,6 +18,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { formatYuan } from "@/lib/format";
 import { normalizeCaseStatusText } from "@/lib/caseSnapshot";
+import { extractExecutionCaseNoFromCase } from "@/lib/caseNumbers";
 import type { Case, CourtContact, Document } from "@/lib/types";
 import { parseJsonArray } from "@/lib/types";
 import { getCaseWithDocs, listCases } from "@/lib/api";
@@ -196,6 +197,7 @@ function ExecutionCard({
   onOpen: () => void;
 }) {
   const defendants = parseJsonArray(caseData.agg_defendants);
+  const executionCaseNo = extractExecutionCaseNoFromCase(caseData);
   const statusText = normalizeCaseStatusText(caseData.agg_status_text);
   const keyDates = parseKeyDates(caseData.agg_key_dates);
   // 优先展示"执行立案 / 申请保全 / 续封 / 财产查询" 节点
@@ -227,6 +229,14 @@ function ExecutionCard({
       )}
 
       <div className="mt-4 space-y-1.5 text-xs">
+        {executionCaseNo && (
+          <div className="flex items-baseline gap-2">
+            <span className="shrink-0 text-muted-foreground">执行案号</span>
+            <span className="font-mono font-medium text-foreground">
+              {executionCaseNo}
+            </span>
+          </div>
+        )}
         {defendants.length > 0 && (
           <div className="flex items-baseline gap-2">
             <span className="shrink-0 text-muted-foreground">被执行人</span>

@@ -373,6 +373,8 @@ export interface Citation {
   quote?: string | null;
   /** type=case 时的法院名(可选) */
   court?: string | null;
+  /** type=web 时的公开网页 URL(可选) */
+  url?: string | null;
   /**
    * 后端校验结果:`type=doc` 时校验 quote 是否在文档里;其他 type 默认 true。
    * false → CitationsCard 标 ⚠️

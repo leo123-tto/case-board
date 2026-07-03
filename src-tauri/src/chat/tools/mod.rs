@@ -1,16 +1,17 @@
 //! 案件 AI 助手 V2 的工具集合(V0.2 D2-D3)。
 //!
-//! 27 个 tool 分 10 类(详 docs/V0.2-法律AI工作台-实施计划.md § 5):
+//! 30 个内置 tool 分 11 类(详 docs/V0.2-法律AI工作台-实施计划.md § 5):
 //!   - 法规法条 5 (laws.rs)
 //!   - 案例 4 (cases.rs)
 //!   - 企业 6 (companies.rs)
 //!   - 幻觉校验 1 (verify.rs · hall_detect,不缓存)
 //!   - 案件文档 4 (docs.rs · sqlite + 案件 extracted_text_path;semantic.rs · 向量语义检索)
-//!   - 本地知识库 2 (kb.rs · `~/Documents/知识库/` 整库)
+//!   - 本地知识库 3 (kb.rs · `~/Documents/知识库/` 整库;semantic_kb.rs · 语义检索)
 //!   - 写作工具 2 (artifact.rs · save_artifact 文书生产 + edit_artifact 局部编辑,均 mutating)
 //!   - 交互工具 1 (ask_user.rs · 选项式追问,agent_loop 拦截不进派发)
 //!   - 文档维护 1 (reextract.rs · reextract_document,V0.3 触发后台重抽,mutating)
 //!   - 入库工具 1 (save_kb.rs · save_company_report,企业报告入库 raw/companies/,P2,mutating)
+//!   - 公开联网工具 2 (web.rs · web_search / web_fetch,只读兜底)
 //!
 //! 调用方:`chat::agent_loop`(D3-D4 实施)拿到 LLM 的 function_call,
 //! 用 `ToolRegistry::find(name)` 查到 tool,调 `execute(args, ctx)`,
@@ -21,9 +22,11 @@
 //!   2. miss → 调元典 API
 //!   3. API 成功 → 调 `LocalKb::save_search` / `save_detail` 写回 KB
 //!
-//! 不走 cache 的 6 个:`verify_legal_citations`(实时校验)、`list_case_docs`、
+//! 不走元典 cache 的工具包括:`verify_legal_citations`(实时校验)、`list_case_docs`、
 //! `read_case_doc`、`find_in_document`(全部案件内查 sqlite/文件)、
-//! `search_local_kb`、`read_kb_file`(本身就是从 KB 读)。
+//! `semantic_search_case_docs`、`search_local_kb`、`semantic_search_local_kb`、`read_kb_file`
+//! (本身就是从 KB 读或查向量索引)、`save_artifact` / `edit_artifact` / `ask_user` /
+//! `reextract_document` / `save_company_report` / `web_search` / `web_fetch`。
 
 pub mod artifact;
 pub mod ask_user;
@@ -38,6 +41,7 @@ pub mod save_kb;
 pub mod semantic;
 pub mod semantic_kb;
 pub mod verify;
+pub mod web;
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -148,9 +152,9 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// 默认注册的全部 27 个工具:V0.2 的 21 个,加 V0.3 的 save_artifact / ask_user /
+/// 默认注册的全部 30 个内置工具:V0.2 的 21 个,加 V0.3 的 save_artifact / ask_user /
 /// reextract_document,V0.3.3 的 semantic_search_case_docs,ADR-0003 的 edit_artifact,
-/// P2 的 save_company_report(企业报告入库)。
+/// P2 的 save_company_report(企业报告入库),以及公开联网兜底工具 web_search / web_fetch。
 /// `ToolRegistry::default_v0_2()` 返回这个列表。
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
@@ -198,6 +202,9 @@ impl ToolRegistry {
             Box::new(reextract::ReextractDocument),
             // 入库工具 1(P2):把企业调查报告写进本地 KB raw/companies/(mutating)
             Box::new(save_kb::SaveCompanyReport),
+            // 通用联网工具 2:公开网页搜索 / 读取。只读,作为本地 KB + 元典之外的兜底。
+            Box::new(web::WebSearch),
+            Box::new(web::WebFetch),
         ];
         Self { tools }
     }

@@ -33,6 +33,9 @@ pub struct Citation {
     /// type=case 时填(法院名)
     #[serde(default)]
     pub court: Option<String>,
+    /// type=web 时填公开网页 URL。
+    #[serde(default)]
+    pub url: Option<String>,
     /// `verify_doc_quote` 后端校验结果。type=doc 时:true=quote 在文档里找得到,
     /// false=找不到(LLM 可能编造)。其他 type 默认 true(无法本地校验)。
     #[serde(default = "default_verified")]

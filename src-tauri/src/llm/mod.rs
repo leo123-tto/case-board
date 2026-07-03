@@ -142,6 +142,8 @@ pub struct KeyDate {
     pub date: Option<String>,
     /// 备注(如"庭前会议" / "二审")
     pub note: Option<String>,
+    /// 有"到期"概念的事件失效日期,如保全/续封/续冻到期日。
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -409,6 +411,45 @@ impl serde::Serialize for LlmError {
     }
 }
 
+const DEEPSEEK_FIELD_EXTRACT_MAX_TOKENS: u32 = 384_000;
+const LARGE_COMPAT_FIELD_EXTRACT_MAX_TOKENS: u32 = 64_000;
+const LOCAL_FIELD_EXTRACT_MAX_TOKENS: u32 = 32_768;
+
+pub const DEEPSEEK_FIELD_EXTRACT_MAX_INPUT_CHARS: usize = 650_000;
+pub const LARGE_COMPAT_FIELD_EXTRACT_MAX_INPUT_CHARS: usize = 220_000;
+pub const LOCAL_FIELD_EXTRACT_MAX_INPUT_CHARS: usize = 90_000;
+
+fn is_deepseek_config(config: &LlmConfig) -> bool {
+    let endpoint = config.endpoint.to_ascii_lowercase();
+    let model = config.model.to_ascii_lowercase();
+    endpoint.contains("deepseek") || model.contains("deepseek")
+}
+
+fn is_local_config(config: &LlmConfig) -> bool {
+    let endpoint = config.endpoint.to_ascii_lowercase();
+    endpoint.contains("127.0.0.1") || endpoint.contains("localhost")
+}
+
+pub fn field_extract_input_char_budget(config: &LlmConfig) -> usize {
+    if is_deepseek_config(config) {
+        DEEPSEEK_FIELD_EXTRACT_MAX_INPUT_CHARS
+    } else if is_local_config(config) {
+        LOCAL_FIELD_EXTRACT_MAX_INPUT_CHARS
+    } else {
+        LARGE_COMPAT_FIELD_EXTRACT_MAX_INPUT_CHARS
+    }
+}
+
+pub fn field_extract_output_token_budget(config: &LlmConfig) -> u32 {
+    if is_deepseek_config(config) {
+        DEEPSEEK_FIELD_EXTRACT_MAX_TOKENS
+    } else if is_local_config(config) {
+        LOCAL_FIELD_EXTRACT_MAX_TOKENS
+    } else {
+        LARGE_COMPAT_FIELD_EXTRACT_MAX_TOKENS
+    }
+}
+
 /// OpenAI 兼容请求体的简化版(只用 messages + temperature + max_tokens)。
 #[derive(Serialize)]
 struct ChatRequest<'a> {
@@ -434,6 +475,7 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatResponseMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -466,7 +508,9 @@ pub async fn extract_case_fields_with_hint(
             role: "user",
             content: &prompt,
         }],
-        max_tokens: 4096, // 2026-05-23 晚十三 扩字段后(party_contacts/fees/court_contacts/key_dates/preservations 等),输出可能 1.5-3k tokens
+        // 长查封/冻结清单会拆出多条 key_dates / preservations,输出预算按模型能力给足,
+        // 否则服务端 finish_reason=length 时 JSON 会半截截断。
+        max_tokens: field_extract_output_token_budget(config),
         temperature: config.temperature, // DeepSeek/本机=0.0;MiniMax=0.3(M 系列禁 0.0)
         stream: false,
     };
@@ -498,18 +542,24 @@ pub async fn extract_case_fields_with_hint(
         .await
         .map_err(|e| LlmError::ResponseFormat(e.to_string()))?;
 
-    let content = parsed
+    let choice = parsed
         .choices
         .into_iter()
         .next()
-        .map(|c| c.message.content)
         .ok_or_else(|| LlmError::ResponseFormat("choices 为空".into()))?;
+    let finish_reason = choice.finish_reason.clone();
+    let content = choice.message.content;
 
     // LLM 输出可能带 markdown ```json ... ``` 包裹,容错剥离
     let cleaned = extract_json_from_content(&content);
 
-    serde_json::from_str::<ExtractedFields>(&cleaned)
-        .map_err(|e| LlmError::ContentJson(format!("{}; raw = {}", e, content)))
+    serde_json::from_str::<ExtractedFields>(&cleaned).map_err(|e| {
+        let finish = finish_reason
+            .as_deref()
+            .map(|value| format!("; finish_reason = {}", value))
+            .unwrap_or_default();
+        LlmError::ContentJson(format!("{}{}; raw = {}", e, finish, content))
+    })
 }
 
 /// 从 LLM 返回的内容里抽取出 JSON 对象部分,处理几种常见的包裹:

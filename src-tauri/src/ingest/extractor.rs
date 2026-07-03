@@ -130,6 +130,14 @@ pub enum ExtractResult {
         text_md: String,
         metrics: Vec<MetricEntry>,
     },
+    /// 分片抽取只成功了一部分。保留已成功合并出的字段和全文,但 caller 必须把状态标成 failed,
+    /// 让用户看到"结果不完整,需要重试/换模型/继续分批处理",不能冒充完整成功。
+    PartialExtracted {
+        fields: ExtractedFields,
+        text_md: String,
+        warning: String,
+        metrics: Vec<MetricEntry>,
+    },
     /// 已知不支持的格式,跳过(.pdf / 图片等),不报错
     Skipped {
         reason: String,
@@ -144,6 +152,7 @@ pub enum ExtractResult {
     /// 出错(textutil 失败 / LLM 不可达 / JSON 解析失败等)
     Failed {
         error: String,
+        text_md: Option<String>,
         metrics: Vec<MetricEntry>,
     },
 }
@@ -486,6 +495,7 @@ pub async fn extract_one(
                     });
                     return ExtractResult::Failed {
                         error: format!("OCR 兜底失败:{}", e),
+                        text_md: None,
                         metrics,
                     };
                 }
@@ -507,7 +517,11 @@ pub async fn extract_one(
                 text_chars: None,
                 error_short: Some(short),
             });
-            return ExtractResult::Failed { error: e, metrics };
+            return ExtractResult::Failed {
+                error: e,
+                text_md: None,
+                metrics,
+            };
         }
     };
 
@@ -519,60 +533,185 @@ pub async fn extract_one(
         };
     }
 
-    // 3. 文本太长 → 截断(给 LLM 的)
-    const MAX_CHARS: usize = 10000;
-    let text_for_llm: String = if text.chars().count() > MAX_CHARS {
-        text.chars().take(MAX_CHARS).collect::<String>()
-    } else {
-        text.clone()
-    };
-
-    // 4. LLM 抽取
+    // 3. LLM 抽取。大文档按模型上下文预算分片,不再静默硬截断。
     let llm_backend = llm_backend_label(llm_config);
-    let t_llm = Instant::now();
-    match llm::extract_case_fields_with_hint(llm_config, &text_for_llm, Some(filename), category)
-        .await
-    {
-        Ok(fields) => {
-            metrics.push(MetricEntry {
-                filename: filename.into(),
-                ext,
-                file_size_bytes,
-                stage: "llm_extract".into(),
-                backend: llm_backend.clone(),
-                outcome: "ok".into(),
-                elapsed_ms: t_llm.elapsed().as_millis() as i64,
-                text_chars: Some(text_for_llm.chars().count() as i64),
-                error_short: None,
-            });
-            ExtractResult::Extracted {
-                fields,
-                text_md: text, // pipeline 用这个写盘到 extracts/<case_id>/<doc_id>.md
-                metrics,
+    let chunks =
+        split_text_for_field_extract(&text, llm::field_extract_input_char_budget(llm_config));
+    let total_chunks = chunks.len();
+    let mut extracted_fields = Vec::new();
+    let mut failed_chunks = Vec::new();
+
+    for (index, chunk) in chunks.iter().enumerate() {
+        let t_llm = Instant::now();
+        let chunk_filename = if total_chunks > 1 {
+            format!("{filename} [分片 {}/{}]", index + 1, total_chunks)
+        } else {
+            filename.to_string()
+        };
+
+        match llm::extract_case_fields_with_hint(llm_config, chunk, Some(&chunk_filename), category)
+            .await
+        {
+            Ok(fields) => {
+                metrics.push(MetricEntry {
+                    filename: chunk_filename,
+                    ext: ext.clone(),
+                    file_size_bytes,
+                    stage: "llm_extract".into(),
+                    backend: llm_backend.clone(),
+                    outcome: "ok".into(),
+                    elapsed_ms: t_llm.elapsed().as_millis() as i64,
+                    text_chars: Some(chunk.chars().count() as i64),
+                    error_short: None,
+                });
+                extracted_fields.push(fields);
             }
-        }
-        Err(e) => {
-            let short = crate::feedback::sanitize_paths(&format!("{}", e))
-                .chars()
-                .take(200)
-                .collect::<String>();
-            metrics.push(MetricEntry {
-                filename: filename.into(),
-                ext,
-                file_size_bytes,
-                stage: "llm_extract".into(),
-                backend: llm_backend.clone(),
-                outcome: "failed".into(),
-                elapsed_ms: t_llm.elapsed().as_millis() as i64,
-                text_chars: None,
-                error_short: Some(short),
-            });
-            ExtractResult::Failed {
-                error: format!("LLM 抽取失败: {}", e),
-                metrics,
+            Err(e) => {
+                let error = format!("{}", e);
+                let short = crate::feedback::sanitize_paths(&error)
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                metrics.push(MetricEntry {
+                    filename: chunk_filename,
+                    ext: ext.clone(),
+                    file_size_bytes,
+                    stage: "llm_extract".into(),
+                    backend: llm_backend.clone(),
+                    outcome: "failed".into(),
+                    elapsed_ms: t_llm.elapsed().as_millis() as i64,
+                    text_chars: Some(chunk.chars().count() as i64),
+                    error_short: Some(short.clone()),
+                });
+                failed_chunks.push(format!("分片 {}: {}", index + 1, short));
             }
         }
     }
+
+    if extracted_fields.is_empty() {
+        let detail = failed_chunks.join("；");
+        return ExtractResult::Failed {
+            error: format!(
+                "LLM 抽取失败:全文 {} 字,已按 {} 字/片拆成 {} 片,但没有任何分片成功。{}",
+                text.chars().count(),
+                llm::field_extract_input_char_budget(llm_config),
+                total_chunks,
+                detail
+            ),
+            text_md: Some(text),
+            metrics,
+        };
+    }
+
+    let fields = merge_extracted_fields(extracted_fields);
+    if failed_chunks.is_empty() {
+        ExtractResult::Extracted {
+            fields,
+            text_md: text, // pipeline 用这个写盘到 extracts/<case_id>/<doc_id>.md
+            metrics,
+        }
+    } else {
+        ExtractResult::PartialExtracted {
+            fields,
+            text_md: text,
+            warning: format!(
+                "LLM 分片抽取部分失败:全文 {} 字,按 {} 字/片拆成 {} 片,成功 {} 片,失败 {} 片。结果可能缺少未成功分片中的保全/续封/日期信息。建议重试、切换 DeepSeek 大上下文模型,或减少单次材料量后重扫。失败明细:{}",
+                chunks.iter().map(|c| c.chars().count()).sum::<usize>(),
+                llm::field_extract_input_char_budget(llm_config),
+                total_chunks,
+                total_chunks - failed_chunks.len(),
+                failed_chunks.len(),
+                failed_chunks.join("；")
+            ),
+            metrics,
+        }
+    }
+}
+
+fn split_text_for_field_extract(text: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    let total = text.chars().count();
+    if total <= max_chars {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    for ch in text.chars() {
+        if current_chars >= max_chars {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current.push(ch);
+        current_chars += 1;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn first_some<T>(target: &mut Option<T>, value: Option<T>) {
+    if target.is_none() {
+        *target = value;
+    }
+}
+
+fn extend_unique_by_json<T>(target: &mut Vec<T>, values: Vec<T>)
+where
+    T: serde::Serialize,
+{
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<String> = target
+        .iter()
+        .filter_map(|item| serde_json::to_string(item).ok())
+        .collect();
+    for value in values {
+        let key = serde_json::to_string(&value).unwrap_or_default();
+        if seen.insert(key) {
+            target.push(value);
+        }
+    }
+}
+
+fn extend_unique_strings(target: &mut Vec<String>, values: Vec<String>) {
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<String> = target.iter().cloned().collect();
+    for value in values {
+        if seen.insert(value.clone()) {
+            target.push(value);
+        }
+    }
+}
+
+fn merge_extracted_fields(chunks: Vec<ExtractedFields>) -> ExtractedFields {
+    let mut merged = ExtractedFields::default();
+    for fields in chunks {
+        first_some(&mut merged.case_no, fields.case_no);
+        first_some(&mut merged.case_type, fields.case_type);
+        first_some(&mut merged.court, fields.court);
+        first_some(&mut merged.cause, fields.cause);
+        first_some(&mut merged.case_stage, fields.case_stage);
+        first_some(&mut merged.case_status, fields.case_status);
+        first_some(&mut merged.filed_at, fields.filed_at);
+        first_some(&mut merged.expected_close_at, fields.expected_close_at);
+        first_some(&mut merged.case_note, fields.case_note);
+        first_some(&mut merged.claim_amount, fields.claim_amount);
+
+        extend_unique_strings(&mut merged.plaintiffs, fields.plaintiffs);
+        extend_unique_strings(&mut merged.defendants, fields.defendants);
+        extend_unique_strings(&mut merged.third_parties, fields.third_parties);
+        extend_unique_strings(&mut merged.judges, fields.judges);
+        extend_unique_by_json(&mut merged.party_contacts, fields.party_contacts);
+        extend_unique_by_json(&mut merged.fees, fields.fees);
+        extend_unique_by_json(&mut merged.court_contacts, fields.court_contacts);
+        extend_unique_by_json(&mut merged.key_dates, fields.key_dates);
+        extend_unique_by_json(&mut merged.preservations, fields.preservations);
+    }
+    merged
 }
 
 /// LLM 后端标签 = endpoint 类型 + 模型名,这样 metric 既能区分 local/cloud,

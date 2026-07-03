@@ -3,6 +3,7 @@ import type {
   CourtContact,
   Document,
   ExtractedFields,
+  KeyDate,
   Preservation,
 } from "@/lib/types";
 import { parseJsonArray } from "@/lib/types";
@@ -261,6 +262,10 @@ function collectPreservationCandidates(
       const candidate = fromExtractedPreservation(p, doc);
       if (candidate) out.push(candidate);
     }
+    for (const kd of fields?.key_dates ?? []) {
+      const candidate = fromExtractedKeyDate(kd, doc);
+      if (candidate) out.push(candidate);
+    }
   }
   return dedupePreservations(out);
 }
@@ -333,6 +338,19 @@ function fromExtractedPreservation(
     durationYears: p.duration_years,
     targetLabel: preservationTargetLabel(p.target),
     targetKey: preservationTargetKeyFromText(p.target),
+    sourceDoc,
+  };
+}
+
+function fromExtractedKeyDate(kd: KeyDate, sourceDoc: Document): PreservationCandidate | null {
+  if (!kd.expires_at || !PRESERVATION_RE.test(kd.event_type)) return null;
+  return {
+    type: preservationTypeFromText(`${kd.event_type} ${kd.note ?? ""}`),
+    startedAt: kd.date ?? kd.expires_at,
+    expiresAt: kd.expires_at,
+    durationYears: null,
+    targetLabel: preservationTargetLabel(kd.note),
+    targetKey: preservationTargetKeyFromText(kd.note),
     sourceDoc,
   };
 }

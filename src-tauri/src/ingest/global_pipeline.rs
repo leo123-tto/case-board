@@ -59,7 +59,7 @@ pub async fn run_global_extract(
 ) -> GlobalExtractReport {
     let start = std::time::Instant::now();
 
-    // 1. 拿 done 文档清单 + extracted_text_path
+    // 1. 拿可读正文清单:done 文档 + LLM 字段失败但 OCR/文本已落盘的文档。
     type DocRow = (
         String,
         String,
@@ -71,7 +71,8 @@ pub async fn run_global_extract(
     let rows: Vec<DocRow> = match sqlx::query_as(
         "SELECT id, filename, category, stage, extracted_text_path, source_path \
          FROM documents \
-         WHERE case_id = ? AND deleted_at IS NULL AND extraction_status = 'done' \
+         WHERE case_id = ? AND deleted_at IS NULL AND extracted_text_path IS NOT NULL \
+           AND (extraction_status = 'done' OR extraction_status = 'failed') \
          ORDER BY filename",
     )
     .bind(case_id)
@@ -100,16 +101,18 @@ pub async fn run_global_extract(
             report_ok: false,
             report_path: None,
             elapsed_ms: start.elapsed().as_millis(),
-            error: Some("无已 done 文档,无法全局抽取".into()),
+            error: Some("无可分析正文,无法全局抽取".into()),
         };
     }
 
-    // D3-1:检测语料是否为完整集的子集 —— 有未 done 的文档说明本次基于**不完整语料**抽取。
+    // D3-1:检测语料是否为完整集的子集 —— 有未纳入正文的文档说明本次基于**不完整语料**抽取。
     // 数组字段(当事人/日期/费用)可能比完整抽取更短;COALESCE 只防"整列被空值抹除",
     // **防不了"变短覆盖"**(P1 残留:完整性 gate 待定)。这里落 dlog 让 partial-shrink 可观测,不再静默。
     if let Ok(not_done) = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM documents \
-         WHERE case_id = ? AND deleted_at IS NULL AND extraction_status != 'done'",
+         WHERE case_id = ? AND deleted_at IS NULL \
+           AND NOT (extracted_text_path IS NOT NULL \
+             AND (extraction_status = 'done' OR extraction_status = 'failed'))",
     )
     .bind(case_id)
     .fetch_one(pool)
@@ -117,7 +120,7 @@ pub async fn run_global_extract(
     {
         if not_done > 0 {
             crate::dlog!(
-                "[global_extract] case={} 有 {} 份文档未 done → 基于不完整语料抽取,\
+                "[global_extract] case={} 有 {} 份文档未纳入正文 → 基于不完整语料抽取,\
                  数组字段可能比完整抽取更短(D3-1 残留:仅防空覆盖,未防变短)",
                 case_id,
                 not_done

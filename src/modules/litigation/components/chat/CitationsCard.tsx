@@ -30,7 +30,7 @@ import {
   Scale,
 } from "lucide-react";
 
-import { openInDefaultApp } from "@/lib/api";
+import { openInDefaultApp, openUrl } from "@/lib/api";
 import type { Citation } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -68,9 +68,10 @@ export function CitationsCard({ citations, defaultOpen = false }: Props) {
     pushGroup(ordered, byKind, "case", "案例", <Gavel className="size-3.5" />);
     pushGroup(ordered, byKind, "doc", "本案文档", <FileText className="size-3.5" />);
     pushGroup(ordered, byKind, "kb_local", "本地知识库", <BookOpen className="size-3.5" />);
+    pushGroup(ordered, byKind, "web", "网页", <ExternalLink className="size-3.5" />);
     // 兜底:其他未识别 type
     for (const [k, arr] of byKind) {
-      if (!["law", "case", "doc", "kb_local"].includes(k)) {
+      if (!["law", "case", "doc", "kb_local", "web"].includes(k)) {
         ordered.push({ key: k, label: k, icon: <BookOpen className="size-3.5" />, items: arr });
       }
     }
@@ -96,6 +97,16 @@ export function CitationsCard({ citations, defaultOpen = false }: Props) {
       await openInDefaultApp(c.source);
     } catch (e) {
       console.error("[CitationsCard] open_in_default_app failed", e);
+    }
+  };
+
+  const handleOpenUrl = async (c: Citation) => {
+    const url = c.url || (c.source.startsWith("http") ? c.source : "");
+    if (!url) return;
+    try {
+      await openUrl(url);
+    } catch (e) {
+      console.error("[CitationsCard] open_url failed", e);
     }
   };
 
@@ -141,6 +152,7 @@ export function CitationsCard({ citations, defaultOpen = false }: Props) {
                     copied={copiedRef === c.ref}
                     onCopy={() => handleCopy(c)}
                     onOpenPath={() => handleOpenPath(c)}
+                    onOpenUrl={() => handleOpenUrl(c)}
                   />
                 ))}
               </ul>
@@ -157,11 +169,13 @@ interface RowProps {
   copied: boolean;
   onCopy: () => void;
   onOpenPath: () => void;
+  onOpenUrl: () => void;
 }
 
-function CitationRow({ citation: c, copied, onCopy, onOpenPath }: RowProps) {
+function CitationRow({ citation: c, copied, onCopy, onOpenPath, onOpenUrl }: RowProps) {
   // doc / kb_local 才有"开原文"按钮(source 是绝对路径)
   const canOpenPath = c.type === "doc" || c.type === "kb_local";
+  const canOpenUrl = c.type === "web" && Boolean(c.url || c.source.startsWith("http"));
 
   return (
     <li
@@ -179,6 +193,9 @@ function CitationRow({ citation: c, copied, onCopy, onOpenPath }: RowProps) {
           {c.court && (
             <div className="text-caption text-muted-foreground">{c.court}</div>
           )}
+          {c.url && (
+            <div className="break-all text-caption text-muted-foreground">{c.url}</div>
+          )}
           {c.quote && (
             <blockquote className="mt-1 border-l-2 border-border/60 pl-2 text-label text-muted-foreground">
               "{c.quote}"
@@ -192,11 +209,11 @@ function CitationRow({ citation: c, copied, onCopy, onOpenPath }: RowProps) {
           )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          {canOpenPath ? (
+          {canOpenPath || canOpenUrl ? (
             <button
               type="button"
-              onClick={onOpenPath}
-              title="用系统默认应用打开原文"
+              onClick={canOpenUrl ? onOpenUrl : onOpenPath}
+              title={canOpenUrl ? "用系统浏览器打开网页" : "用系统默认应用打开原文"}
               className="grid place-items-center rounded-sm p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
             >
               <ExternalLink className="size-3" />

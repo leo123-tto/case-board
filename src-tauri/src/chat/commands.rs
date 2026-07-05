@@ -26,12 +26,17 @@ use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::chat::agent_loop::{run_chat_with_tools, AgentLoopRequest};
+use crate::chat::agent_loop::{run_chat_with_tools, AgentLoopRequest, ToolCallRecord};
+use crate::chat::citations::{parse_with_doc_filenames, Citation};
 use crate::chat::constitution::build_system_prompt_with_memory;
 use crate::chat::context::TaskType;
 use crate::chat::model_router::route_model;
 use crate::chat::prompts::task_user_prompt;
+use crate::chat::quality_gate::{
+    evaluate_task_quality, format_quality_gate_note, QualityGateInput,
+};
 use crate::chat::stream::{ChatStreamEvent, ChatUsage};
+use crate::chat::task_contract::task_contract_prompt;
 use crate::chat::tools::{ToolContext, ToolRegistry};
 use crate::db::chat::{insert_chat_message, list_chat_messages, ChatMessage, NewChatMessage};
 use crate::llm::LlmConfig;
@@ -314,7 +319,7 @@ pub async fn case_chat_impl(
     }
     let global_memories = cap_prompt_memories(global_memories, 8_000, "全局记忆");
     let case_memories = cap_prompt_memories(case_memories, 6_000, "本案记忆");
-    let constitution_prompt = build_system_prompt_with_memory(
+    let mut constitution_prompt = build_system_prompt_with_memory(
         &case,
         &docs,
         &attached_ids,
@@ -323,6 +328,7 @@ pub async fn case_chat_impl(
         &global_memories,
         &case_memories,
     );
+    constitution_prompt.push_str(&task_contract_prompt(task));
 
     let registry_tools = ToolRegistry::default_v0_2();
     // V0.3.6 · 外部 MCP server(白名单,默认空 = 零开销零变化)。连/列失败的 server 跳过+dlog,不拖垮 chat。
@@ -360,7 +366,7 @@ pub async fn case_chat_impl(
         max_tokens: choice.max_tokens,
         // thinking 模型不支持 tool_choice="required"(DeepSeek 400),降级 auto;详 resolve_tool_choice。
         tool_choice: resolve_tool_choice(task.needs_tools(), &choice.model).into(),
-        case_docs_for_citation_check,
+        case_docs_for_citation_check: case_docs_for_citation_check.clone(),
     };
     let result: Result<ChatRunFinish, String> =
         run_chat_with_tools(&llm_config, agent_req, &registry_tools, ctx, tx, cancel_rx)
@@ -385,7 +391,7 @@ pub async fn case_chat_impl(
     match result {
         Ok(ChatRunFinish {
             content_cleaned,
-            citations: final_citations,
+            citations: mut final_citations,
             tool_calls: final_tool_calls,
             usage,
             metrics,
@@ -405,7 +411,7 @@ pub async fn case_chat_impl(
             let assistant_id = input.message_id.clone();
             // V0.2 D6.5 · 入 chat_messages.content 用 cleaned(剥掉 <CITATIONS> 块);
             // artifact 落盘也用 cleaned,防止 .md 文件里残留 JSON 引用块。
-            let assistant_content = content_cleaned;
+            let mut assistant_content = content_cleaned;
             // ── 9. 决定是否落 artifact ──────────────────────────────
             let mut artifact_doc_id = if let Some(task_str) = task.as_db_str() {
                 if assistant_content.chars().count() >= 1500 {
@@ -453,6 +459,27 @@ pub async fn case_chat_impl(
                     Ok(None) => {}
                     Err(e) => crate::dlog!("[chat] 查 save_artifact doc_id 失败: {}", e),
                 }
+            }
+
+            if final_citations.is_empty() {
+                final_citations = citations_from_save_artifact_tool_calls(
+                    &final_tool_calls,
+                    &case_docs_for_citation_check,
+                );
+            }
+
+            let quality_report = evaluate_task_quality(QualityGateInput {
+                task,
+                content: &assistant_content,
+                citations: &final_citations,
+                tool_calls: &final_tool_calls,
+                ask_user_present: ask_user.as_ref().is_some_and(|items| !items.is_empty()),
+                artifact_doc_id: artifact_doc_id.as_deref(),
+            });
+            let quality_note = format_quality_gate_note(&quality_report);
+            if !quality_note.is_empty() {
+                assistant_content.push_str(&quality_note);
+                let _ = app.emit(&channel, ChatStreamEvent::Delta { text: quality_note });
             }
 
             // ── 10. 入库 assistant 消息 ──────────────────────────────
@@ -694,6 +721,24 @@ fn clip_history_for_replay(rows: &[ChatMessage], char_budget: usize) -> Vec<(Str
     }
     acc.reverse();
     acc
+}
+
+fn citations_from_save_artifact_tool_calls(
+    tool_calls: &[ToolCallRecord],
+    case_docs_for_citation_check: &[(String, String)],
+) -> Vec<Citation> {
+    let mut citations = Vec::new();
+    for call in tool_calls {
+        if call.tool != "save_artifact" || !call.success {
+            continue;
+        }
+        let Some(content_md) = call.args.get("content_md").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        citations
+            .extend(parse_with_doc_filenames(content_md, case_docs_for_citation_check).citations);
+    }
+    citations
 }
 
 /// 把 chat 输出落成 artifact MD,同时 INSERT 一行 documents(source='chat')。

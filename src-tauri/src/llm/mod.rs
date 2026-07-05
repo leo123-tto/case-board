@@ -12,6 +12,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod capability;
+pub mod gateway;
 pub mod global_extract;
 pub mod organize;
 pub mod prompts;
@@ -450,39 +452,6 @@ pub fn field_extract_output_token_budget(config: &LlmConfig) -> u32 {
     }
 }
 
-/// OpenAI 兼容请求体的简化版(只用 messages + temperature + max_tokens)。
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<ChatMessage<'a>>,
-    max_tokens: u32,
-    temperature: f32,
-    stream: bool,
-}
-
-#[derive(Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
-/// OpenAI 兼容响应体(只解析我们关心的部分)。
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatResponseMessage,
-    finish_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChatResponseMessage {
-    content: String,
-}
-
 /// 给一段纯文本(诉状/判决书/笔录等),让 LLM 抽出结构化字段。
 ///
 /// 失败不 panic,返回 LlmError 让调用方决定怎么降级(可以记 `extraction_status = failed`)。
@@ -501,54 +470,25 @@ pub async fn extract_case_fields_with_hint(
     category: Option<&str>,
 ) -> Result<ExtractedFields, LlmError> {
     let prompt = prompts::case_fields_extraction_with_hint(text, filename, category);
-
-    let body = ChatRequest {
-        model: &config.model,
-        messages: vec![ChatMessage {
-            role: "user",
-            content: &prompt,
-        }],
-        // 长查封/冻结清单会拆出多条 key_dates / preservations,输出预算按模型能力给足,
-        // 否则服务端 finish_reason=length 时 JSON 会半截截断。
-        max_tokens: field_extract_output_token_budget(config),
-        temperature: config.temperature, // DeepSeek/本机=0.0;MiniMax=0.3(M 系列禁 0.0)
-        stream: false,
-    };
-
-    let mut req = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout_secs))
-        .build()
-        .map_err(|e| LlmError::Network(e.to_string()))?
-        .post(&config.endpoint)
-        .json(&body);
-
-    if let Some(key) = &config.api_key {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req
-        .send()
-        .await
-        .map_err(|e| LlmError::Network(e.to_string()))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(LlmError::HttpStatus(status.as_u16(), body));
-    }
-
-    let parsed: ChatResponse = response
-        .json()
-        .await
-        .map_err(|e| LlmError::ResponseFormat(e.to_string()))?;
-
-    let choice = parsed
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| LlmError::ResponseFormat("choices 为空".into()))?;
-    let finish_reason = choice.finish_reason.clone();
-    let content = choice.message.content;
+    let capability =
+        capability::ProviderCapability::from_backend("", &config.endpoint, &config.model);
+    let output = gateway::complete_non_stream_chat(
+        config,
+        &capability,
+        gateway::NonStreamChatRequest {
+            messages: vec![gateway::LlmChatMessage::user(prompt)],
+            // 长查封/冻结清单会拆出多条 key_dates / preservations,输出预算按模型能力给足,
+            // 否则服务端 finish_reason=length 时 JSON 会半截截断。
+            max_output_tokens: field_extract_output_token_budget(config),
+            temperature: config.temperature, // DeepSeek/本机=0.0;MiniMax=0.3(M 系列禁 0.0)
+            timeout_secs: Some(config.timeout_secs),
+            response_format_json_object: true,
+        },
+    )
+    .await
+    .map_err(gateway_error_to_llm_error)?;
+    let finish_reason = output.finish_reason.clone();
+    let content = output.content;
 
     // LLM 输出可能带 markdown ```json ... ``` 包裹,容错剥离
     let cleaned = extract_json_from_content(&content);
@@ -560,6 +500,21 @@ pub async fn extract_case_fields_with_hint(
             .unwrap_or_default();
         LlmError::ContentJson(format!("{}{}; raw = {}", e, finish, content))
     })
+}
+
+pub(crate) fn gateway_error_to_llm_error(err: gateway::LlmGatewayError) -> LlmError {
+    match err.kind {
+        gateway::LlmGatewayErrorKind::Network | gateway::LlmGatewayErrorKind::Timeout => {
+            LlmError::Network(err.message)
+        }
+        gateway::LlmGatewayErrorKind::ResponseFormat => LlmError::ResponseFormat(err.message),
+        gateway::LlmGatewayErrorKind::Auth
+        | gateway::LlmGatewayErrorKind::RateLimit
+        | gateway::LlmGatewayErrorKind::ProviderSchema
+        | gateway::LlmGatewayErrorKind::ProviderUnavailable => {
+            LlmError::HttpStatus(err.status.unwrap_or(0), err.message)
+        }
+    }
 }
 
 /// 从 LLM 返回的内容里抽取出 JSON 对象部分,处理几种常见的包裹:

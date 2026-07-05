@@ -19,6 +19,8 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::chat::citations;
+
 use super::{require_str, Tool, ToolContext, ToolError, ToolResult};
 
 // V0.3 · doc_type 白名单已开放(任意文书类型可写),不再有枚举常量。
@@ -83,8 +85,9 @@ impl Tool for SaveArtifact {
         }
         let title = require_str(args, "title")?;
         let content_md = require_str(args, "content_md")?;
+        let cleaned = citations::parse(content_md).content_cleaned;
 
-        let doc_id = persist_filing(ctx.pool, case_id, &doc_type, title, content_md)
+        let doc_id = persist_filing(ctx.pool, case_id, &doc_type, title, &cleaned)
             .await
             .map_err(ToolError::Runtime)?;
 

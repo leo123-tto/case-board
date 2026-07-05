@@ -34,7 +34,9 @@ pub mod model_router;
 pub mod parallel;
 pub mod prefix_cache;
 pub mod prompts;
+pub mod quality_gate;
 pub mod stream;
+pub mod task_contract;
 pub mod tools;
 
 pub use commands::{

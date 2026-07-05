@@ -2,6 +2,8 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use crate::llm::capability::ProviderCapability;
+use crate::llm::gateway::{complete_non_stream_chat, LlmChatMessage, NonStreamChatRequest};
 use crate::llm::LlmConfig;
 use crate::settings::Settings;
 
@@ -43,36 +45,6 @@ pub struct HomeGreetingResponse {
     pub generated_at: String,
     pub memory_used_count: usize,
     pub error: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    max_tokens: u32,
-    temperature: f32,
-    stream: bool,
-}
-
-#[derive(Serialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatResponseMessage,
-}
-
-#[derive(Deserialize)]
-struct ChatResponseMessage {
-    content: String,
 }
 
 pub async fn generate_home_greeting(
@@ -130,54 +102,19 @@ async fn call_llm_for_greeting(
     }
 
     let prompt = build_home_greeting_prompt(input, memories);
-    let body = ChatRequest {
-        model: config.model.clone(),
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            content: prompt,
-        }],
-        max_tokens: 96,
+    let capability = ProviderCapability::from_settings(settings, &config);
+    let request = NonStreamChatRequest {
+        messages: vec![LlmChatMessage::user(prompt)],
+        max_output_tokens: 96,
         temperature: 0.6,
-        stream: false,
+        timeout_secs: Some(config.timeout_secs.clamp(6, 18)),
+        response_format_json_object: false,
     };
 
-    let timeout = std::time::Duration::from_secs(config.timeout_secs.clamp(6, 18));
-    let mut req = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("创建 LLM 客户端失败: {e}"))?
-        .post(&config.endpoint)
-        .json(&body);
-
-    if let Some(key) = config
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req
-        .send()
+    let output = complete_non_stream_chat(&config, &capability, request)
         .await
         .map_err(|e| format!("LLM 问候请求失败: {e}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("LLM 问候返回 {}: {}", status.as_u16(), text));
-    }
-    let parsed = response
-        .json::<ChatResponse>()
-        .await
-        .map_err(|e| format!("解析 LLM 问候失败: {e}"))?;
-    let raw = parsed
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content)
-        .ok_or_else(|| "LLM 问候 choices 为空".to_string())?;
-    let cleaned = safe_home_greeting(&raw, input);
+    let cleaned = safe_home_greeting(&output.content, input);
     if cleaned.is_empty() {
         Err("LLM 问候为空".into())
     } else {
@@ -208,7 +145,7 @@ pub(crate) fn build_home_greeting_prompt(input: &HomeGreetingInput, memories: &[
     format!(
         "你是案件看板首页的“案件助手”。\n\
          人设: 克制、可靠、熟悉律师办案节奏,像老同事一样提供一点情绪价值,不撒娇,不说教。\n\
-         目标: 主要做日常关心、作息提醒、天气关照或轻微鼓励;案件提醒只占很小比例,因为正式提醒由日历和重要日期承担。\n\
+         目标: 主要做日常关心、作息提醒或轻微鼓励;案件提醒只占很小比例,因为正式提醒由日历和重要日期承担。\n\
          用户称呼: {display_name}\n\
          日期: {}\n\
          时间段: {time_of_day}\n\
@@ -223,9 +160,10 @@ pub(crate) fn build_home_greeting_prompt(input: &HomeGreetingInput, memories: &[
          3. 不要说“作为 AI”。\n\
          4. 不要提任何案号、当事人、文件路径或具体案件事实。\n\
          5. 提醒只作为背景,不得说具体日程、庭审、开庭、待办、截止、到期、案件数量或“几场/几件/几条”。\n\
-         6. 上午可轻微鼓励或夸一句;夜间优先提醒早点休息;天气明显时可提醒带伞/添衣。\n\
-         7. 如果要提提醒,只能泛泛说“提醒区扫一眼”,不要判断今天有没有开庭。\n\
-         8. 不要鸡汤味太重,要克制、稳、轻。",
+         6. 必须匹配时间段:上午不要说“今天辛苦了”“早点休息”“明天状态会更好”;夜间优先提醒早点休息。\n\
+         7. 天气只作事实参考;天气未更新、不可信或没有明确降雨/降温/高温时,不要提天气、带伞、添衣或路况。\n\
+         8. 如果要提提醒,只能泛泛说“提醒区扫一眼”,不要判断今天有没有开庭。\n\
+         9. 不要鸡汤味太重,要克制、稳、轻。",
         input.local_date.trim()
     )
 }
@@ -287,7 +225,11 @@ pub(crate) fn fallback_greeting(display_name: Option<&str>, time_of_day: Option<
 
 pub(crate) fn safe_home_greeting(raw: &str, input: &HomeGreetingInput) -> String {
     let cleaned = clean_greeting(raw);
-    if cleaned.is_empty() || is_unsafe_schedule_claim(&cleaned) {
+    if cleaned.is_empty()
+        || is_unsafe_schedule_claim(&cleaned)
+        || is_inconsistent_time_claim(&cleaned, input.time_of_day.as_deref())
+        || is_unsupported_weather_claim(&cleaned, input.weather_summary.as_deref())
+    {
         fallback_greeting(input.display_name.as_deref(), input.time_of_day.as_deref())
     } else {
         cleaned
@@ -310,6 +252,49 @@ fn is_unsafe_schedule_claim(text: &str) -> bool {
     )
     .expect("valid home greeting schedule regex");
     schedule_count.is_match(text)
+}
+
+fn is_inconsistent_time_claim(text: &str, time_of_day: Option<&str>) -> bool {
+    let period = clean_optional(time_of_day).unwrap_or_default();
+    match period.as_str() {
+        "早上" | "上午" => {
+            text.contains("早点休息")
+                || text.contains("早些休息")
+                || text.contains("晚安")
+                || text.contains("时间不早")
+                || text.contains("明天状态")
+                || text.contains("今天辛苦")
+                || text.contains("辛苦了")
+        }
+        "夜间" | "晚上" => {
+            text.contains("早上")
+                || text.contains("上午")
+                || text.contains("开局")
+                || text.contains("新的一天")
+        }
+        _ => false,
+    }
+}
+
+fn is_unsupported_weather_claim(text: &str, weather_summary: Option<&str>) -> bool {
+    if has_trusted_weather_summary(weather_summary) {
+        return false;
+    }
+    [
+        "天气", "下雨", "雨", "带伞", "伞", "添衣", "降温", "升温", "高温", "低温", "冷", "热",
+        "路上", "出门",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn has_trusted_weather_summary(weather_summary: Option<&str>) -> bool {
+    let Some(summary) = clean_optional(weather_summary) else {
+        return false;
+    };
+    !summary.contains("天气未更新")
+        && !summary.contains("定位未确认")
+        && !summary.contains("网络定位")
 }
 
 fn reminder_context(items: &[String]) -> &'static str {

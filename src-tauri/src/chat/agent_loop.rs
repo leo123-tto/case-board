@@ -39,6 +39,7 @@ use super::hooks::{HookChain, HookContext, HookOutcome, SessionStats};
 use super::loop_guard::{LoopGuard, LoopGuardViolation};
 use super::stream::{ChatStreamEvent, ChatUsage};
 use super::tools::{ToolContext, ToolError, ToolRegistry};
+use crate::llm::capability::{OutputTokenParam, ProviderCapability};
 use crate::llm::LlmConfig;
 
 /// agent_loop 调用入参(跟 `stream::ChatStreamRequest` 平行,字段略多)。
@@ -222,9 +223,48 @@ struct ApiRequest<'a> {
     stream: bool,
     stream_options: StreamOptions,
     temperature: f32,
-    max_tokens: u32,
+    #[serde(flatten)]
+    token_budget: ApiTokenBudget,
     tools: &'a [Value],
     tool_choice: &'a str,
+}
+
+#[derive(Serialize)]
+struct ApiTokenBudget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+}
+
+impl ApiTokenBudget {
+    fn from_capability(max_output_tokens: u32, capability: &ProviderCapability) -> Self {
+        match capability.output_token_param {
+            OutputTokenParam::MaxTokens => Self {
+                max_tokens: Some(max_output_tokens),
+                max_completion_tokens: None,
+            },
+            OutputTokenParam::MaxCompletionTokens => Self {
+                max_tokens: None,
+                max_completion_tokens: Some(max_output_tokens),
+            },
+        }
+    }
+}
+
+fn resolve_stream_tool_choice<'a>(
+    tool_schemas: &[Value],
+    requested: &'a str,
+    capability: &ProviderCapability,
+) -> &'a str {
+    if tool_schemas.is_empty() {
+        // 强制收尾轮没有工具时必须显式 none,避免 provider 收到 required+空工具报 400。
+        "none"
+    } else if requested == "required" && !capability.supports_tool_choice_required {
+        "auto"
+    } else {
+        requested
+    }
 }
 
 #[derive(Serialize)]
@@ -830,13 +870,9 @@ async fn stream_one_request(
     cancel: &mut oneshot::Receiver<()>,
     guard: &mut LoopGuard,
 ) -> Result<OneStreamPass, AgentLoopError> {
-    // 空工具集(fix 3 强制收尾轮)时强制 tool_choice="none":避免 "required"(flash 模型)
-    // + 无工具 → DeepSeek 400,否则收尾轮被打掉、拿不到最终答案。
-    let tool_choice = if tool_schemas.is_empty() {
-        "none"
-    } else {
-        req.tool_choice.as_str()
-    };
+    let capability = ProviderCapability::from_backend("", endpoint, &config.model);
+    let tool_choice =
+        resolve_stream_tool_choice(tool_schemas, req.tool_choice.as_str(), &capability);
     let body = ApiRequest {
         model: &config.model,
         messages,
@@ -845,7 +881,7 @@ async fn stream_one_request(
             include_usage: true,
         },
         temperature: req.temperature,
-        max_tokens: req.max_tokens,
+        token_budget: ApiTokenBudget::from_capability(req.max_tokens, &capability),
         tools: tool_schemas,
         tool_choice,
     };

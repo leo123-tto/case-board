@@ -20,7 +20,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{LlmConfig, LlmError};
+use crate::llm::{
+    capability::{LlmProviderKind, ProviderCapability},
+    gateway::{complete_non_stream_chat, LlmChatMessage, NonStreamChatRequest},
+    gateway_error_to_llm_error, LlmConfig, LlmError,
+};
 
 /// LLM 全局抽出的"填表"结果(对齐 cases.agg_* 字段)。
 ///
@@ -309,6 +313,10 @@ pub struct CombinedExtractResult {
     pub report_md: String,
 }
 
+const GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS: u32 = 12_288;
+const MINIMAX_GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS: u32 = 32_768;
+const EXPERIENCE_DISTILL_MAX_OUTPUT_TOKENS: u32 = 4_096;
+
 /// 拼接所有文档为一个 LLM 输入。
 pub fn build_corpus(docs: &[DocInput]) -> String {
     let mut s = String::new();
@@ -331,6 +339,51 @@ pub fn build_corpus(docs: &[DocInput]) -> String {
     s
 }
 
+fn build_combined_user_content(
+    corpus: &str,
+    confirmed_our_side: Option<&str>,
+    today: &str,
+) -> String {
+    let mut user_content = format!("【当前日期={}】\n", today);
+    if let Some(side) = confirmed_our_side.map(str::trim).filter(|s| !s.is_empty()) {
+        user_content.push_str(&format!("【律师已确认:我方代理立场={}】\n", side));
+    }
+    user_content.push('\n');
+    user_content.push_str(corpus);
+    user_content
+}
+
+fn global_extract_output_budget(capability: &ProviderCapability) -> u32 {
+    if capability.kind == LlmProviderKind::MiniMaxNative {
+        MINIMAX_GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS
+    } else {
+        GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS
+    }
+}
+
+fn build_combined_extract_request(
+    config: &LlmConfig,
+    corpus: &str,
+    confirmed_our_side: Option<&str>,
+    today: &str,
+) -> (ProviderCapability, NonStreamChatRequest) {
+    let capability = ProviderCapability::from_backend("", &config.endpoint, &config.model);
+    let user_content = build_combined_user_content(corpus, confirmed_our_side, today);
+    (
+        capability,
+        NonStreamChatRequest {
+            messages: vec![
+                LlmChatMessage::system(SYSTEM_PROMPT_COMBINED),
+                LlmChatMessage::user(user_content),
+            ],
+            max_output_tokens: global_extract_output_budget(&capability),
+            temperature: config.temperature,
+            timeout_secs: Some(config.timeout_secs.saturating_mul(3).max(1)),
+            response_format_json_object: true,
+        },
+    )
+}
+
 /// 单次 LLM call 同时输出表格 + 报告(2026-05-24 i)。
 ///
 /// 返回 `CombinedExtractResult { table, report_md }`。
@@ -340,106 +393,18 @@ pub async fn extract_combined(
     corpus: &str,
     confirmed_our_side: Option<&str>,
 ) -> Result<CombinedExtractResult, LlmError> {
-    // 律师在详情页确认/纠正过的立场 → 作为输入回喂(prompt 铁律 3b 会以此为准),
-    // 修复"LLM 推断站反、用户纠正后报告不变"。只回喂用户确认值,不回喂 LLM 自己上次的猜测(避免错值固化)。
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let mut user_content = format!("【当前日期={}】\n", today);
-    if let Some(side) = confirmed_our_side.map(str::trim).filter(|s| !s.is_empty()) {
-        user_content.push_str(&format!("【律师已确认:我方代理立场={}】\n", side));
-    }
-    user_content.push('\n');
-    user_content.push_str(corpus);
-    // 2026-06-15:MiniMax 自有协议(/chatcompletion_v2)不支持 response_format:json_object(实测 2013 报错),
-    // 且 M 系列恒思考、思考占 output token → 不发 response_format、把 max_tokens 抬高、温度禁 0.0。
-    let is_minimax = config.endpoint.contains("chatcompletion_v2");
-    let mut body = serde_json::json!({
-        "model": config.model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT_COMBINED},
-            {"role": "user", "content": user_content},
-        ],
-        // 报告 + 表格 大约 5-10K tokens output;MiniMax 还要叠思考 token,抬到 32K(M3 支持)。
-        "max_tokens": if is_minimax { 32768 } else { 12288 },
-        "temperature": config.temperature,
-        "stream": false,
-    });
-    if !is_minimax {
-        body["response_format"] = serde_json::json!({"type": "json_object"});
-    }
-
-    let mut req = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout_secs * 3))
-        .build()
-        .map_err(|e| LlmError::Network(e.to_string()))?
-        .post(&config.endpoint)
-        .json(&body);
-
-    if let Some(key) = &config.api_key {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req
-        .send()
+    let (capability, request) =
+        build_combined_extract_request(config, corpus, confirmed_our_side, &today);
+    let output = complete_non_stream_chat(config, &capability, request)
         .await
-        .map_err(|e| LlmError::Network(e.to_string()))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(LlmError::HttpStatus(status.as_u16(), text));
-    }
-
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LlmError::ResponseFormat(e.to_string()))?;
-
-    // 整合外部 PR #14 @zzf516988659-del:多字段 fallback —— MiniMax M 系列恒思考,
-    // finish_reason=length 时 message.content 截断为空,但 reasoning_content 还有内容;
-    // 旧代码只查 message.content 一字段 → 「无 content」误报。
-    // (PR 原带 dlog! 打印整份 raw response + dlog 写盘:因含案件内容、可能流入反馈 MD/落盘,
-    //  违反隐私铁律「反馈不传案件内容」,本仓未采纳那两块;只取多字段 fallback + 富错误信息。)
-    let first_choice = json.get("choices").and_then(|c| c.get(0));
-    let first_message = first_choice.and_then(|c| c.get("message"));
-    // 优先 content(OpenAI 标准 / M 系列正常);空串视为无效 → reasoning_content 兜底 → 顶层 text。
-    let content_opt: Option<&str> = first_message
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            first_message
-                .and_then(|m| m.get("reasoning_content"))
-                .and_then(|c| c.as_str())
-                .filter(|s| !s.trim().is_empty())
-        })
-        .or_else(|| json.get("text").and_then(|c| c.as_str()));
-    let content = content_opt.ok_or_else(|| {
-        // 错误信息只带 finish_reason + token 数(无案件内容),让用户区分是 max_tokens 撞墙还是模型问题。
-        let finish_reason = first_choice
-            .and_then(|c| c.get("finish_reason"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let usage = json.get("usage");
-        let completion = usage
-            .and_then(|u| u.get("completion_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let reasoning = usage
-            .and_then(|u| u.get("completion_tokens_details"))
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        LlmError::ResponseFormat(format!(
-            "无 choices[0].message.content (finish_reason={}, completion_tokens={}, reasoning_tokens={})",
-            finish_reason, completion, reasoning
-        ))
-    })?;
+        .map_err(gateway_error_to_llm_error)?;
 
     // MiniMax M 系列可能把 <think> 块塞进 content 开头 → 用更鲁棒的剥离(剥 think + 取首{到末})。
-    let cleaned = if is_minimax {
-        crate::llm::extract_json_from_content(content)
+    let cleaned = if capability.kind == LlmProviderKind::MiniMaxNative {
+        crate::llm::extract_json_from_content(&output.content)
     } else {
-        strip_markdown_fence(content)
+        strip_markdown_fence(&output.content)
     };
     serde_json::from_str::<CombinedExtractResult>(&cleaned)
         .map_err(|e| LlmError::ContentJson(format!("{}\n---原始---\n{}", e, cleaned)))
@@ -453,47 +418,24 @@ pub async fn distill_experience(
     report_md: &str,
 ) -> Result<String, LlmError> {
     let user_content = format!("【案件信息】\n{case_brief}\n\n【案件分析报告】\n{report_md}");
-    let body = serde_json::json!({
-        "model": config.model,
-        "messages": [
-            {"role": "system", "content": EXPERIENCE_DISTILL_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        "max_tokens": 4096,
-        "temperature": 0.2,
-        "stream": false,
-    });
-
-    let mut req = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout_secs * 2))
-        .build()
-        .map_err(|e| LlmError::Network(e.to_string()))?
-        .post(&config.endpoint)
-        .json(&body);
-    if let Some(key) = &config.api_key {
-        req = req.bearer_auth(key);
-    }
-    let response = req
-        .send()
-        .await
-        .map_err(|e| LlmError::Network(e.to_string()))?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(LlmError::HttpStatus(status.as_u16(), text));
-    }
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LlmError::ResponseFormat(e.to_string()))?;
-    let content = json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .ok_or_else(|| LlmError::ResponseFormat("无 choices[0].message.content".into()))?;
-    Ok(strip_markdown_fence(content).trim().to_string())
+    let capability = ProviderCapability::from_backend("", &config.endpoint, &config.model);
+    let output = complete_non_stream_chat(
+        config,
+        &capability,
+        NonStreamChatRequest {
+            messages: vec![
+                LlmChatMessage::system(EXPERIENCE_DISTILL_PROMPT),
+                LlmChatMessage::user(user_content),
+            ],
+            max_output_tokens: EXPERIENCE_DISTILL_MAX_OUTPUT_TOKENS,
+            temperature: 0.2,
+            timeout_secs: Some(config.timeout_secs.saturating_mul(2).max(1)),
+            response_format_json_object: false,
+        },
+    )
+    .await
+    .map_err(gateway_error_to_llm_error)?;
+    Ok(strip_markdown_fence(&output.content).trim().to_string())
 }
 
 const EXPERIENCE_DISTILL_PROMPT: &str = r#"你是资深诉讼律师的办案经验整理助手。给你一个**已结案/已判决**案件的信息与分析报告,提炼一张「办案经验卡片」,供日后办理**同类案件**时检索复用。

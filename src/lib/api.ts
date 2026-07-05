@@ -16,14 +16,11 @@ import type {
 } from "./types";
 
 import type {
-  Case,
   CaseInstance,
   CaseMemory,
-  CaseWithDocs,
   CourtFilingJob,
   CourtFilingEnvReport,
   Document,
-  ExtractedFields,
   FeishuCalendarEvent,
   GlobalMemory,
   LawyerProfile,
@@ -32,238 +29,13 @@ import type {
   MemoryCandidate,
   SaveMemoryNoteInput,
   NewCaseInstance,
-  ImportPlan,
-  ImportResult,
-  ScannedDoc,
   Settings,
   UpdateInfo,
   VerifyResult,
 } from "./types";
 
-/* ------------------------------------------------------------------ */
-/* 扫描 / 导入                                                        */
-/* ------------------------------------------------------------------ */
-
-/** 纯扫描,不入库。给"先看看"用。 */
-export function scanCaseFolder(path: string): Promise<ScannedDoc[]> {
-  return invoke<ScannedDoc[]>("scan_case_folder", { path });
-}
-
-/** 导入文件夹:扫描 + upsert 案件 + 替换文档列表。是 V0.1 的主路径。 */
-export function importCaseFolder(path: string): Promise<ImportResult> {
-  return invoke<ImportResult>("import_case_folder", { path });
-}
-
-/** 多案件检测:对文件夹做拆分预案(只读)。multi=false 时按单案导入即可。 */
-export function planImportFolder(path: string): Promise<ImportPlan> {
-  return invoke<ImportPlan>("plan_import_folder", { path });
-}
-
-/** 按确认后的拆分预案批量建案。`root` = 被拖入的上层文件夹(用于替换旧的整体单案)。 */
-export function commitImportFolder(
-  root: string,
-  cases: { dir: string; name: string }[],
-  sharedDirs: string[],
-): Promise<ImportResult[]> {
-  return invoke<ImportResult[]>("commit_import_folder", {
-    root,
-    cases,
-    sharedDirs,
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/* 案件读写                                                            */
-/* ------------------------------------------------------------------ */
-
-/** 列出所有已导入案件,按 updated_at 倒序。 */
-export function listCases(): Promise<Case[]> {
-  return invoke<Case[]>("list_cases");
-}
-
-/** 取案件详情 + 该案件所有文档。 */
-export function getCaseWithDocs(id: string): Promise<CaseWithDocs> {
-  return invoke<CaseWithDocs>("get_case_with_docs", { id });
-}
-
-export interface InsightBucket {
-  label: string;
-  count: number;
-  ratio: number;
-  amount_total: number;
-}
-
-export interface LawyerInsightsReport {
-  total_cases: number;
-  active_cases: number;
-  closed_cases: number;
-  analyzed_cases: number;
-  amount_cases: number;
-  total_claim_amount: number;
-  average_claim_amount: number | null;
-  top_causes: InsightBucket[];
-  top_courts: InsightBucket[];
-  our_side_mix: InsightBucket[];
-  stage_mix: InsightBucket[];
-  strengths: string[];
-  data_gaps: string[];
-  next_questions: string[];
-  markdown: string;
-}
-
-/** 基于本机案件数据生成办案画像。只读统计,不上传。 */
-export function getLawyerInsights(): Promise<LawyerInsightsReport> {
-  return invoke<LawyerInsightsReport>("get_lawyer_insights");
-}
-
-/** 删除一个案件(级联删除关联文档)。不动原始文件夹。 */
-export function deleteCase(id: string): Promise<void> {
-  return invoke<void>("delete_case", { id });
-}
-
-/* ------------------------------------------------------------------ */
-/* 文件读取                                                            */
-/* ------------------------------------------------------------------ */
-
-/** 读一个文本文件(.md/.html/.txt)的全文。仅限 5MB 以内。 */
-export function readTextFile(path: string): Promise<string> {
-  return invoke<string>("read_text_file", { path });
-}
-
-/**
- * 抽 .docx / .doc / .rtf / .odt 的纯文本,用于在 App 内即时预览 Word 文档(不启动 Word)。
- * .docx 走跨平台原生解析;.doc/.rtf/.odt 在 macOS 用 textutil 即时预览,其他平台暂不支持预览
- *(导入案件时这类文档由 MinerU 云端解析入库,内容照常进 AI 上下文)。
- */
-export function extractDocText(path: string): Promise<string> {
-  return invoke<string>("extract_doc_text", { path });
-}
-
-/**
- * 把一段诉讼文书纯文本喂给本机 LLM(llama.cpp + MiniCPM-V 4.6),
- * 抽出 7 个结构化字段。耗时通常 3-8 秒。
- */
-export function extractFieldsFromText(text: string): Promise<ExtractedFields> {
-  return invoke<ExtractedFields>("extract_fields_from_text", { text });
-}
-
-/** 用系统默认应用打开一个文件(PDF→Preview, docx→Word, 图片→Preview)。 */
-export function openInDefaultApp(path: string): Promise<void> {
-  return invoke<void>("open_in_default_app", { path });
-}
-
-/** 用系统默认浏览器打开 URL(Settings 里 token 申请链接、外链等)。2026-05-24 k */
-export function openUrl(url: string): Promise<void> {
-  return invoke<void>("open_url", { url });
-}
-
-/** 在 Finder 中显示该路径(选中并打开父目录)。 */
-export function revealInFinder(path: string): Promise<void> {
-  return invoke<void>("reveal_in_finder", { path });
-}
-
-/* ---- 源文件看板 Phase 3:文档标记 ---- */
-
-/** 列出某案件全部文档的标记(重要/忽略 + 原告/被告/第三人)。 */
-export function listDocumentTags(caseId: string): Promise<import("./types").DocumentTag[]> {
-  return invoke("list_document_tags", { caseId });
-}
-
-/** 设文档重要度(单值):value="重要"|"忽略" 或 null(清空)。documentIds 多个=整批。 */
-export function setDocumentImportance(
-  documentIds: string[],
-  value: string | null,
-): Promise<void> {
-  return invoke("set_document_importance", { documentIds, value });
-}
-
-/** 切换文档当事人侧(可多值):value=原告|被告|第三人,enabled=加/删。documentIds 多个=整批。 */
-export function setDocumentPartySide(
-  documentIds: string[],
-  value: string,
-  enabled: boolean,
-): Promise<void> {
-  return invoke("set_document_party_side", { documentIds, value, enabled });
-}
-
-/** 人工设文档分类(单值,六选一;value=null 清空)。 */
-export function setDocumentCategory(
-  documentIds: string | string[],
-  value: string | null,
-): Promise<void> {
-  const ids = Array.isArray(documentIds) ? documentIds : [documentIds];
-  return invoke("set_document_category", { documentIds: ids, value });
-}
-
-/** 人工设证据倾向(单值):value=有利|不利|中性 或 null(清空)。documentIds 多个=整批。 */
-export function setDocumentEvidenceAttitude(
-  documentIds: string[],
-  value: string | null,
-): Promise<void> {
-  return invoke("set_document_evidence_attitude", { documentIds, value });
-}
-
-/** 人工设提交阶段(单值):value 为固定阶段之一或 null(清空)。documentIds 多个=整批。 */
-export function setDocumentSubmissionStage(
-  documentIds: string[],
-  value: string | null,
-): Promise<void> {
-  return invoke("set_document_submission_stage", { documentIds, value });
-}
-
-/** 🪄 AI 自动整理:一次 LLM 调用判整案材料的 重要度+归类+显示名,写 ai_suggest。返回写入数。 */
-export function aiOrganizeCase(
-  caseId: string,
-  renameFiles = true,
-): Promise<number> {
-  return invoke("ai_organize_case", { caseId, renameFiles });
-}
-
-/** 人工设文档板内显示名(右键重命名);name=null/空 → 清回原文件名。纯元数据,不动原件。 */
-export function setDocumentDisplayName(
-  documentId: string,
-  name: string | null,
-): Promise<void> {
-  return invoke("set_document_display_name", { documentId, name });
-}
-
-/** 在某文档已抽取文本里按页搜索关键词,返回命中页 + 摘要(前端点一下跳页)。 */
-export function searchInDocument(
-  documentId: string,
-  query: string,
-): Promise<import("./types").SearchHit[]> {
-  return invoke("search_in_document", { documentId, query });
-}
-
-/** 列某文档的 PDF 页码书签(按页升序)。 */
-export function listDocumentBookmarks(
-  documentId: string,
-): Promise<import("./types").Bookmark[]> {
-  return invoke("list_document_bookmarks", { documentId });
-}
-
-/** 加一个 PDF 页码书签(page 1-based,label 可空)。返回新书签。 */
-export function addDocumentBookmark(
-  documentId: string,
-  page: number,
-  label: string | null,
-): Promise<import("./types").Bookmark> {
-  return invoke("add_document_bookmark", { documentId, page, label });
-}
-
-/** 删一个 PDF 页码书签。 */
-export function deleteDocumentBookmark(id: string): Promise<void> {
-  return invoke("delete_document_bookmark", { id });
-}
-
-/**
- * 2026-06-19:把案件源文件夹加进 asset 协议 scope(运行期、按案件授权),
- * 让源文件查看器能用流式 `asset://` 协议在 iframe 里原生渲染该案 PDF。
- * **打开查看器前必须 await 本调用**,否则 iframe 首次请求会 403(scope 未就绪)。
- */
-export function allowCaseAssets(folder: string): Promise<void> {
-  return invoke<void>("allow_case_assets", { folder });
-}
+export * from "./api/cases";
+export * from "./api/files";
 
 /* ------------------------------------------------------------------ */
 /* 用户设置                                                            */
@@ -325,7 +97,7 @@ export function verifyYuandianKey(apiKey: string): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_yuandian_key", { apiKey });
 }
 
-/** 2026-05-25 V0.1.8:检测远程最新版本(公开分发仓库的 version.json)。
+/** 2026-05-25 V0.1.8:检测远程最新版本(公开更新元数据 version.json)。
  *  失败时 has_update=false + error 字段填上原因,前端可静默忽略。*/
 export function checkForUpdate(): Promise<UpdateInfo> {
   return invoke<UpdateInfo>("check_for_update");
@@ -1164,6 +936,14 @@ export function saveFeedbackMd(
   description: string,
 ): Promise<string> {
   return invoke<string>("save_feedback_md", { info, description });
+}
+
+/** 用户确认后,把脱敏反馈上传到作者的 Supabase 私有收件箱。 */
+export function uploadFeedbackReport(
+  info: FeedbackDiagnostic,
+  description: string,
+): Promise<void> {
+  return invoke<void>("upload_feedback_report", { info, description });
 }
 
 /* ------------------------------------------------------------------ */

@@ -52,9 +52,10 @@ export function ExecutionModule({ onCalculateInterest }: Props) {
         const all = await listCases();
         if (!mountedRef.current) return;
         setCases(all);
-        // 每个案件拉 docs 给 inferStatus 用(跟首页 HomeView 同源)
+        // 先用 cases 聚合字段做候选预筛,避免每次进入执行 tab 都给全库案件拉完整 docs。
+        const candidates = all.filter(isExecutionCandidate);
         const pairs = await Promise.all(
-          all.map(async (c) => {
+          candidates.map(async (c) => {
             try {
               const r = await getCaseWithDocs(c.id);
               return [c.id, r.documents] as const;
@@ -154,6 +155,30 @@ export function ExecutionModule({ onCalculateInterest }: Props) {
       </div>
     </main>
   );
+}
+
+function isExecutionCandidate(caseData: Case): boolean {
+  if (caseData.workflow_status === "execution" || caseData.workflow_status === "执行中") {
+    return true;
+  }
+  if (
+    caseData.execution_started_at ||
+    caseData.execution_total != null ||
+    caseData.execution_received != null ||
+    caseData.execution_remaining != null
+  ) {
+    return true;
+  }
+  const haystack = [
+    caseData.stage,
+    caseData.agg_status_text,
+    caseData.case_summary,
+    caseData.agg_resolution,
+    caseData.agg_key_dates,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return /执行|执恢|执保|被执行人|执行标的|终本|限高|失信/.test(haystack);
 }
 
 function EmptyExecution() {

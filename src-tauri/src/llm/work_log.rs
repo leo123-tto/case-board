@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use super::capability::{LlmProviderKind, ProviderCapability};
+use super::gateway::{complete_non_stream_chat, LlmChatMessage, NonStreamChatRequest};
 use super::{LlmConfig, LlmError};
 
 #[derive(Debug, Deserialize)]
@@ -66,53 +68,31 @@ pub async fn organize(
          todos/deadlines 只是建议，不得声称已经写入系统。严格输出 JSON:\n\
          {{\"title\":\"\",\"kind\":\"\",\"summary\":\"\",\"progress\":[],\"todos\":[],\"deadlines\":[],\"risks\":[]}}"
     );
-    let is_minimax = config.endpoint.contains("chatcompletion_v2");
-    let mut body = serde_json::json!({
-        "model": config.model,
-        "messages": [
-            {"role":"system","content":"你是律师案件工作记录整理助手。忠实保留原意，区分事实、建议和待核实事项。"},
-            {"role":"user","content":prompt}
-        ],
-        "max_tokens": if is_minimax { 8192 } else { 4096 },
-        "temperature": config.temperature,
-        "stream": false
-    });
-    if !is_minimax {
-        body["response_format"] = serde_json::json!({"type":"json_object"});
-    }
-    let mut request = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout_secs * 2))
-        .build()
-        .map_err(|e| LlmError::Network(e.to_string()))?
-        .post(&config.endpoint)
-        .json(&body);
-    if let Some(key) = &config.api_key {
-        request = request.bearer_auth(key);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|e| LlmError::Network(e.to_string()))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(LlmError::HttpStatus(
-            status.as_u16(),
-            response.text().await.unwrap_or_default(),
-        ));
-    }
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LlmError::ResponseFormat(e.to_string()))?;
-    let content = json
-        .pointer("/choices/0/message/content")
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            json.pointer("/choices/0/message/reasoning_content")
-                .and_then(|value| value.as_str())
-        })
-        .ok_or_else(|| LlmError::ResponseFormat("工作记录整理响应无 content".into()))?;
-    let cleaned = super::extract_json_from_content(content);
+    let capability = ProviderCapability::from_backend("", &config.endpoint, &config.model);
+    let max_output_tokens = if capability.kind == LlmProviderKind::MiniMaxNative {
+        8192
+    } else {
+        4096
+    };
+    let output = complete_non_stream_chat(
+        config,
+        &capability,
+        NonStreamChatRequest {
+            messages: vec![
+                LlmChatMessage::system(
+                    "你是律师案件工作记录整理助手。忠实保留原意，区分事实、建议和待核实事项。",
+                ),
+                LlmChatMessage::user(prompt),
+            ],
+            max_output_tokens,
+            temperature: config.temperature,
+            timeout_secs: Some(config.timeout_secs * 2),
+            response_format_json_object: true,
+        },
+    )
+    .await
+    .map_err(super::gateway_error_to_llm_error)?;
+    let cleaned = super::extract_json_from_content(&output.content);
     let value: OrganizedLog = serde_json::from_str(&cleaned)
         .map_err(|e| LlmError::ContentJson(format!("{e}; raw={cleaned}")))?;
     Ok(render(value))

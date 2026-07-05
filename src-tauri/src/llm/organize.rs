@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::capability::{LlmProviderKind, ProviderCapability};
+use super::gateway::{complete_non_stream_chat, LlmChatMessage, NonStreamChatRequest};
 use super::{LlmConfig, LlmError};
 
 /// 喂给 AI 的单份材料(id + 文件名 + 正文摘要)。
@@ -148,62 +150,30 @@ pub async fn classify_documents(
         corpus.push('\n');
     }
 
-    let is_minimax = config.endpoint.contains("chatcompletion_v2");
-    let mut body = serde_json::json!({
-        "model": config.model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": corpus},
-        ],
-        "max_tokens": if is_minimax { 32768 } else { 8192 },
-        "temperature": config.temperature,
-        "stream": false,
-    });
-    if !is_minimax {
-        body["response_format"] = serde_json::json!({"type": "json_object"});
-    }
+    let capability = ProviderCapability::from_backend("", &config.endpoint, &config.model);
+    let max_output_tokens = if capability.kind == LlmProviderKind::MiniMaxNative {
+        32768
+    } else {
+        8192
+    };
+    let output = complete_non_stream_chat(
+        config,
+        &capability,
+        NonStreamChatRequest {
+            messages: vec![
+                LlmChatMessage::system(SYSTEM_PROMPT),
+                LlmChatMessage::user(corpus),
+            ],
+            max_output_tokens,
+            temperature: config.temperature,
+            timeout_secs: Some(config.timeout_secs * 3),
+            response_format_json_object: true,
+        },
+    )
+    .await
+    .map_err(super::gateway_error_to_llm_error)?;
 
-    let mut req = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.timeout_secs * 3))
-        .build()
-        .map_err(|e| LlmError::Network(e.to_string()))?
-        .post(&config.endpoint)
-        .json(&body);
-    if let Some(key) = &config.api_key {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req
-        .send()
-        .await
-        .map_err(|e| LlmError::Network(e.to_string()))?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        return Err(LlmError::HttpStatus(status.as_u16(), text));
-    }
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| LlmError::ResponseFormat(e.to_string()))?;
-
-    let first_message = json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"));
-    let content = first_message
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            first_message
-                .and_then(|m| m.get("reasoning_content"))
-                .and_then(|c| c.as_str())
-                .filter(|s| !s.trim().is_empty())
-        })
-        .ok_or_else(|| LlmError::ResponseFormat("AI 整理:响应无 content".to_string()))?;
-
-    let cleaned = super::extract_json_from_content(content);
+    let cleaned = super::extract_json_from_content(&output.content);
     let mut result = serde_json::from_str::<ClassifyResult>(&cleaned)
         .map_err(|e| LlmError::ContentJson(format!("{}\n---原始---\n{}", e, cleaned)))?;
     normalize_identity_material_classifications(docs, &mut result.items);

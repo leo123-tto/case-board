@@ -20,6 +20,7 @@ import {
   ChevronUp,
   Loader2,
   MessageCircle,
+  Send,
   X,
 } from "lucide-react";
 
@@ -30,6 +31,7 @@ import {
   type FeedbackDiagnostic,
   revealInFinder,
   saveFeedbackMd,
+  uploadFeedbackReport,
 } from "@/lib/api";
 import { snapshotConsoleErrors } from "@/lib/console-tap";
 
@@ -74,6 +76,9 @@ function FeedbackModal({ onClose }: { onClose: () => void }) {
   const [description, setDescription] = useState("");
   const [showDiag, setShowDiag] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploaded, setUploaded] = useState(false);
+  const [uploadErr, setUploadErr] = useState<string | null>(null);
   const [savedPath, setSavedPath] = useState<string | null>(null);
 
   // 启动时拉诊断(把已累积的 console 错误一起带过去)
@@ -92,7 +97,7 @@ function FeedbackModal({ onClose }: { onClose: () => void }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose, submitting]);
 
-  const handleSubmit = async () => {
+  const handleSaveLocal = async () => {
     if (!diag) return;
     setSubmitting(true);
     try {
@@ -105,7 +110,21 @@ function FeedbackModal({ onClose }: { onClose: () => void }) {
     }
   };
 
-  // ── 成功态:显示文件位置 + Finder 打开按钮 ──
+  const handleUpload = async () => {
+    if (!diag) return;
+    setUploading(true);
+    setUploadErr(null);
+    try {
+      await uploadFeedbackReport(diag, description);
+      setUploaded(true);
+    } catch (e) {
+      setUploadErr(String(e));
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  // ── 成功态:显示文件位置 + Finder 打开按钮 + 一键邮件 ──
   if (savedPath) {
     return (
       <SavedFeedbackPanel savedPath={savedPath} onClose={onClose} />
@@ -167,22 +186,52 @@ function FeedbackModal({ onClose }: { onClose: () => void }) {
         </div>
 
         {/* 按钮行 */}
-        <div className="flex items-center justify-between gap-2 pt-2">
-          <span className="text-caption text-muted-foreground">
-            ID:{diag?.client_id_short ?? "—"} · 匿名
-          </span>
-          <div className="flex gap-2">
+        {uploaded && (
+          <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900">
+            已上传给维护者。维护者会在反馈后台查看和处理。
+          </div>
+        )}
+        {uploadErr && (
+          <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+            上传失败:{uploadErr}。可以先保存到本地后手工发送。
+          </div>
+        )}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+          <div className="flex flex-col gap-1">
+            <span className="text-caption text-muted-foreground">
+              ID:{diag?.client_id_short ?? "—"} · 匿名
+            </span>
+            <button
+              type="button"
+              onClick={handleSaveLocal}
+              disabled={submitting || uploading || !diag}
+              className="inline-flex items-center gap-1 text-left text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {submitting && <Loader2 className="size-3 animate-spin" />}
+              仅生成本地 MD
+            </button>
+          </div>
+          <div className="flex flex-wrap justify-end gap-2">
             <Button
               variant="outline"
               size="sm"
               onClick={onClose}
-              disabled={submitting}
+              disabled={submitting || uploading}
             >
-              取消
+              {uploaded ? "完成" : "取消"}
             </Button>
-            <Button size="sm" onClick={handleSubmit} disabled={submitting || !diag}>
-              {submitting && <Loader2 className="size-3 animate-spin" />}
-              生成反馈文件 → 桌面
+            <Button
+              size="sm"
+              onClick={handleUpload}
+              disabled={uploading || submitting || !diag || uploaded}
+              className="bg-foreground text-background hover:bg-foreground/90"
+            >
+              {uploading ? (
+                <Loader2 className="size-3 animate-spin" />
+              ) : (
+                <Send className="size-3.5" />
+              )}
+              {uploaded ? "已上传" : "上传给维护者"}
             </Button>
           </div>
         </div>
@@ -191,7 +240,7 @@ function FeedbackModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-/* ============================ 反馈生成后面板 ============================ */
+/* ============================ 反馈生成后面板(含邮件发送) ============================ */
 function SavedFeedbackPanel({
   savedPath,
   onClose,
@@ -213,7 +262,7 @@ function SavedFeedbackPanel({
         </div>
 
         <p className="text-xs text-muted-foreground">
-          反馈文件只保存在本机。可以先在 Finder 中查看,确认后再自行发送给项目维护者。
+          可以在 Finder 中显示后,通过你习惯的方式把 MD 发给维护者。
         </p>
 
         <div className="flex flex-wrap justify-end gap-2 pt-2">

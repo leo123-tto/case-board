@@ -1037,7 +1037,7 @@ function MainApp() {
   }, []);
 
   // macOS 键盘快捷键
-  //   Cmd+O 导入 / Cmd+, 设置 / Cmd+R 重扫
+  //   Cmd+O 导入 / Cmd+, 设置 / Cmd+R 刷新当前案件源文件
   // 必须在所有 early return 之前(React Hooks 规则:每次 render 调用相同顺序的 hooks)
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -1056,14 +1056,14 @@ function MainApp() {
         case "R":
           if (selectedCase) {
             e.preventDefault();
-            handleImport();
+            void handleRefreshFiles();
           }
           break;
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleImport, selectedCase, openSettings]);
+  }, [handleImport, handleRefreshFiles, selectedCase, openSettings]);
 
   // ========================================================================
   // 所有 hooks 声明完毕,以下可以做条件渲染 / 路由

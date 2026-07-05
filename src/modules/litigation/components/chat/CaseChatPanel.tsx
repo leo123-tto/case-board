@@ -302,6 +302,8 @@ export function CaseChatPanel({
   // V0.3 · 模型调 ask_user 发起的选项式追问;非 null 时在末尾渲染选项卡片。
   // 任何新消息(点选项 / 自己发)开头即清,切案件也清。
   const [pendingAsk, setPendingAsk] = useState<AskQuestion[] | null>(null);
+  const [pendingAskTaskType, setPendingAskTaskType] =
+    useState<CaseChatTaskType | null>(null);
   // 2026-05-31 · 流式状态来自模块级 registry(跨面板卸载存活)。forceRerender 强制重渲染。
   const [, forceRerender] = useState(0);
   const run = getRun(caseId);
@@ -476,6 +478,7 @@ export function CaseChatPanel({
     setMemoryError(null);
     // V0.3 · 切案件清掉上一个案件遗留的选项卡片
     setPendingAsk(null);
+    setPendingAskTaskType(null);
     if (!caseId || collapsed) return;
     let abort = false;
     setHistoryLoading(true);
@@ -580,6 +583,7 @@ export function CaseChatPanel({
     setError(null);
     // V0.3 · 新一轮开始,上一轮的选项卡片作废(点了选项 or 自己发都算回答了)
     setPendingAsk(null);
+    setPendingAskTaskType(null);
 
     // 在模块级 registry 起监听(跨面板卸载存活)
     const ok = await startRun(caseId, messageId);
@@ -616,6 +620,7 @@ export function CaseChatPanel({
       setHistory(fresh);
       // V0.3 · 模型这轮发起了选项式追问 → 末尾渲染选项卡片,等用户点选/填写
       setPendingAsk(result.ask_user ?? null);
+      setPendingAskTaskType(result.ask_user?.length ? taskType : null);
       // V0.3 · **只有「写文书」(save_artifact)才自动进编辑器**。分析类任务(类案检索/法律依据
       // 等)也会落 artifact_doc_id(write_chat_artifact),但它们是分析产物、不该自动跳编辑器
       //(老板真机反馈)—— 只 reload 让它出现在文档列表,用户想编辑再手动点。
@@ -938,7 +943,7 @@ export function CaseChatPanel({
           <AskUserCard
             questions={pendingAsk}
             disabled={disabled}
-            onSubmit={(text) => send(text, null)}
+            onSubmit={(text) => send(text, pendingAskTaskType)}
           />
         )}
       </div>

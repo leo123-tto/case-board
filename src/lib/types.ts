@@ -154,6 +154,13 @@ export interface Case {
    * 全局抽不再用 LLM 值覆盖(修「结案/手设状态被重新分析刷新掉」)。
    */
   workflow_status_locked: number;
+
+  /** 2026-07-04(migration 0039):最近一次全案分析使用的材料输入签名。 */
+  analysis_input_signature: string | null;
+  /** 1 = 当前材料集变更后尚未重新跑全案分析。 */
+  analysis_stale: number;
+  /** 分析过期原因,如 source_files_changed / document_reextract_requested。 */
+  analysis_stale_reason: string | null;
 }
 
 /**
@@ -233,6 +240,8 @@ export interface Document {
   deleted_at: string | null;
   /** 抽出来的 .md 文件落盘路径(extracts/<case_id>/<doc_id>.md) */
   extracted_text_path: string | null;
+  /** 抽取正文稳定哈希,用于本地分析/embedding 缓存失效。 */
+  extracted_text_hash: string | null;
   /** 缓存键 = "<mtime>:<size>" */
   cache_key: string | null;
   /**

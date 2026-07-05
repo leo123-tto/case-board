@@ -26,6 +26,26 @@ pub async fn telemetry_get(
 }
 
 #[tauri::command]
+pub async fn telemetry_patch(
+    _base: String,
+    _key: String,
+    _path: String,
+    _body: String,
+) -> Result<String, String> {
+    Err(private_unavailable())
+}
+
+#[tauri::command]
+pub async fn private_usage_event_cache_read() -> Result<Option<String>, String> {
+    Err(private_unavailable())
+}
+
+#[tauri::command]
+pub async fn private_usage_event_cache_write(_body: String) -> Result<(), String> {
+    Err(private_unavailable())
+}
+
+#[tauri::command]
 pub async fn reset_yuandian_credits(_pool: tauri::State<'_, SqlitePool>) -> Result<u64, String> {
     Err(private_unavailable())
 }

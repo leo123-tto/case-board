@@ -133,17 +133,14 @@ impl Tool for WebFetch {
     }
 
     async fn execute(&self, args: &Value, _ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
-        let url = validate_public_http_url(require_str(args, "url")?)?;
+        let url = validate_public_http_url_for_request(require_str(args, "url")?).await?;
         let max_chars = opt_u32(args, "max_chars")
             .map(|n| n as usize)
             .unwrap_or(20_000)
             .clamp(1_000, FETCH_MAX_CHARS);
         let client = web_client()?;
-        let resp = client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|e| ToolError::Runtime(format!("网页读取失败:{e}")))?
+        let resp = fetch_public_url(&client, url).await?;
+        let resp = resp
             .error_for_status()
             .map_err(|e| ToolError::Runtime(format!("网页 HTTP 错误:{e}")))?;
         let final_url = resp.url().to_string();
@@ -186,9 +183,36 @@ fn web_client() -> Result<reqwest::Client, ToolError> {
     reqwest::Client::builder()
         .user_agent(WEB_USER_AGENT)
         .timeout(Duration::from_secs(WEB_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ToolError::Runtime(format!("初始化联网客户端失败:{e}")))
+}
+
+async fn fetch_public_url(
+    client: &reqwest::Client,
+    mut url: Url,
+) -> Result<reqwest::Response, ToolError> {
+    for redirect_count in 0..=5 {
+        ensure_url_resolves_public(&url).await?;
+        let resp = client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| ToolError::Runtime(format!("网页读取失败:{e}")))?;
+        if !resp.status().is_redirection() {
+            return Ok(resp);
+        }
+        if redirect_count == 5 {
+            return Err(ToolError::Runtime("网页跳转次数过多".into()));
+        }
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| ToolError::Runtime("网页返回跳转但缺少 Location".into()))?;
+        url = validate_redirect_target(&url, location)?;
+    }
+    Err(ToolError::Runtime("网页跳转处理失败".into()))
 }
 
 fn is_supported_content_type(content_type: &str) -> bool {
@@ -220,6 +244,39 @@ fn validate_public_http_url(raw: &str) -> Result<Url, ToolError> {
     Ok(url)
 }
 
+async fn validate_public_http_url_for_request(raw: &str) -> Result<Url, ToolError> {
+    let url = validate_public_http_url(raw)?;
+    ensure_url_resolves_public(&url).await?;
+    Ok(url)
+}
+
+async fn ensure_url_resolves_public(url: &Url) -> Result<(), ToolError> {
+    let Some(host) = url.host_str() else {
+        return Err(ToolError::InvalidArgs("URL 缺少 host".into()));
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| ToolError::Runtime(format!("解析网页域名失败:{e}")))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(ToolError::Runtime("网页域名没有解析结果".into()));
+    }
+    if addrs.iter().any(|addr| ip_is_blocked(addr.ip())) {
+        return Err(ToolError::InvalidArgs(
+            "拒绝读取解析到 localhost、内网、link-local 或保留地址的 URL".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_redirect_target(base: &Url, location: &str) -> Result<Url, ToolError> {
+    let next = base
+        .join(location)
+        .map_err(|e| ToolError::Runtime(format!("网页跳转 URL 无效:{e}")))?;
+    validate_public_http_url(next.as_str())
+}
+
 fn host_is_blocked(host: &str) -> bool {
     let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
     if h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local") {
@@ -229,6 +286,13 @@ fn host_is_blocked(host: &str) -> bool {
         Ok(IpAddr::V4(ip)) => ipv4_is_blocked(ip),
         Ok(IpAddr::V6(ip)) => ipv6_is_blocked(ip),
         Err(_) => false,
+    }
+}
+
+fn ip_is_blocked(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ipv4_is_blocked(ip),
+        IpAddr::V6(ip) => ipv6_is_blocked(ip),
     }
 }
 

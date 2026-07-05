@@ -2,11 +2,11 @@
 //!
 //! 职责:把案件「材料文档」全文(`extracts/<case_id>/<doc_id>.md`)切成 ~500 字片段、
 //! embed 成向量、按余弦相似度对用户 query 做 top-N 检索。向量缓存落
-//! `embeddings/<case_id>.json`,按 `documents.cache_key` 增量失效(文件变了才重 embed)。
+//! `embeddings/<case_id>.json`,按 `documents.cache_key + extracted_text_hash` 增量失效。
 //!
 //! 设计要点:
-//!   - **懒加载 + 增量**:首次检索才建索引;之后只对 cache_key 变了 / 新增的文档重 embed,
-//!     未变的直接复用旧向量(命中现有 cache_key 失效模式,坑#11 同源思路)。
+//!   - **懒加载 + 增量**:首次检索才建索引;之后只对源文件 cache_key 或抽取正文 hash
+//!     变了 / 新增的文档重 embed,未变的直接复用旧向量。
 //!   - **模型签名**:换 embedding endpoint/model → signature 变 → 整库失效重建(维度也会变,
 //!     旧向量跟新 query 维度不一致,cosine 直接返 0,必须重建)。
 //!   - **材料集对齐 constitution**:只索引 `!is_ai_artifact && !归档类` 且有全文的文档,
@@ -78,6 +78,16 @@ pub fn is_indexable(d: &Document) -> bool {
         && d.deleted_at.is_none()
         && d.extracted_text_path.is_some()
         && !crate::ingest::pipeline::is_archival_category(d.category.as_deref())
+}
+
+/// embedding 有效缓存键:源文件没变但抽取正文变了时也必须重建向量。
+pub fn embedding_doc_cache_key(d: &Document) -> Option<String> {
+    match (&d.cache_key, &d.extracted_text_hash) {
+        (Some(cache_key), Some(text_hash)) => Some(format!("{cache_key}|{text_hash}")),
+        (Some(cache_key), None) => Some(cache_key.clone()),
+        (None, Some(text_hash)) => Some(format!("text:{text_hash}")),
+        (None, None) => None,
+    }
 }
 
 /// embedding 模型签名("<endpoint>|<model>")。留空时用默认值,跟 `embedding::embed` 兜底一致。
@@ -273,7 +283,7 @@ pub async fn build_or_update_index(
     let existing = load_index(case_id).await;
     let current: Vec<(String, Option<String>)> = indexable
         .iter()
-        .map(|d| (d.id.clone(), d.cache_key.clone()))
+        .map(|d| (d.id.clone(), embedding_doc_cache_key(d)))
         .collect();
     let plan = plan_update(&existing, &sig, &current);
 
@@ -307,7 +317,7 @@ pub async fn build_or_update_index(
             doc_id: d.id.clone(),
             filename: d.filename.clone(),
             category: d.category.clone(),
-            cache_key: d.cache_key.clone(),
+            cache_key: embedding_doc_cache_key(d),
             chunks,
         });
     }

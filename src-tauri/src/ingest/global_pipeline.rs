@@ -51,6 +51,33 @@ pub struct ReaggregateReport {
     pub failures: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnalysisInputPart {
+    doc_id: String,
+    filename: String,
+    category: Option<String>,
+    stage: Option<String>,
+    text_hash: String,
+}
+
+fn analysis_input_signature(parts: &[AnalysisInputPart]) -> String {
+    let mut lines: Vec<String> = parts
+        .iter()
+        .map(|p| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                p.doc_id,
+                p.filename,
+                p.category.as_deref().unwrap_or(""),
+                p.stage.as_deref().unwrap_or(""),
+                p.text_hash
+            )
+        })
+        .collect();
+    lines.sort();
+    crate::db::documents::stable_text_hash(&lines.join("\n"))
+}
+
 /// 跑一次案件全局抽。两次 LLM call **并发跑**(call A 表格 + call B 报告)。
 pub async fn run_global_extract(
     pool: &SqlitePool,
@@ -67,9 +94,10 @@ pub async fn run_global_extract(
         Option<String>,
         Option<String>,
         String,
+        Option<String>,
     );
     let rows: Vec<DocRow> = match sqlx::query_as(
-        "SELECT id, filename, category, stage, extracted_text_path, source_path \
+        "SELECT id, filename, category, stage, extracted_text_path, source_path, extracted_text_hash \
          FROM documents \
          WHERE case_id = ? AND deleted_at IS NULL AND extracted_text_path IS NOT NULL \
            AND (extraction_status = 'done' OR extraction_status = 'failed') \
@@ -131,7 +159,8 @@ pub async fn run_global_extract(
     // 2. 读 MD 文件内容(本地 IO,blocking,但量小可接受)
     let mut docs: Vec<DocInput> = Vec::with_capacity(rows.len());
     let mut payment_sources: Vec<PaymentSourceDoc> = Vec::with_capacity(rows.len());
-    for (id, filename, category, stage, text_path, source_path) in &rows {
+    let mut signature_parts: Vec<AnalysisInputPart> = Vec::with_capacity(rows.len());
+    for (id, filename, category, stage, text_path, source_path, extracted_text_hash) in &rows {
         if crate::ingest::pipeline::is_archival_category(category.as_deref()) {
             continue;
         }
@@ -141,11 +170,21 @@ pub async fn run_global_extract(
         };
         match std::fs::read_to_string(p) {
             Ok(content) => {
+                let text_hash = extracted_text_hash
+                    .clone()
+                    .unwrap_or_else(|| crate::db::documents::stable_text_hash(&content));
                 docs.push(DocInput {
                     filename: filename.clone(),
                     category: category.clone(),
                     stage: stage.clone(),
                     text_md: content,
+                });
+                signature_parts.push(AnalysisInputPart {
+                    doc_id: id.clone(),
+                    filename: filename.clone(),
+                    category: category.clone(),
+                    stage: stage.clone(),
+                    text_hash,
                 });
                 payment_sources.push(PaymentSourceDoc {
                     id: id.clone(),
@@ -170,6 +209,7 @@ pub async fn run_global_extract(
     }
 
     let docs_count = docs.len();
+    let input_signature = analysis_input_signature(&signature_parts);
     let corpus = build_corpus(&docs);
     crate::dlog!(
         "[global_extract] case={} 拼了 {} 份 MD,{} chars(~{} tokens)",
@@ -207,6 +247,11 @@ pub async fn run_global_extract(
                 write_table_to_cases(pool, case_id, &r.table, report_path.as_deref()).await
             {
                 crate::dlog!("[global_extract] 写 cases 失败:{}", e);
+            } else if let Err(e) =
+                crate::db::ai_jobs::mark_case_analysis_current(pool, case_id, &input_signature)
+                    .await
+            {
+                crate::dlog!("[global_extract] 写分析输入签名失败:{}", e);
             }
             // 2026-06-11 审级模型:instances 落库 + 当前审级快照回写 agg_*
             if let Err(e) = write_instances(pool, case_id, &r.table.instances).await {

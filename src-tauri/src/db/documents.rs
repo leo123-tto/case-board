@@ -27,6 +27,8 @@ pub struct Document {
     pub deleted_at: Option<String>,
     /// 抽出来的 .md 文件落盘路径(extracts/<case_id>/<doc_id>.md)
     pub extracted_text_path: Option<String>,
+    /// 抽取正文的稳定哈希。用于判断分析输入和 embedding 缓存是否真的过期。
+    pub extracted_text_hash: Option<String>,
     /// 缓存键 = "<modified_at>:<size>",变了就重抽
     pub cache_key: Option<String>,
     /// 2026-05-25 加(migration 0014):最近一次抽取失败的错误信息。
@@ -54,6 +56,16 @@ pub struct Document {
 
 fn make_cache_key(modified_at: Option<&str>, size_bytes: u64) -> String {
     format!("{}:{}", modified_at.unwrap_or(""), size_bytes)
+}
+
+/// 非安全用途的稳定文本哈希。只用于本地缓存/陈旧判断,不当加密摘要。
+pub fn stable_text_hash(text: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 /// 同步结果统计(给前端 Toast / 日志用)。
@@ -200,7 +212,7 @@ pub async fn sync_documents_for_case(
                     "UPDATE documents SET \
                        filename = ?, stage = ?, category = ?, is_ai_artifact = ?, \
                        size_bytes = ?, modified_at = ?, cache_key = ?, \
-                       extracted_fields = NULL, extracted_text_path = NULL, \
+                       extracted_fields = NULL, extracted_text_path = NULL, extracted_text_hash = NULL, \
                        extraction_status = 'pending', deleted_at = NULL \
                      WHERE id = ?",
                 )
@@ -352,7 +364,7 @@ pub async fn get_document_by_id(
 /// run_extraction 只处理 pending,故重置后再 spawn_extraction 即会重抽该文档。返回受影响行数。
 pub async fn reset_for_reextract(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
     let res = sqlx::query(
-        "UPDATE documents SET extraction_status = 'pending', last_error = NULL \
+        "UPDATE documents SET extraction_status = 'pending', last_error = NULL, extracted_text_hash = NULL \
          WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(id)

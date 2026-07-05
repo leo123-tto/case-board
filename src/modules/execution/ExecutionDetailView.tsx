@@ -1066,6 +1066,7 @@ function paymentSourceDoc(payment: Payment, docs: Document[]): Document | null {
     created_at: payment.created_at,
     deleted_at: null,
     extracted_text_path: null,
+    extracted_text_hash: null,
     cache_key: null,
     pinned_at: null,
     ocr_backend_override: null,

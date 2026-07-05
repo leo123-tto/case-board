@@ -132,24 +132,32 @@ export function TeamModule() {
   }
 
   const isLeader = view.my_role === "leader";
+  const detailOwner = detail
+    ? view.members.find((m) => m.member_id === detail.memberId)
+    : null;
+  const detailCase =
+    detailOwner && detail
+      ? detailOwner.cases.find((x) => x.id === detail.caseId)
+      : null;
+
+  useEffect(() => {
+    if (detail && !detailCase) {
+      setDetail(null);
+    }
+  }, [detail, detailCase]);
 
   // 详情页:从最新 view 里找(同步后数据自动更新);案件没了(对方删了)自动回列表
-  if (detail) {
-    const owner = view.members.find((m) => m.member_id === detail.memberId);
-    const c = owner?.cases.find((x) => x.id === detail.caseId);
-    if (owner && c) {
-      return (
-        <TeamCaseDetail
-          c={c}
-          owner={owner}
-          edits={view.edits}
-          myId={view.my_member_id}
-          onBack={() => setDetail(null)}
-          onChanged={() => void reload()}
-        />
-      );
-    }
-    setDetail(null);
+  if (detailOwner && detailCase) {
+    return (
+      <TeamCaseDetail
+        c={detailCase}
+        owner={detailOwner}
+        edits={view.edits}
+        myId={view.my_member_id}
+        onBack={() => setDetail(null)}
+        onChanged={() => void reload()}
+      />
+    );
   }
 
   return (

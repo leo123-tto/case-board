@@ -115,6 +115,13 @@ pub struct Case {
     /// 1 = 用户在卡片右上角手动选过 workflow_status → 全局抽不再用 LLM 值覆盖;
     /// 0 = 走自动推断。修「结案/手设状态被重新分析刷新掉」的 bug。
     pub workflow_status_locked: i64,
+
+    /// 2026-07-04 加(migration 0039):最近一次全案分析使用的材料输入签名。
+    pub analysis_input_signature: Option<String>,
+    /// 1 = 当前材料集变更后尚未重新跑全案分析。
+    pub analysis_stale: i64,
+    /// 分析过期原因,如 source_files_changed / document_reextract_requested。
+    pub analysis_stale_reason: Option<String>,
 }
 
 /// 仅取用户在详情页确认/纠正的我方立场(user_overrides_json.fields.agg_our_side)。空返回 None。

@@ -30,6 +30,7 @@ telemetry/.env.telemetry*
 data/
 *.db
 *.db-journal
+feedback-inbox/
 
 # Superpowers scratch
 .superpowers/

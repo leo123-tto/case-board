@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { CloudSun } from "lucide-react";
+import { CloudSun, RefreshCw } from "lucide-react";
 
 import poseBriefcase from "@/assets/caseboard-companion/caseboard-companion-pose-briefcase-2026-06-28.png";
 import poseChecklist from "@/assets/caseboard-companion/caseboard-companion-pose-checklist-2026-06-28.png";
@@ -7,16 +7,23 @@ import poseFiles from "@/assets/caseboard-companion/caseboard-companion-pose-fil
 import poseNeutral from "@/assets/caseboard-companion/caseboard-companion-pose-neutral-2026-06-28.png";
 import poseWriting from "@/assets/caseboard-companion/caseboard-companion-pose-writing-2026-06-28.png";
 import { generateHomeGreeting, type HomeGreetingResponse } from "@/lib/api";
+import {
+  buildGreetingCacheKey,
+  isGreetingTextCompatible,
+  isUsableCachedWeather,
+  isStaleIso,
+  shouldRefreshWeather,
+  timeOfDay,
+  todayLocalIso,
+  weatherDisplaySummary,
+  weatherSummaryForGreeting,
+} from "./homeCompanionLogic";
 
-const GREETING_KEY_PREFIX = "caseboard:home-companion:greeting:";
-const WEATHER_KEY_PREFIX = "caseboard:home-companion:weather:";
-const GREETING_REFRESH_KEY_PREFIX = "caseboard:home-companion:greeting-refresh:";
-const GEOLOCATION_TIMEOUT_MS = 5000;
-const WEATHER_FETCH_TIMEOUT_MS = 2500;
-const IP_LOCATION_TIMEOUT_MS = 2500;
-const WEATHER_CACHE_TTL_MS = 1000 * 60 * 60 * 3;
-const GREETING_MIN_REFRESH_MS = 1000 * 60 * 60 * 2;
-const GREETING_JITTER_MS = 1000 * 60 * 45;
+const GREETING_KEY_PREFIX = "caseboard:home-companion:greeting:v2:";
+const WEATHER_KEY_PREFIX = "caseboard:home-companion:weather:v2:";
+const GEOLOCATION_TIMEOUT_MS = 8000;
+const WEATHER_FETCH_TIMEOUT_MS = 5000;
+const GREETING_CACHE_TTL_MS = 1000 * 60 * 90;
 
 interface CachedGreeting {
   text: string;
@@ -56,87 +63,170 @@ export function HomeCompanionStrip({
   activeCaseCount: number;
   reminderSummaries: string[];
 }) {
-  const today = useMemo(() => todayLocalIso(), []);
+  const clock = useCompanionClock();
+  const localDate = useMemo(() => todayLocalIso(clock), [clock]);
+  const currentPeriod = useMemo(() => timeOfDay(clock), [clock]);
   const companionMode = useMemo(
-    () => resolveCompanionMode({ today, activeCaseCount, reminderSummaries }),
-    [activeCaseCount, reminderSummaries, today],
+    () => resolveCompanionMode({ today: localDate, activeCaseCount, reminderSummaries }),
+    [activeCaseCount, reminderSummaries, localDate],
   );
-  const [greeting, setGreeting] = useState<CachedGreeting>(() =>
-    readCachedGreeting(today) ?? {
-      text: fallbackGreeting(displayName, timeOfDay(), companionMode),
-      source: "fallback",
-      generated_at: new Date().toISOString(),
-    },
-  );
+  const assistantMode = companionModeLabel(companionMode);
+  const [greeting, setGreeting] = useState<CachedGreeting>(() => {
+    const initialDate = todayLocalIso();
+    const initialPeriod = timeOfDay();
+    const initialWeather = readCachedWeather(initialDate);
+    const initialMode = resolveCompanionMode({
+      today: initialDate,
+      activeCaseCount,
+      reminderSummaries,
+    });
+    const initialKey = buildGreetingCacheKey({
+      localDate: initialDate,
+      timeOfDay: initialPeriod,
+      weatherSummary: initialWeather?.summary ?? null,
+      assistantMode: companionModeLabel(initialMode),
+      activeCaseCount,
+      reminderSummaries,
+    });
+    return (
+      readCachedGreeting(initialKey, initialPeriod, weatherSummaryForGreeting(initialWeather)) ?? {
+        text: fallbackGreeting(displayName, initialPeriod, initialMode),
+        source: "fallback",
+        generated_at: new Date().toISOString(),
+      }
+    );
+  });
   const [greetingRefreshing, setGreetingRefreshing] = useState(false);
-  const [weather, setWeather] = useState<WeatherState>(() => ({
-    status: "idle",
-    value: readCachedWeather(today),
-    error: null,
-  }));
+  const [weather, setWeather] = useState<WeatherState>(() => {
+    const initialDate = todayLocalIso();
+    return {
+      status: "idle",
+      value: readCachedWeather(initialDate),
+      error: null,
+    };
+  });
 
-  const weatherSummary = weather.value?.summary ?? null;
+  const weatherSummary = useMemo(() => weatherSummaryForGreeting(weather.value), [weather.value]);
+  const greetingCacheKey = useMemo(
+    () =>
+      buildGreetingCacheKey({
+        localDate,
+        timeOfDay: currentPeriod,
+        weatherSummary,
+        assistantMode,
+        activeCaseCount,
+        reminderSummaries,
+      }),
+    [activeCaseCount, assistantMode, currentPeriod, localDate, reminderSummaries, weatherSummary],
+  );
 
   const refreshGreeting = useCallback(
-    async (forceRefresh = false) => {
+    async ({
+      forceRefresh = false,
+      weatherSummaryOverride,
+    }: {
+      forceRefresh?: boolean;
+      weatherSummaryOverride?: string | null;
+    } = {}) => {
+      const requestDate = todayLocalIso();
+      const requestPeriod = timeOfDay();
+      const requestMode = resolveCompanionMode({
+        today: requestDate,
+        activeCaseCount,
+        reminderSummaries,
+      });
+      const requestAssistantMode = companionModeLabel(requestMode);
+      const effectiveWeatherSummary = weatherSummaryOverride ?? weatherSummary;
+      const requestCacheKey = buildGreetingCacheKey({
+        localDate: requestDate,
+        timeOfDay: requestPeriod,
+        weatherSummary: effectiveWeatherSummary,
+        assistantMode: requestAssistantMode,
+        activeCaseCount,
+        reminderSummaries,
+      });
+
       setGreetingRefreshing(true);
       try {
         const result = await generateHomeGreeting({
           display_name: displayName,
-          weather_summary: weatherSummary,
+          weather_summary: effectiveWeatherSummary,
           active_case_count: activeCaseCount,
           reminder_summaries: reminderSummaries,
-          assistant_mode: companionModeLabel(companionMode),
-          local_date: today,
-          time_of_day: timeOfDay(),
+          assistant_mode: requestAssistantMode,
+          local_date: requestDate,
+          time_of_day: requestPeriod,
           force_refresh: forceRefresh,
         });
         const next = responseToCache(result);
         setGreeting(next);
-        writeCachedGreeting(today, next);
+        writeCachedGreeting(requestCacheKey, next);
       } catch {
         // 首页问候是环境信息,失败不打扰主流程。
       } finally {
         setGreetingRefreshing(false);
       }
     },
-    [activeCaseCount, companionMode, displayName, reminderSummaries, today, weatherSummary],
+    [activeCaseCount, displayName, reminderSummaries, weatherSummary],
   );
 
   useEffect(() => {
-    const cached = readCachedGreeting(today);
-    if (cached && !shouldRefreshGreeting(today)) return;
-    const delay = stableRefreshDelay(today);
-    const id = window.setTimeout(() => {
-      void refreshGreeting(Boolean(cached));
-      writeGreetingRefresh(today);
-    }, delay);
-    return () => window.clearTimeout(id);
-  }, [refreshGreeting, today]);
-
-  const refreshWeather = useCallback(async () => {
-    setWeather((prev) => ({ status: "locating", value: prev.value, error: null }));
-    try {
-      const location = await resolveWeatherLocation();
-      setWeather((prev) => ({ status: "fetching", value: prev.value, error: null }));
-      const next = await fetchWeather(location);
-      writeCachedWeather(today, next);
-      setWeather({ status: "idle", value: next, error: null });
-      void refreshGreeting(false);
-    } catch (e) {
-      const message = weatherErrorMessage(e);
-      setWeather((prev) => ({ status: "idle", value: prev.value, error: message }));
+    const cached = readCachedGreeting(greetingCacheKey, currentPeriod, weatherSummary);
+    if (cached && !isStaleIso(cached.generated_at, GREETING_CACHE_TTL_MS)) {
+      setGreeting(cached);
+      return;
     }
-  }, [today, refreshGreeting]);
-
-  useEffect(() => {
-    const cached = readCachedWeather(today);
-    if (cached && !isStaleIso(cached.generated_at, WEATHER_CACHE_TTL_MS)) return;
+    if (greetingRefreshing) return;
+    setGreeting(
+      cached ?? {
+        text: fallbackGreeting(displayName, currentPeriod, companionMode),
+        source: "fallback",
+        generated_at: new Date().toISOString(),
+      },
+    );
     const id = window.setTimeout(() => {
-      void refreshWeather();
+      void refreshGreeting({ forceRefresh: Boolean(cached) });
     }, 250);
     return () => window.clearTimeout(id);
-  }, [refreshWeather, today]);
+  }, [companionMode, currentPeriod, displayName, greetingCacheKey, greetingRefreshing, refreshGreeting]);
+
+  const refreshWeather = useCallback(
+    async (forceGreetingRefresh = false) => {
+      setWeather((prev) => ({ status: "locating", value: prev.value, error: null }));
+      try {
+        const location = await resolveWeatherLocation();
+        setWeather((prev) => ({ status: "fetching", value: prev.value, error: null }));
+        const next = await fetchWeather(location);
+        if (isUsableCachedWeather(next)) writeCachedWeather(todayLocalIso(), next);
+        setWeather({ status: "idle", value: next, error: null });
+        void refreshGreeting({
+          forceRefresh: forceGreetingRefresh,
+          weatherSummaryOverride: weatherSummaryForGreeting(next),
+        });
+      } catch (e) {
+        const message = weatherErrorMessage(e);
+        setWeather((prev) => ({ status: "idle", value: prev.value, error: message }));
+        if (forceGreetingRefresh) void refreshGreeting({ forceRefresh: true });
+      }
+    },
+    [refreshGreeting],
+  );
+
+  useEffect(() => {
+    const cached = readCachedWeather(localDate);
+    if (cached && cached.generated_at !== weather.value?.generated_at) {
+      setWeather({ status: "idle", value: cached, error: null });
+    }
+    if (cached && !shouldRefreshWeather(cached)) return;
+    const id = window.setTimeout(() => {
+      void refreshWeather(false);
+    }, 250);
+    return () => window.clearTimeout(id);
+  }, [localDate, refreshWeather, weather.value?.generated_at]);
+
+  const handleManualRefresh = useCallback(() => {
+    void refreshWeather(true);
+  }, [refreshWeather]);
 
   const weatherBusy = weather.status === "locating" || weather.status === "fetching";
   const weatherLabel =
@@ -144,7 +234,7 @@ export function HomeCompanionStrip({
       ? "正在定位..."
       : weather.status === "fetching"
         ? "正在查询天气..."
-        : weather.value?.summary ?? (weather.error ? "天气获取失败" : "天气未更新");
+        : weatherDisplaySummary(weather.value) ?? (weather.error ? "天气获取失败" : "天气未更新");
   const companionPose = pickCompanionPose({
     mode: companionMode,
     weatherBusy,
@@ -171,7 +261,14 @@ export function HomeCompanionStrip({
           </span>
         </div>
         <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-          <span className="inline-flex items-center gap-1" title={weather.value?.detail ?? undefined}>
+          <span
+            className="inline-flex items-center gap-1"
+            title={
+              weather.value?.source === "网络定位"
+                ? "系统定位失败，未使用网络估算天气"
+                : weather.value?.detail ?? undefined
+            }
+          >
             <CloudSun className="size-3" />
             {weatherLabel}
           </span>
@@ -180,6 +277,16 @@ export function HomeCompanionStrip({
               {weather.value ? "使用缓存" : weather.error}
             </span>
           )}
+          <button
+            type="button"
+            className="inline-flex size-5 items-center justify-center rounded border border-transparent text-muted-foreground/70 transition hover:border-border hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            title="刷新案件助手"
+            onClick={handleManualRefresh}
+            disabled={weatherBusy || greetingRefreshing}
+          >
+            <RefreshCw className={weatherBusy || greetingRefreshing ? "size-3 animate-spin" : "size-3"} />
+            <span className="sr-only">刷新案件助手</span>
+          </button>
         </div>
       </div>
     </div>
@@ -258,45 +365,32 @@ function responseToCache(result: HomeGreetingResponse): CachedGreeting {
   };
 }
 
-function todayLocalIso(): string {
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = `${now.getMonth() + 1}`.padStart(2, "0");
-  const d = `${now.getDate()}`.padStart(2, "0");
-  return `${y}-${m}-${d}`;
+function useCompanionClock(): Date {
+  const [clock, setClock] = useState(() => new Date());
+  useEffect(() => {
+    const id = window.setInterval(() => setClock(new Date()), 1000 * 60);
+    return () => window.clearInterval(id);
+  }, []);
+  return clock;
 }
 
-function timeOfDay(): string {
-  const hour = new Date().getHours();
-  if (hour < 6) return "夜间";
-  if (hour < 11) return "上午";
-  if (hour < 14) return "中午";
-  if (hour < 18) return "下午";
-  return "晚上";
-}
-
-function readCachedGreeting(today: string): CachedGreeting | null {
-  return readJson<CachedGreeting>(GREETING_KEY_PREFIX + today);
+function readCachedGreeting(
+  today: string,
+  period: string,
+  weatherSummary: string | null,
+): CachedGreeting | null {
+  const cached = readJson<CachedGreeting>(GREETING_KEY_PREFIX + today);
+  if (!cached) return null;
+  return isGreetingTextCompatible(cached.text, period, weatherSummary) ? cached : null;
 }
 
 function writeCachedGreeting(today: string, value: CachedGreeting): void {
   writeJson(GREETING_KEY_PREFIX + today, value);
 }
 
-function shouldRefreshGreeting(today: string): boolean {
-  const last = readJson<{ refreshed_at: string }>(GREETING_REFRESH_KEY_PREFIX + today);
-  if (!last?.refreshed_at) return true;
-  return isStaleIso(last.refreshed_at, GREETING_MIN_REFRESH_MS + stableRefreshDelay(today));
-}
-
-function writeGreetingRefresh(today: string): void {
-  writeJson(GREETING_REFRESH_KEY_PREFIX + today, {
-    refreshed_at: new Date().toISOString(),
-  });
-}
-
 function readCachedWeather(today: string): CachedWeather | null {
-  return readJson<CachedWeather>(WEATHER_KEY_PREFIX + today);
+  const cached = readJson<CachedWeather>(WEATHER_KEY_PREFIX + today);
+  return isUsableCachedWeather(cached) ? cached : null;
 }
 
 function writeCachedWeather(today: string, value: CachedWeather): void {
@@ -320,24 +414,14 @@ function writeJson(key: string, value: unknown): void {
   }
 }
 
-function isStaleIso(value: string, ttlMs: number): boolean {
-  const time = Date.parse(value);
-  if (!Number.isFinite(time)) return true;
-  return Date.now() - time > ttlMs;
-}
-
-function stableRefreshDelay(seed: string): number {
-  return stableIndex(`${seed}:${timeOfDay()}`, GREETING_JITTER_MS);
-}
-
 function getCurrentPositionWithTimeout(timeoutMs: number): Promise<GeolocationPosition> {
   if (!navigator.geolocation) {
     return Promise.reject(new Error("当前环境不支持定位"));
   }
   return new Promise((resolve, reject) => {
     navigator.geolocation.getCurrentPosition(resolve, reject, {
-      enableHighAccuracy: false,
-      maximumAge: 1000 * 60 * 30,
+      enableHighAccuracy: true,
+      maximumAge: 1000 * 60 * 5,
       timeout: timeoutMs,
     });
   });
@@ -354,45 +438,8 @@ async function resolveWeatherLocation(): Promise<WeatherLocation> {
       warning: null,
     };
   } catch (error) {
-    const systemError = weatherErrorMessage(error);
-    try {
-      const fallback = await getIpApproximateLocation();
-      return { ...fallback, warning: systemError };
-    } catch (fallbackError) {
-      throw new Error(`${systemError}; 网络定位也失败: ${weatherErrorMessage(fallbackError)}`);
-    }
+    throw new Error(weatherErrorMessage(error));
   }
-}
-
-async function getIpApproximateLocation(): Promise<WeatherLocation> {
-  const ipapi = await fetchJsonWithTimeout<IpApiLocation>(
-    "https://ipapi.co/json/",
-    IP_LOCATION_TIMEOUT_MS,
-  ).catch(() => null);
-  if (typeof ipapi?.latitude === "number" && typeof ipapi.longitude === "number") {
-    return {
-      latitude: ipapi.latitude,
-      longitude: ipapi.longitude,
-      source: "network",
-      label: [ipapi.city, ipapi.region].filter(Boolean).join(" · ") || null,
-      warning: null,
-    };
-  }
-
-  const ipwho = await fetchJsonWithTimeout<IpWhoLocation>(
-    "https://ipwho.is/",
-    IP_LOCATION_TIMEOUT_MS,
-  );
-  if (ipwho.success !== false && typeof ipwho.latitude === "number" && typeof ipwho.longitude === "number") {
-    return {
-      latitude: ipwho.latitude,
-      longitude: ipwho.longitude,
-      source: "network",
-      label: [ipwho.city, ipwho.region].filter(Boolean).join(" · ") || null,
-      warning: null,
-    };
-  }
-  throw new Error(ipwho.message || "网络定位返回无经纬度");
 }
 
 async function fetchWeather(location: WeatherLocation): Promise<CachedWeather> {
@@ -402,6 +449,7 @@ async function fetchWeather(location: WeatherLocation): Promise<CachedWeather> {
     const params = new URLSearchParams({
       latitude: location.latitude.toFixed(4),
       longitude: location.longitude.toFixed(4),
+      current: "temperature_2m,precipitation,rain,showers,weather_code",
       daily:
         "temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,rain_sum",
       timezone: "auto",
@@ -413,18 +461,6 @@ async function fetchWeather(location: WeatherLocation): Promise<CachedWeather> {
     if (!response.ok) throw new Error(`天气返回 ${response.status}`);
     const data = (await response.json()) as OpenMeteoDailyResponse;
     return parseWeather(data, location);
-  } finally {
-    window.clearTimeout(timer);
-  }
-}
-
-async function fetchJsonWithTimeout<T>(url: string, timeoutMs: number): Promise<T> {
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, { signal: controller.signal });
-    if (!response.ok) throw new Error(`请求返回 ${response.status}`);
-    return (await response.json()) as T;
   } finally {
     window.clearTimeout(timer);
   }
@@ -443,6 +479,13 @@ function weatherErrorMessage(error: unknown): string {
 }
 
 interface OpenMeteoDailyResponse {
+  current?: {
+    temperature_2m?: number;
+    precipitation?: number;
+    rain?: number;
+    showers?: number;
+    weather_code?: number;
+  };
   daily?: {
     temperature_2m_max?: number[];
     temperature_2m_min?: number[];
@@ -452,42 +495,42 @@ interface OpenMeteoDailyResponse {
   };
 }
 
-interface IpApiLocation {
-  latitude?: number;
-  longitude?: number;
-  city?: string;
-  region?: string;
-}
-
-interface IpWhoLocation {
-  success?: boolean;
-  latitude?: number;
-  longitude?: number;
-  city?: string;
-  region?: string;
-  message?: string;
-}
-
 function parseWeather(data: OpenMeteoDailyResponse, location: WeatherLocation): CachedWeather {
   const daily = data.daily ?? {};
+  const current = data.current ?? {};
+  const currentTemp = current.temperature_2m;
+  const currentPrecipitation = current.precipitation ?? current.rain ?? current.showers ?? 0;
   const max = daily.temperature_2m_max?.[0];
   const min = daily.temperature_2m_min?.[0];
   const probability = daily.precipitation_probability_max?.[0] ?? 0;
   const precipitation = daily.precipitation_sum?.[0] ?? daily.rain_sum?.[0] ?? 0;
-  const hasRain = precipitation > 0.1 || probability >= 30;
-  const temp =
-    typeof min === "number" && typeof max === "number"
-      ? `${Math.round(min)}-${Math.round(max)}°C`
-      : "温度未更新";
-  const rainText = hasRain ? "可能有雨" : "少雨";
+  const hasCurrentRain = currentPrecipitation > 0.1 || isRainWeatherCode(current.weather_code);
+  const hasRain = hasCurrentRain || precipitation > 0.1 || probability >= 30;
+  const dayTemp =
+    typeof min === "number" && typeof max === "number" ? `${Math.round(min)}-${Math.round(max)}°C` : null;
+  const currentText = typeof currentTemp === "number" ? `现在 ${Math.round(currentTemp)}°C` : null;
+  const rainText = hasCurrentRain ? "正在下雨" : hasRain ? "可能有雨" : "少雨";
   const sourceText = location.source === "system" ? "系统定位" : "网络定位";
+  const placeText = location.label || sourceText;
   const locationText = location.label ? ` · ${location.label}` : "";
   const warningText = location.warning ? ` · 系统定位失败: ${location.warning}` : "";
+  const summary = [placeText, currentText, dayTemp ? `今日 ${dayTemp}` : null, rainText]
+    .filter(Boolean)
+    .join(" · ");
   return {
-    summary: `${temp} · ${rainText}`,
-    detail: `${sourceText}${locationText}${warningText} · 降雨概率 ${Math.round(probability)}% · 预计降雨 ${precipitation.toFixed(1)}mm`,
+    summary: summary || `${sourceText} · 天气未更新`,
+    detail: `${sourceText}${locationText}${warningText} · 当前降水 ${currentPrecipitation.toFixed(1)}mm · 降雨概率 ${Math.round(probability)}% · 预计降雨 ${precipitation.toFixed(1)}mm`,
     generated_at: new Date().toISOString(),
     source: sourceText,
     location_label: location.label,
   };
+}
+
+function isRainWeatherCode(code: number | undefined): boolean {
+  if (typeof code !== "number") return false;
+  return (
+    (code >= 51 && code <= 67) ||
+    (code >= 80 && code <= 82) ||
+    (code >= 95 && code <= 99)
+  );
 }

@@ -22,6 +22,7 @@ pub mod lifecycle;
 pub mod llm;
 pub mod local_kb;
 pub mod memory_vault;
+pub mod native_location;
 pub mod proc_util;
 // 私人专属功能 Rust 侧(双轨发布模型)。开源仓此文件为桩(命令返回 Err),照样编译。
 pub mod case_bundle;
@@ -4171,10 +4172,10 @@ async fn upload_feedback_report(
 
 /// 2026-05-27 V0.1.13+:打开默认邮件客户端发反馈给作者。
 ///
-/// 实现策略(macOS 主路径):
-///   1. 先 osascript 调 Mail.app:自动填收件人 / 主题 / 正文 +「带附件」
-///   2. AppleScript 失败(用户没装 Mail.app / 没授权 AppleScript)→ fallback
-///      `open mailto:` 链接(默认邮件客户端打开新邮件,但**不带附件**,需要用户手动拖入)
+/// 实现策略:
+///   1. macOS 先 osascript 调 Mail.app:自动填收件人 / 主题 / 正文 +「带附件」
+///   2. 其他平台或 AppleScript 失败时,用系统默认邮件客户端打开 mailto:
+///      链接(不带附件,需要用户手动添加 MD)
 ///
 /// 返回 `("applescript"|"mailto", warning_message_or_empty)`,
 /// 让前端 toast 提示用户:走的哪条路径 + 是否需要手动拖附件。
@@ -6031,6 +6032,8 @@ pub fn run() {
             reveal_in_finder,
             get_settings,
             generate_home_greeting,
+            native_location::get_native_location,
+            native_location::open_location_privacy_settings,
             save_settings,
             update_home_case_order,
             detect_local_readiness,

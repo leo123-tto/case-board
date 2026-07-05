@@ -6,16 +6,24 @@ import poseChecklist from "@/assets/caseboard-companion/caseboard-companion-pose
 import poseFiles from "@/assets/caseboard-companion/caseboard-companion-pose-files-2026-06-28.png";
 import poseNeutral from "@/assets/caseboard-companion/caseboard-companion-pose-neutral-2026-06-28.png";
 import poseWriting from "@/assets/caseboard-companion/caseboard-companion-pose-writing-2026-06-28.png";
-import { generateHomeGreeting, type HomeGreetingResponse } from "@/lib/api";
+import {
+  generateHomeGreeting,
+  getNativeLocation,
+  openLocationPrivacySettings,
+  type HomeGreetingResponse,
+} from "@/lib/api";
+import { cn } from "@/lib/utils";
 import {
   buildGreetingCacheKey,
+  isDisplayableCachedWeather,
   isGreetingTextCompatible,
-  isUsableCachedWeather,
   isStaleIso,
+  shouldShowLocationSettingsAction,
   shouldRefreshWeather,
   timeOfDay,
   todayLocalIso,
   weatherDisplaySummary,
+  weatherStatusMessage,
   weatherSummaryForGreeting,
 } from "./homeCompanionLogic";
 
@@ -23,6 +31,7 @@ const GREETING_KEY_PREFIX = "caseboard:home-companion:greeting:v2:";
 const WEATHER_KEY_PREFIX = "caseboard:home-companion:weather:v2:";
 const GEOLOCATION_TIMEOUT_MS = 8000;
 const WEATHER_FETCH_TIMEOUT_MS = 5000;
+const IP_LOCATION_TIMEOUT_MS = 3500;
 const GREETING_CACHE_TTL_MS = 1000 * 60 * 90;
 
 interface CachedGreeting {
@@ -58,10 +67,14 @@ export function HomeCompanionStrip({
   displayName,
   activeCaseCount,
   reminderSummaries,
+  dailyBrief,
+  onDailyBriefAction,
 }: {
   displayName: string | null;
   activeCaseCount: number;
   reminderSummaries: string[];
+  dailyBrief?: DailyBrief | null;
+  onDailyBriefAction?: () => void;
 }) {
   const clock = useCompanionClock();
   const localDate = useMemo(() => todayLocalIso(clock), [clock]);
@@ -75,6 +88,7 @@ export function HomeCompanionStrip({
     const initialDate = todayLocalIso();
     const initialPeriod = timeOfDay();
     const initialWeather = readCachedWeather(initialDate);
+    const initialWeatherSummary = weatherSummaryForGreeting(initialWeather);
     const initialMode = resolveCompanionMode({
       today: initialDate,
       activeCaseCount,
@@ -83,7 +97,7 @@ export function HomeCompanionStrip({
     const initialKey = buildGreetingCacheKey({
       localDate: initialDate,
       timeOfDay: initialPeriod,
-      weatherSummary: initialWeather?.summary ?? null,
+      weatherSummary: initialWeatherSummary,
       assistantMode: companionModeLabel(initialMode),
       activeCaseCount,
       reminderSummaries,
@@ -106,7 +120,16 @@ export function HomeCompanionStrip({
     };
   });
 
-  const weatherSummary = useMemo(() => weatherSummaryForGreeting(weather.value), [weather.value]);
+  const weatherSummary = useMemo(
+    () => weatherSummaryForGreeting(weather.value, clock),
+    [
+      clock,
+      weather.value?.detail,
+      weather.value?.generated_at,
+      weather.value?.source,
+      weather.value?.summary,
+    ],
+  );
   const greetingCacheKey = useMemo(
     () =>
       buildGreetingCacheKey({
@@ -197,7 +220,7 @@ export function HomeCompanionStrip({
         const location = await resolveWeatherLocation();
         setWeather((prev) => ({ status: "fetching", value: prev.value, error: null }));
         const next = await fetchWeather(location);
-        if (isUsableCachedWeather(next)) writeCachedWeather(todayLocalIso(), next);
+        if (isDisplayableCachedWeather(next)) writeCachedWeather(todayLocalIso(), next);
         setWeather({ status: "idle", value: next, error: null });
         void refreshGreeting({
           forceRefresh: forceGreetingRefresh,
@@ -229,17 +252,30 @@ export function HomeCompanionStrip({
   }, [refreshWeather]);
 
   const weatherBusy = weather.status === "locating" || weather.status === "fetching";
+  const weatherNeedsRefresh = weather.value ? shouldRefreshWeather(weather.value, clock) : false;
+  const weatherFeedsGreeting = weather.value ? Boolean(weatherSummaryForGreeting(weather.value, clock)) : false;
   const weatherLabel =
     weather.status === "locating"
       ? "正在定位..."
       : weather.status === "fetching"
         ? "正在查询天气..."
         : weatherDisplaySummary(weather.value) ?? (weather.error ? "天气获取失败" : "天气未更新");
+  const weatherStatusText = weatherStatusMessage({
+    value: weather.value,
+    error: weather.error,
+    weatherFeedsGreeting,
+    weatherNeedsRefresh,
+  });
+  const showLocationSettingsAction = shouldShowLocationSettingsAction(weather.value, weather.error);
   const companionPose = pickCompanionPose({
     mode: companionMode,
     weatherBusy,
     greetingRefreshing,
   });
+
+  const handleOpenLocationSettings = useCallback(() => {
+    void openLocationPrivacySettings();
+  }, []);
 
   return (
     <div className="mt-3 flex max-w-2xl items-start gap-2.5 text-sm text-muted-foreground">
@@ -272,9 +308,17 @@ export function HomeCompanionStrip({
             <CloudSun className="size-3" />
             {weatherLabel}
           </span>
-          {weather.error && (
-            <span className="text-muted-foreground/80" title={weather.error}>
-              {weather.value ? "使用缓存" : weather.error}
+          {weatherStatusText && (
+            <span
+              className="text-muted-foreground/80"
+              title={
+                weather.error ??
+                (!weatherFeedsGreeting && weather.value
+                  ? "天气缓存已过期,不会用于案件助手问候"
+                  : undefined)
+              }
+            >
+              {weatherStatusText}
             </span>
           )}
           <button
@@ -287,10 +331,41 @@ export function HomeCompanionStrip({
             <RefreshCw className={weatherBusy || greetingRefreshing ? "size-3 animate-spin" : "size-3"} />
             <span className="sr-only">刷新案件助手</span>
           </button>
+          {showLocationSettingsAction && (
+            <button
+              type="button"
+              className="rounded border border-border bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground transition hover:bg-muted hover:text-foreground"
+              title="打开系统定位服务设置"
+              onClick={handleOpenLocationSettings}
+            >
+              开启定位
+            </button>
+          )}
         </div>
+        {dailyBrief && (
+          <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+            <span className="min-w-0 truncate">{dailyBrief.text}</span>
+            <button
+              type="button"
+              className={cn(
+                "shrink-0 rounded border px-1.5 py-0.5 transition",
+                "border-border bg-background text-muted-foreground hover:bg-muted hover:text-foreground",
+              )}
+              onClick={onDailyBriefAction}
+            >
+              {dailyBrief.actionLabel}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
+}
+
+export interface DailyBrief {
+  text: string;
+  actionLabel: string;
+  level: "red" | "orange" | "calm";
 }
 
 function resolveCompanionMode({
@@ -390,7 +465,7 @@ function writeCachedGreeting(today: string, value: CachedGreeting): void {
 
 function readCachedWeather(today: string): CachedWeather | null {
   const cached = readJson<CachedWeather>(WEATHER_KEY_PREFIX + today);
-  return isUsableCachedWeather(cached) ? cached : null;
+  return isDisplayableCachedWeather(cached) ? cached : null;
 }
 
 function writeCachedWeather(today: string, value: CachedWeather): void {
@@ -429,17 +504,75 @@ function getCurrentPositionWithTimeout(timeoutMs: number): Promise<GeolocationPo
 
 async function resolveWeatherLocation(): Promise<WeatherLocation> {
   try {
-    const position = await getCurrentPositionWithTimeout(GEOLOCATION_TIMEOUT_MS);
+    return await getSystemLocation();
+  } catch (error) {
+    const systemError = weatherErrorMessage(error);
+    try {
+      const fallback = await getIpApproximateLocation();
+      return { ...fallback, warning: systemError };
+    } catch (fallbackError) {
+      throw new Error(`${systemError}; 网络定位也失败: ${weatherErrorMessage(fallbackError)}`);
+    }
+  }
+}
+
+async function getSystemLocation(): Promise<WeatherLocation> {
+  try {
+    const location = await getNativeLocation(GEOLOCATION_TIMEOUT_MS);
     return {
-      latitude: position.coords.latitude,
-      longitude: position.coords.longitude,
+      latitude: location.latitude,
+      longitude: location.longitude,
       source: "system",
       label: null,
       warning: null,
     };
-  } catch (error) {
-    throw new Error(weatherErrorMessage(error));
+  } catch (nativeError) {
+    try {
+      const position = await getCurrentPositionWithTimeout(GEOLOCATION_TIMEOUT_MS);
+      return {
+        latitude: position.coords.latitude,
+        longitude: position.coords.longitude,
+        source: "system",
+        label: null,
+        warning: null,
+      };
+    } catch (webError) {
+      throw new Error(
+        `${weatherErrorMessage(nativeError)}; WebView 定位也失败: ${weatherErrorMessage(webError)}`,
+      );
+    }
   }
+}
+
+async function getIpApproximateLocation(): Promise<WeatherLocation> {
+  const ipapi = await fetchJsonWithTimeout<IpApiLocation>(
+    "https://ipapi.co/json/",
+    IP_LOCATION_TIMEOUT_MS,
+  ).catch(() => null);
+  if (typeof ipapi?.latitude === "number" && typeof ipapi.longitude === "number") {
+    return {
+      latitude: ipapi.latitude,
+      longitude: ipapi.longitude,
+      source: "network",
+      label: [ipapi.city, ipapi.region].filter(Boolean).join(" · ") || null,
+      warning: null,
+    };
+  }
+
+  const ipwho = await fetchJsonWithTimeout<IpWhoLocation>(
+    "https://ipwho.is/",
+    IP_LOCATION_TIMEOUT_MS,
+  );
+  if (ipwho.success !== false && typeof ipwho.latitude === "number" && typeof ipwho.longitude === "number") {
+    return {
+      latitude: ipwho.latitude,
+      longitude: ipwho.longitude,
+      source: "network",
+      label: [ipwho.city, ipwho.region].filter(Boolean).join(" · ") || null,
+      warning: null,
+    };
+  }
+  throw new Error(ipwho.message || "网络定位返回无经纬度");
 }
 
 async function fetchWeather(location: WeatherLocation): Promise<CachedWeather> {
@@ -466,6 +599,18 @@ async function fetchWeather(location: WeatherLocation): Promise<CachedWeather> {
   }
 }
 
+async function fetchJsonWithTimeout<T>(url: string, timeoutMs: number): Promise<T> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`请求返回 ${response.status}`);
+    return (await response.json()) as T;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 function weatherErrorMessage(error: unknown): string {
   if (typeof error === "object" && error && "code" in error) {
     const code = Number((error as { code?: unknown }).code);
@@ -473,6 +618,7 @@ function weatherErrorMessage(error: unknown): string {
     if (code === 2) return "定位不可用";
     if (code === 3) return "定位超时";
   }
+  if (typeof error === "string") return error;
   if (error instanceof DOMException && error.name === "AbortError") return "天气请求超时";
   if (error instanceof Error) return error.message;
   return "天气获取失败";
@@ -493,6 +639,22 @@ interface OpenMeteoDailyResponse {
     precipitation_sum?: number[];
     rain_sum?: number[];
   };
+}
+
+interface IpApiLocation {
+  latitude?: number;
+  longitude?: number;
+  city?: string;
+  region?: string;
+}
+
+interface IpWhoLocation {
+  success?: boolean;
+  latitude?: number;
+  longitude?: number;
+  city?: string;
+  region?: string;
+  message?: string;
 }
 
 function parseWeather(data: OpenMeteoDailyResponse, location: WeatherLocation): CachedWeather {

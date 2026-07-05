@@ -68,7 +68,7 @@ import { cn } from "@/lib/utils";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { CalendarBoard } from "./CalendarBoard";
 import { countOpenCaseRows, isOpenCaseStatus } from "./homeCaseCounts";
-import { HomeCompanionStrip } from "./HomeCompanionStrip";
+import { HomeCompanionStrip, type DailyBrief } from "./HomeCompanionStrip";
 import {
   loadHearingDisplayDetail,
   type HearingDisplayDetail,
@@ -373,6 +373,10 @@ export function HomeView({
     () => buildAssistantReminderSummaries(upcomingEvents),
     [upcomingEvents],
   );
+  const dailyBriefContext = useMemo(
+    () => buildHomeDailyBrief(upcomingEvents, activeCases, docsByCase),
+    [activeCases, docsByCase, upcomingEvents],
+  );
   const hearingEventsSeed = upcomingEventsBase
     .filter((event) => event.kind === "hearing")
     .map(upcomingEventKey)
@@ -634,6 +638,16 @@ export function HomeView({
                   displayName={userDisplayName}
                   activeCaseCount={activeCases.length}
                   reminderSummaries={assistantReminderSummaries}
+                  dailyBrief={dailyBriefContext.brief}
+                  onDailyBriefAction={() => {
+                    if (dailyBriefContext.actionEvent) {
+                      openEvent(dailyBriefContext.actionEvent);
+                    } else if (dailyBriefContext.actionCaseId) {
+                      onPickCase(dailyBriefContext.actionCaseId);
+                    } else {
+                      onImport();
+                    }
+                  }}
                 />
               )}
               <Button
@@ -2240,6 +2254,109 @@ function buildCaseDisplay(caseData: Case): CaseDisplayFields {
     partySummary: `${left}${leftMore} vs ${right}${rightMore}`,
     amountText: claimAmount ? formatYuan(claimAmount) : null,
   };
+}
+
+function buildHomeDailyBrief(
+  events: UpcomingEvent[],
+  activeCases: Case[],
+  docsByCase: Record<string, Document[]>,
+): {
+  brief: DailyBrief;
+  actionEvent: UpcomingEvent | null;
+  actionCaseId: string | null;
+} {
+  const redEvents = events.filter((event) => eventUrgency(event) === "overdue");
+  const orangeEvents = events.filter((event) => eventUrgency(event) === "urgent");
+  const failedDocCaseId = firstExtractionFailedCaseId(activeCases, docsByCase);
+  const recentCaseId = firstRecentlyUpdatedCaseId(activeCases);
+  const recentCount = recentlyUpdatedCaseCount(activeCases);
+
+  if (redEvents.length > 0) {
+    return {
+      brief: {
+        text: `今日简报: ${redEvents.length} 个红色提醒 · ${orangeEvents.length} 个橙色提醒`,
+        actionLabel: "查看提醒",
+        level: "red",
+      },
+      actionEvent: redEvents[0],
+      actionCaseId: null,
+    };
+  }
+
+  if (orangeEvents.length > 0) {
+    return {
+      brief: {
+        text: `今日简报: 无红色风险 · ${orangeEvents.length} 个橙色提醒`,
+        actionLabel: "扫一眼",
+        level: "orange",
+      },
+      actionEvent: orangeEvents[0],
+      actionCaseId: null,
+    };
+  }
+
+  if (failedDocCaseId) {
+    return {
+      brief: {
+        text: "今日简报: 无红色风险 · 有材料抽取需处理",
+        actionLabel: "查看材料",
+        level: "orange",
+      },
+      actionEvent: null,
+      actionCaseId: failedDocCaseId,
+    };
+  }
+
+  if (recentCount > 0 && recentCaseId) {
+    return {
+      brief: {
+        text: `今日简报: 无红色风险 · 最近更新 ${recentCount} 案`,
+        actionLabel: "看更新",
+        level: "calm",
+      },
+      actionEvent: null,
+      actionCaseId: recentCaseId,
+    };
+  }
+
+  return {
+    brief: {
+      text: "今日简报: 暂无红色风险 · 可以按自己的节奏来",
+      actionLabel: "导入材料",
+      level: "calm",
+    },
+    actionEvent: null,
+    actionCaseId: null,
+  };
+}
+
+function firstExtractionFailedCaseId(
+  activeCases: Case[],
+  docsByCase: Record<string, Document[]>,
+): string | null {
+  for (const c of activeCases) {
+    if ((docsByCase[c.id] ?? []).some((doc) => doc.extraction_status === "failed")) {
+      return c.id;
+    }
+  }
+  return null;
+}
+
+function firstRecentlyUpdatedCaseId(activeCases: Case[]): string | null {
+  return [...activeCases]
+    .filter((c) => isRecentlyUpdated(c.updated_at))
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at))[0]?.id ?? null;
+}
+
+function recentlyUpdatedCaseCount(activeCases: Case[]): number {
+  return activeCases.filter((c) => isRecentlyUpdated(c.updated_at)).length;
+}
+
+function isRecentlyUpdated(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return false;
+  return Date.now() - time <= 1000 * 60 * 60 * 48;
 }
 
 function compareCaseRows(a: CaseRow, b: CaseRow, key: SortKey, dir: SortDir): number {

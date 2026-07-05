@@ -35,6 +35,7 @@ pub struct GlobalExtractReport {
     pub report_ok: bool,
     pub report_path: Option<String>,
     pub elapsed_ms: u128,
+    pub warning: Option<String>,
     pub error: Option<String>,
 }
 
@@ -116,6 +117,7 @@ pub async fn run_global_extract(
                 report_ok: false,
                 report_path: None,
                 elapsed_ms: start.elapsed().as_millis(),
+                warning: None,
                 error: Some(format!("查文档列表失败:{}", e)),
             }
         }
@@ -129,6 +131,7 @@ pub async fn run_global_extract(
             report_ok: false,
             report_path: None,
             elapsed_ms: start.elapsed().as_millis(),
+            warning: None,
             error: Some("无可分析正文,无法全局抽取".into()),
         };
     }
@@ -136,6 +139,7 @@ pub async fn run_global_extract(
     // D3-1:检测语料是否为完整集的子集 —— 有未纳入正文的文档说明本次基于**不完整语料**抽取。
     // 数组字段(当事人/日期/费用)可能比完整抽取更短;COALESCE 只防"整列被空值抹除",
     // **防不了"变短覆盖"**(P1 残留:完整性 gate 待定)。这里落 dlog 让 partial-shrink 可观测,不再静默。
+    let mut warning = None;
     if let Ok(not_done) = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM documents \
          WHERE case_id = ? AND deleted_at IS NULL \
@@ -146,12 +150,13 @@ pub async fn run_global_extract(
     .fetch_one(pool)
     .await
     {
-        if not_done > 0 {
+        warning = corpus_incomplete_warning(not_done);
+        if let Some(w) = warning.as_deref() {
             crate::dlog!(
-                "[global_extract] case={} 有 {} 份文档未纳入正文 → 基于不完整语料抽取,\
+                "[global_extract] case={} {} \
                  数组字段可能比完整抽取更短(D3-1 残留:仅防空覆盖,未防变短)",
                 case_id,
-                not_done
+                w
             );
         }
     }
@@ -204,6 +209,7 @@ pub async fn run_global_extract(
             report_ok: false,
             report_path: None,
             elapsed_ms: start.elapsed().as_millis(),
+            warning,
             error: Some("MD 文件都读不到,无法全局抽取".into()),
         };
     }
@@ -278,8 +284,19 @@ pub async fn run_global_extract(
         report_ok,
         report_path: report_path_str,
         elapsed_ms: start.elapsed().as_millis(),
+        warning,
         error: err,
     }
+}
+
+fn corpus_incomplete_warning(not_done: i64) -> Option<String> {
+    if not_done <= 0 {
+        return None;
+    }
+    Some(format!(
+        "有 {} 份文档未纳入本次语料,报告基于不完整材料生成,建议先处理失败/未完成材料后重新分析。",
+        not_done
+    ))
 }
 
 /// 对所有案件依次跑一遍全局抽。**串行**(每个案件单 LLM call 已经够慢),
@@ -477,7 +494,7 @@ fn non_empty_json<T: serde::Serialize>(v: &[T]) -> Option<String> {
     }
 }
 
-/// D9-1:`cases.workflow_status` 单一英文口径。LLM 输出的中文 9 档 → 前端 `StatusId`(英文)。
+/// D9-1:`cases.workflow_status` 单一英文口径。LLM 输出的中文 11 档 → 前端 `StatusId`(英文)。
 /// 不在表内 → None(写库时 COALESCE 保留 DB 现值)。**与前端 `inferStatus.ts::StatusId` 严格对齐**。
 pub fn workflow_status_zh_to_en(zh: &str) -> Option<&'static str> {
     match zh.trim() {

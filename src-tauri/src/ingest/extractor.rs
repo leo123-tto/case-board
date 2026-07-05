@@ -463,6 +463,12 @@ pub async fn extract_one(
             match ocr_fallback(path.to_path_buf(), ocr_ctx.clone()).await {
                 Ok((t, used_backend)) => {
                     let chars = t.chars().count() as i64;
+                    let quality_note = ocr_quality_note(used_backend, &t);
+                    let quality_outcome = if quality_note.contains("_review") {
+                        "review_needed"
+                    } else {
+                        "ok"
+                    };
                     metrics.push(MetricEntry {
                         filename: filename.into(),
                         ext: ext.clone(),
@@ -474,6 +480,17 @@ pub async fn extract_one(
                         elapsed_ms: t_ocr.elapsed().as_millis() as i64,
                         text_chars: Some(chars),
                         error_short: None,
+                    });
+                    metrics.push(MetricEntry {
+                        filename: filename.into(),
+                        ext: ext.clone(),
+                        file_size_bytes,
+                        stage: "ocr_quality".into(),
+                        backend: used_backend.into(),
+                        outcome: quality_outcome.into(),
+                        elapsed_ms: 0,
+                        text_chars: Some(chars),
+                        error_short: Some(quality_note),
                     });
                     t
                 }
@@ -712,6 +729,37 @@ fn merge_extracted_fields(chunks: Vec<ExtractedFields>) -> ExtractedFields {
         extend_unique_by_json(&mut merged.preservations, fields.preservations);
     }
     merged
+}
+
+fn ocr_quality_note(backend: &str, text: &str) -> String {
+    let chars = text.trim().chars().count();
+    let pages = count_page_markers(text).unwrap_or(1);
+    let mut flags: Vec<&str> = Vec::new();
+
+    if chars < 300 {
+        flags.push("short_text_review");
+    }
+    if backend == "ppocrv6" && text.contains("---以下为去水印过滤掉的行") {
+        flags.push("watermark_filtered_review");
+    }
+
+    let flags = if flags.is_empty() {
+        "none".to_string()
+    } else {
+        flags.join("|")
+    };
+    format!("quality:backend={backend};chars={chars};pages={pages};flags={flags}")
+}
+
+fn count_page_markers(text: &str) -> Option<usize> {
+    let count = text
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            line.starts_with("--- 第 ") && line.ends_with(" 页 ---")
+        })
+        .count();
+    (count > 0).then_some(count)
 }
 
 /// LLM 后端标签 = endpoint 类型 + 模型名,这样 metric 既能区分 local/cloud,

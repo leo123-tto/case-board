@@ -113,6 +113,23 @@ export function getSettings(): Promise<Settings> {
   return invoke<Settings>("get_settings");
 }
 
+export interface NativeLocation {
+  latitude: number;
+  longitude: number;
+  accuracy?: number | null;
+  authorization_status?: string;
+}
+
+/** macOS 原生 CoreLocation:用于 Tauri WebView 不弹系统定位授权时的首页天气定位。 */
+export function getNativeLocation(timeoutMs?: number): Promise<NativeLocation> {
+  return invoke<NativeLocation>("get_native_location", { timeoutMs: timeoutMs ?? null });
+}
+
+/** 打开系统定位服务隐私设置,让用户手动授权案件看板。 */
+export function openLocationPrivacySettings(): Promise<void> {
+  return invoke<void>("open_location_privacy_settings");
+}
+
 /** 写入用户设置(全量覆盖)。 */
 export function saveSettings(payload: Settings): Promise<void> {
   return invoke<void>("save_settings", { payload });
@@ -249,6 +266,7 @@ export interface GlobalExtractReport {
   report_ok: boolean;
   report_path: string | null;
   elapsed_ms: number;
+  warning: string | null;
   error: string | null;
 }
 
@@ -974,7 +992,7 @@ export function getDeepSeekBalance(refresh = false): Promise<DeepSeekBalance | n
  * 2026-05-24 e:手工覆盖案件工作流状态(看板卡片右上角的 chip)。
  *
  * `status = null` → 清空,前端走自动推断;
- * 非 null → 用户手工选过(8 档之一,见 modules/litigation/lib/inferStatus.ts)。
+ * 非 null → 用户手工选过(11 档之一,见 modules/litigation/lib/inferStatus.ts)。
  */
 export function updateWorkflowStatus(
   caseId: string,

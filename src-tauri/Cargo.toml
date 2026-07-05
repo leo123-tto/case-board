@@ -1,6 +1,6 @@
 [package]
 name = "caseboard"
-version = "0.4.5"
+version = "0.4.6"
 description = "案件看板 · CaseBoard"
 authors = ["CaseBoard Contributors"]
 edition = "2021"
@@ -70,3 +70,8 @@ regex = "1"                  # search_local_kb 全库 grep + 文档内 find_in_d
 # 2026-05-27 V0.2 D2-D3 加 · Tool trait 用 dyn Tool 派发,async fn in trait 现版本 Rust
 # 还不能直接 dyn,所以走 async-trait 宏
 async-trait = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSError", "NSObject", "NSString"] }
+objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }

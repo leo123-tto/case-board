@@ -36,7 +36,7 @@ pub struct GlobalExtractTable {
     pub cause: Option<String>,
     pub filed_at: Option<String>, // YYYY-MM-DD
     pub claim_amount: Option<f64>,
-    pub workflow_status: Option<String>, // 8 档之一:接案/立案中/.../已结案
+    pub workflow_status: Option<String>, // 11 档之一:接案/立案中/.../已结案
     pub plaintiffs: Vec<String>,
     pub defendants: Vec<String>,
     pub third_parties: Vec<String>,

@@ -69,7 +69,7 @@ pub struct Case {
     pub case_report_generated_at: Option<String>,
     /// 调解 / 判决 / 执行结果(自由文本,200 字内)
     pub agg_resolution: Option<String>,
-    /// LLM 推断的状态文字(跟 workflow_status 8 档不同,自由描述)
+    /// LLM 推断的状态文字(跟 workflow_status 11 档不同,自由描述)
     pub agg_status_text: Option<String>,
     /// JSON: [{name,role,id_no,address,phone,is_our_side}]
     pub agg_party_contacts: Option<String>,

@@ -5,8 +5,8 @@
  *   1. 按钮悬浮在右下,常驻不打扰
  *   2. 点开 → 弹窗显示「自动收集的诊断信息(可折叠)+ 输入框」
  *   3. 用户填描述 → 点「生成反馈文件」
- *   4. Rust 写文件到 ~/Desktop/案件看板反馈_*.md
- *   5. Toast 提示路径 + 「在 Finder 中显示」按钮
+ *   4. Rust 写文件到桌面或 Documents/CaseBoard/feedback 兜底目录
+ *   5. Toast 提示路径 + 「在文件管理器中显示」按钮
  *
  * 隐私铁律:
  *   - 自动信息**永不含**案件名 / 当事人 / 文档内容
@@ -124,7 +124,7 @@ function FeedbackModal({ onClose }: { onClose: () => void }) {
     }
   };
 
-  // ── 成功态:显示文件位置 + Finder 打开按钮 + 一键邮件 ──
+  // ── 成功态:显示文件位置 + 文件管理器打开按钮 ──
   if (savedPath) {
     return (
       <SavedFeedbackPanel savedPath={savedPath} onClose={onClose} />
@@ -254,7 +254,7 @@ function SavedFeedbackPanel({
         <div className="flex items-start gap-3 rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3">
           <Check className="mt-0.5 size-4 shrink-0 text-emerald-700" />
           <div className="min-w-0 flex-1 text-sm">
-            <p className="font-medium text-emerald-900">已保存到桌面</p>
+            <p className="font-medium text-emerald-900">反馈文件已保存</p>
             <p className="mt-0.5 break-all font-mono text-label text-emerald-800/80">
               {savedPath}
             </p>
@@ -262,7 +262,7 @@ function SavedFeedbackPanel({
         </div>
 
         <p className="text-xs text-muted-foreground">
-          可以在 Finder 中显示后,通过你习惯的方式把 MD 发给维护者。
+          可以在文件管理器中显示后,通过你习惯的方式把 MD 发给维护者。
         </p>
 
         <div className="flex flex-wrap justify-end gap-2 pt-2">
@@ -271,7 +271,7 @@ function SavedFeedbackPanel({
             size="sm"
             onClick={() => revealInFinder(savedPath)}
           >
-            在 Finder 中显示
+            在文件管理器中显示
           </Button>
           <Button size="sm" variant="outline" onClick={onClose}>
             完成

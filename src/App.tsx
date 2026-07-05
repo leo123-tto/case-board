@@ -862,6 +862,9 @@ function MainApp() {
       setCases((prev) => prev.map((c) => (c.id === fresh.case.id ? fresh.case : c)));
       if (fresh.case.case_report_path) {
         setReportModalCase(fresh.case);
+        if (r.warning) {
+          toast(r.warning, "info", 8000);
+        }
         toast(`报告生成完成 · ${(r.elapsed_ms / 1000).toFixed(1)} 秒`, "success");
       } else {
         setError("报告生成完成,但未找到报告文件");

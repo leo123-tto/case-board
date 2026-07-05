@@ -84,7 +84,7 @@ export function ModuleTabs({
     }
   }, [active]);
 
-  // 核心 6 tab + 私人专属顶层 tab(开源仓为空)。「独立」排最后(设置之后)。
+  // 公开顶层 tab + 私人专属顶层 tab(开源仓为空)。「独立」排最后(设置之后)。
   const allTabs: { id: string; label: string; icon: TabIcon; beta?: boolean }[] =
     [
       ...MODULES,
@@ -99,13 +99,13 @@ export function ModuleTabs({
     <nav className="flex shrink-0 border-b border-border bg-card/50 px-8">
       <div
         ref={rowRef}
-        className="relative mx-auto flex w-full max-w-6xl items-center gap-1"
+        className="relative mx-auto flex w-full min-w-0 max-w-none items-center gap-1 overflow-x-auto overflow-y-hidden"
       >
         {/* 左侧首页按钮 — 单独样式,跟 tab 视觉区分(图标 + 边框 + 不带下划线) */}
         <button
           type="button"
           onClick={onGoHome}
-          className="mr-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          className="mr-2 inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-card px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           title="回到首页(诉讼案件看板)"
           aria-label="首页"
         >
@@ -124,7 +124,7 @@ export function ModuleTabs({
               data-tab={m.id}
               onClick={() => onSwitch(m.id)}
               className={cn(
-                "relative flex items-center gap-1.5 px-4 py-3 text-sm transition-colors",
+                "relative flex shrink-0 items-center gap-1.5 whitespace-nowrap px-4 py-3 text-sm transition-colors",
                 isActive
                   ? "text-foreground"
                   : "text-muted-foreground hover:text-foreground",
@@ -132,7 +132,7 @@ export function ModuleTabs({
               aria-current={isActive ? "page" : undefined}
             >
               <Icon className="size-4" />
-              <span className="font-medium">{m.label}</span>
+              <span className="font-medium whitespace-nowrap">{m.label}</span>
               {m.beta && <BetaBadge className="ml-0.5" />}
             </button>
           );
@@ -145,7 +145,7 @@ export function ModuleTabs({
         />
 
         {/* 右侧插槽(DeepSeek 余额 chip 等) */}
-        {rightSlot && <div className="ml-auto flex items-center gap-2">{rightSlot}</div>}
+        {rightSlot && <div className="ml-auto flex shrink-0 items-center gap-2">{rightSlot}</div>}
       </div>
     </nav>
   );

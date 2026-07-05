@@ -226,6 +226,7 @@ pub(crate) fn fallback_greeting(display_name: Option<&str>, time_of_day: Option<
 pub(crate) fn safe_home_greeting(raw: &str, input: &HomeGreetingInput) -> String {
     let cleaned = clean_greeting(raw);
     if cleaned.is_empty()
+        || is_prompt_leak(&cleaned)
         || is_unsafe_schedule_claim(&cleaned)
         || is_inconsistent_time_claim(&cleaned, input.time_of_day.as_deref())
         || is_unsupported_weather_claim(&cleaned, input.weather_summary.as_deref())
@@ -234,6 +235,27 @@ pub(crate) fn safe_home_greeting(raw: &str, input: &HomeGreetingInput) -> String
     } else {
         cleaned
     }
+}
+
+fn is_prompt_leak(text: &str) -> bool {
+    [
+        "输出一句中文",
+        "只输出一句",
+        "30字以内",
+        "30 字以内",
+        "最多46",
+        "最多 46",
+        "严格要求",
+        "不要解释",
+        "不要引号",
+        "不要列表",
+        "时间段是",
+        "日期202",
+        "我们要求",
+        "要求输出",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn is_unsafe_schedule_claim(text: &str) -> bool {

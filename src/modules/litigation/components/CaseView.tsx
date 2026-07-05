@@ -351,6 +351,9 @@ export function CaseView({
     try {
       const r = await globalExtractCase(selectedCase.id);
       if (r.table_ok) {
+        if (r.warning) {
+          toast(r.warning, "info", 8000);
+        }
         toast("✓ 全案分析完成,画像已更新", "success");
         onReloadCase();
       } else {

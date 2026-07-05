@@ -6,7 +6,7 @@
  * - 已入团:团队看板 + 「管理」区(团队长 = 配对码/逐人权限/移出/解散;成员 = 成员名单/退出)。
  *
  * 权限:后端 team_view 已按"我的可见范围"过滤;can_edit 驱动真编辑面板(Phase 2):
- * 改状态(8 档)/ 留备注 → 生成编辑请求接力转交 → 案件所有人 App 应用后生效,
+ * 留备注 → 生成编辑请求接力转交 → 案件所有人 App 应用后生效,
  * 所有人可在「管理」区撤销。数据=本机缓存,不依赖任何人在线。
  * 团队身份的保存防线在后端 save_settings(team 以磁盘为准)。
  */
@@ -58,7 +58,7 @@ import { cn } from "@/lib/utils";
 const inputCls =
   "w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:border-sky-400 focus:outline-none";
 
-/** 快照里的 stage 可能是 8 档英文 id(executing)或自由中文,统一转中文标签。 */
+/** 快照里的 stage 可能是工作流英文 id(execution)或自由中文,统一转中文标签。 */
 function stageLabel(stage: string | null): string | null {
   if (!stage) return null;
   return STATUS_DEFS[stage as StatusId]?.label ?? stage;
@@ -123,6 +123,21 @@ export function TeamModule() {
     }
   }
 
+  const detailOwner =
+    detail && view
+      ? view.members.find((m) => m.member_id === detail.memberId)
+      : null;
+  const detailCase =
+    detailOwner && detail
+      ? detailOwner.cases.find((x) => x.id === detail.caseId)
+      : null;
+
+  useEffect(() => {
+    if (detail && view && !detailCase) {
+      setDetail(null);
+    }
+  }, [detail, detailCase, view]);
+
   if (loading) {
     return <div className="p-10 text-sm text-muted-foreground">加载团队数据…</div>;
   }
@@ -132,19 +147,6 @@ export function TeamModule() {
   }
 
   const isLeader = view.my_role === "leader";
-  const detailOwner = detail
-    ? view.members.find((m) => m.member_id === detail.memberId)
-    : null;
-  const detailCase =
-    detailOwner && detail
-      ? detailOwner.cases.find((x) => x.id === detail.caseId)
-      : null;
-
-  useEffect(() => {
-    if (detail && !detailCase) {
-      setDetail(null);
-    }
-  }, [detail, detailCase]);
 
   // 详情页:从最新 view 里找(同步后数据自动更新);案件没了(对方删了)自动回列表
   if (detailOwner && detailCase) {

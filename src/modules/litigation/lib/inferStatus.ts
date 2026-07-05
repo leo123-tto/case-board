@@ -33,7 +33,7 @@ export interface StatusDef {
   order: number;
 }
 
-/** 8 档状态完整定义 — UI 渲染 + 排序都从这里读 */
+/** 11 档状态完整定义 — UI 渲染 + 排序都从这里读 */
 export const STATUS_DEFS: Record<StatusId, StatusDef> = {
   intake: {
     id: "intake",

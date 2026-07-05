@@ -1,11 +1,20 @@
 {
   "name": "caseboard",
   "private": true,
-  "version": "0.4.5",
+  "version": "0.4.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "feedback:pull": "python3 telemetry/pull_feedback.py --status open",
+    "check:api-contract": "node scripts/check-tauri-api-contract.mjs",
+    "test:home-companion": "node --test scripts/home-companion-logic.test.mjs",
+    "test:home-reminder": "node scripts/test-home-reminder-engine.mjs",
+    "test:interest": "node scripts/test-interest-calc.cjs",
+    "test:private-usage": "node scripts/test-private-usage-analytics.cjs",
+    "test:feedback-inbox": "node scripts/test-feedback-inbox.cjs",
+    "test": "pnpm test:home-companion && pnpm test:home-reminder && pnpm test:interest && pnpm test:private-usage && pnpm test:feedback-inbox",
+    "check": "pnpm check:api-contract && pnpm test && pnpm build",
     "preview": "vite preview",
     "tauri": "tauri"
   },

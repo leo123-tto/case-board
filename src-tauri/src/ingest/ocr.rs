@@ -16,13 +16,21 @@
 //!
 //! 性能(R&D 实测,M3 Max):
 //! - MinerU precision:~15-30 秒/份(取决于页数 + 服务端排队)
-//! - 本机 MiniCPM-V vision:13-15 秒/份(关键字段 100% 命中,详见
-//!   `~/projects/caseboard/reports/10-local-vision-ocr-test.md`)
+//! - 本机 MiniCPM-V vision:13-15 秒/份(关键字段 100% 命中,详见内部 R&D 记录)
 
 use std::path::{Path, PathBuf};
 
-/// MinerU 精准 API 的文件大小上限(200MB,API 硬上限)
-const PRECISION_MAX_BYTES: u64 = 200 * 1024 * 1024;
+const MB: u64 = 1024 * 1024;
+
+/// MinerU 精准 API 的文件大小上限(200MB,API 硬上限)。
+const PRECISION_MAX_BYTES: u64 = 200 * MB;
+
+/// AI Studio 异步 OCR API 的本地 multipart 上传上限。
+///
+/// 官方文档当前口径:PDF 最多 1000 页;URL 文件最大 200MB;本地上传最大 50MB。
+/// CaseBoard 现有 PaddleOCR-VL / PP-OCRv6 客户端都走本地 multipart 上传,所以先按 50MB
+/// 预检,避免大文件盲提交后失败。后续若接入 URL 模式,再按 URL 能力单独放宽。
+const AISTUDIO_LOCAL_UPLOAD_MAX_BYTES: u64 = 50 * MB;
 
 /// MinerU 精准 API 单次调用超时(秒)
 ///
@@ -149,7 +157,7 @@ async fn run_mineru_precision(
 
 /// OCR 主入口:按 ctx.cloud_enabled 分流。
 ///
-/// - `cloud_enabled = true` → MinerU 精准 extract(需 token,200MB / 600 页)
+/// - `cloud_enabled = true` → 云端 OCR / 文档解析(需 token;按后端能力预检)
 /// - `cloud_enabled = false` → 本机 MiniCPM-V vision(慢一点,0 上传)
 ///
 /// 2026-05-23 作者隐私分流决策。代码层强制:`cloud_enabled = false` 时
@@ -188,6 +196,12 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
                     attempted: vec!["ppocrv6"],
                 };
             };
+            if let Err(e) = preflight_cloud_backend_local_file("ppocrv6", meta.len()) {
+                return OcrResult::Failed {
+                    error: e,
+                    attempted: vec!["ppocrv6"],
+                };
+            }
             return match crate::ingest::ppocrv6_http::extract_with_ppocrv6(
                 path,
                 token,
@@ -282,6 +296,13 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
                 MINERU_PRECISION_TIMEOUT_SEC
             };
             attempted.push(backend);
+            if let Err(e) = preflight_cloud_backend_local_file(backend, meta.len()) {
+                if i + 1 < total {
+                    crate::dlog!("[ocr] 后端 {} 本地文件预检不通过,切换备用: {}", backend, e);
+                }
+                errors.push(format!("{}: {}", backend, e));
+                continue;
+            }
             let result = match backend {
                 "paddle-vl" => {
                     crate::ingest::paddle_vl_http::extract_with_paddle_vl(
@@ -345,6 +366,35 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
     }
 }
 
+fn preflight_cloud_backend_local_file(backend: &str, file_size_bytes: u64) -> Result<(), String> {
+    match backend {
+        "paddle-vl" if file_size_bytes > AISTUDIO_LOCAL_UPLOAD_MAX_BYTES => {
+            return Err(format!(
+                "PaddleOCR-VL 当前走 AI Studio 本地上传接口,官方上限 50MB;当前文件 {:.1}MB。请改用 MinerU 备用、拆分文件,或后续接入 URL 模式后再解析。",
+                bytes_to_mb(file_size_bytes)
+            ));
+        }
+        "ppocrv6" if file_size_bytes > AISTUDIO_LOCAL_UPLOAD_MAX_BYTES => {
+            return Err(format!(
+                "PP-OCRv6 去水印当前走 AI Studio 本地上传接口,官方上限 50MB;当前文件 {:.1}MB。请先拆分带水印材料,或改走 MinerU 后人工复核水印污染。",
+                bytes_to_mb(file_size_bytes)
+            ));
+        }
+        "mineru-precision" if file_size_bytes > PRECISION_MAX_BYTES => {
+            return Err(format!(
+                "MinerU 精准解析单文件上限 200MB;当前文件 {:.1}MB。请先拆分文件后再解析。",
+                bytes_to_mb(file_size_bytes)
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn bytes_to_mb(bytes: u64) -> f64 {
+    bytes as f64 / MB as f64
+}
+
 /// 本机 vision 单次最多识别多少页 PDF(D3-2:旧实现只识别首页,多页扫描件静默丢页)。
 /// 超出部分不识别并落 dlog 告警,而非静默截断。
 const LOCAL_VISION_MAX_PAGES: u32 = 50;
@@ -358,8 +408,7 @@ const LOCAL_VISION_MAX_PAGES: u32 = 50;
 /// 4. 调 :8899/v1/chat/completions(MiniCPM-V 4.6 + mmproj)
 /// 5. 返回纯文本
 ///
-/// 2026-05-23 R&D 实测:M3 Max 13-15 秒/页,关键字段 100% 命中(详见
-/// `~/projects/caseboard/reports/10-local-vision-ocr-test.md`)。
+/// 2026-05-23 R&D 实测:M3 Max 13-15 秒/页,关键字段 100% 命中。
 fn run_local_vision(path: &Path) -> Result<String, String> {
     let ext = path
         .extension()

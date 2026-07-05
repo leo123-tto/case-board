@@ -937,25 +937,48 @@ fn summarize_metrics(samples: &[MetricSample]) -> Vec<BackendStat> {
 
 fn collect_os_version() -> String {
     let arch = std::env::consts::ARCH; // aarch64 / x86_64
-    let os = std::env::consts::OS; // macos
-                                   // 用 sw_vers 命令拿 macOS 版本号
-    let ver = std::process::Command::new("sw_vers")
+    let os = std::env::consts::OS;
+    format_os_version(os, collect_platform_version(), arch)
+}
+
+fn format_os_version(os: &str, version: Option<String>, arch: &str) -> String {
+    let ver = version
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{} {} · {}", os, ver, arch)
+}
+
+#[cfg(target_os = "macos")]
+fn collect_platform_version() -> Option<String> {
+    std::process::Command::new("sw_vers")
         .arg("-productVersion")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("{} {} · {}", os, ver, arch)
+}
+
+#[cfg(target_os = "windows")]
+fn collect_platform_version() -> Option<String> {
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/C", "ver"]);
+    crate::proc_util::hide_console_window_std(&mut cmd);
+    cmd.output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn collect_platform_version() -> Option<String> {
+    None
 }
 
 /// 把诊断信息 + 用户描述拼成 MD,写到 ~/Desktop/案件看板反馈_<timestamp>.md。
 /// 返回最终文件的绝对路径。
 /// 2026-05-27 V0.1.13+ · 调用默认邮件客户端发反馈。
 ///
-/// macOS 主路径:
-///   1. osascript 调 Mail.app:写新邮件 + 带 MD 附件,主窗口显示让用户最终点发送
-///   2. 失败 → fallback `open mailto:` 链接(不带附件,用户手动拖)
+/// macOS 主路径:osascript 调 Mail.app 起草邮件并带附件。
+/// 其他平台 / macOS fallback:用系统默认邮件客户端打开 `mailto:` 链接,附件需用户手动添加。
 ///
 /// 返回 `(path_used, warning)`:
 ///   - path_used: "applescript" 或 "mailto"
@@ -965,16 +988,31 @@ pub async fn send_via_default_mail(
     to: &str,
     subject: &str,
 ) -> Result<(String, String), String> {
-    // 安全:转义路径中的 " 和 \ 防 AppleScript 注入
-    fn escape_for_apple_script(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('"', "\\\"")
+    #[cfg(not(target_os = "macos"))]
+    {
+        return fallback_mailto(to, subject).await.map(|_| {
+            (
+                "mailto".to_string(),
+                format!(
+                    "已打开默认邮件客户端。当前系统不支持自动添加附件,请手动把这个 MD 添加到邮件:{}",
+                    md_path
+                ),
+            )
+        });
     }
-    let escaped_path = escape_for_apple_script(md_path);
-    let escaped_to = escape_for_apple_script(to);
-    let escaped_subject = escape_for_apple_script(subject);
 
-    let script = format!(
-        r#"tell application "Mail"
+    #[cfg(target_os = "macos")]
+    {
+        // 安全:转义路径中的 " 和 \ 防 AppleScript 注入
+        fn escape_for_apple_script(s: &str) -> String {
+            s.replace('\\', "\\\\").replace('"', "\\\"")
+        }
+        let escaped_path = escape_for_apple_script(md_path);
+        let escaped_to = escape_for_apple_script(to);
+        let escaped_subject = escape_for_apple_script(subject);
+
+        let script = format!(
+            r#"tell application "Mail"
     activate
     set newMessage to make new outgoing message with properties {{subject:"{subject}", visible:true}}
     tell newMessage
@@ -984,25 +1022,25 @@ pub async fn send_via_default_mail(
         end try
     end tell
 end tell"#,
-        subject = escaped_subject,
-        to = escaped_to,
-        path = escaped_path,
-    );
+            subject = escaped_subject,
+            to = escaped_to,
+            path = escaped_path,
+        );
 
-    // 调 osascript
-    let output = tokio::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .await;
+        // 调 osascript
+        let output = tokio::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .await;
 
-    match output {
-        Ok(out) if out.status.success() => Ok(("applescript".to_string(), String::new())),
-        Ok(out) => {
-            // AppleScript 失败 — 走 fallback mailto
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            crate::dlog!("[feedback] AppleScript 失败,fallback mailto: {}", stderr);
-            fallback_mailto(to, subject)
+        match output {
+            Ok(out) if out.status.success() => Ok(("applescript".to_string(), String::new())),
+            Ok(out) => {
+                // AppleScript 失败 — 走 fallback mailto
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                crate::dlog!("[feedback] AppleScript 失败,fallback mailto: {}", stderr);
+                fallback_mailto(to, subject)
                 .await
                 .map(|_| {
                     (
@@ -1014,36 +1052,37 @@ end tell"#,
                         ),
                     )
                 })
-        }
-        Err(e) => {
-            crate::dlog!("[feedback] osascript 进程启动失败: {}", e);
-            fallback_mailto(to, subject).await.map(|_| {
-                (
-                    "mailto".to_string(),
-                    format!(
-                        "osascript 不可用,已用 mailto 打开默认邮件客户端。\
+            }
+            Err(e) => {
+                crate::dlog!("[feedback] osascript 进程启动失败: {}", e);
+                fallback_mailto(to, subject).await.map(|_| {
+                    (
+                        "mailto".to_string(),
+                        format!(
+                            "osascript 不可用,已用 mailto 打开默认邮件客户端。\
                         **附件请手动把这个 MD 拖进邮件**:{}",
-                        md_path
-                    ),
-                )
-            })
+                            md_path
+                        ),
+                    )
+                })
+            }
         }
     }
 }
 
-/// fallback 路径:`open mailto:`,默认邮件客户端打开新邮件(无附件)。
+/// fallback 路径:用系统默认邮件客户端打开新邮件(无附件)。
 async fn fallback_mailto(to: &str, subject: &str) -> Result<(), String> {
-    let url = format!(
+    let url = mailto_url(to, subject);
+    tauri_plugin_opener::open_url(&url, None::<&str>)
+        .map_err(|e| format!("打开默认邮件客户端失败: {}", e))
+}
+
+fn mailto_url(to: &str, subject: &str) -> String {
+    format!(
         "mailto:{}?subject={}",
         urlencode_simple(to),
         urlencode_simple(subject),
-    );
-    tokio::process::Command::new("open")
-        .arg(&url)
-        .status()
-        .await
-        .map_err(|e| format!("open mailto 失败: {}", e))?;
-    Ok(())
+    )
 }
 
 /// 极简 URL encode(仅处理 mailto 必须的字符)。不引入新 crate。
@@ -1707,7 +1746,7 @@ pub(crate) fn sanitize_paths(s: &str) -> String {
                 j += ch.len_utf8();
             }
             let path = &s[path_start..j];
-            // basename:最后一个 `/` 之后(可能为空,如 `<home>/`)
+            // basename:最后一个 `/` 之后(可能为空)
             let basename = path.rsplit_once('/').map(|(_, b)| b).unwrap_or("");
             out.push_str("<path>");
             if !basename.is_empty() {

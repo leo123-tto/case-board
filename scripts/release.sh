@@ -27,13 +27,11 @@ case "$REQUESTED_ARCH" in
     ARCH="aarch64"
     FILE_ARCH="aarch64"
     BUNDLE_ROOT="target/release/bundle"
-    TARGET_ARGS=()
     ;;
   x86_64|x64|intel)
     ARCH="x86_64"
     FILE_ARCH="x64"
     BUNDLE_ROOT="target/x86_64-apple-darwin/release/bundle"
-    TARGET_ARGS=(--target x86_64-apple-darwin)
     ;;
   *)
     echo "用法: bash scripts/release.sh [aarch64|x86_64]" >&2
@@ -57,7 +55,11 @@ echo "    (首次约 5-10 分钟,后续 1-2 分钟。期间不会弹窗,可放�
 : "${CASEBOARD_TELEMETRY_KEY:?缺少 CASEBOARD_TELEMETRY_KEY}"
 echo "    ✓ 更新签名与匿名遥测环境已就绪"
 
-pnpm tauri build "${TARGET_ARGS[@]}" --bundles app,dmg
+if [ "$ARCH" = "x86_64" ]; then
+  pnpm tauri build --target x86_64-apple-darwin --bundles app,dmg
+else
+  pnpm tauri build --bundles app,dmg
+fi
 
 # 找产出
 # 注意:本项目是 cargo workspace,target 目录在仓库根而不是 src-tauri/target

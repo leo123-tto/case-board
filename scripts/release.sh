@@ -132,7 +132,7 @@ fi
 TELEMETRY_HOST="${CASEBOARD_TELEMETRY_URL#*://}"
 TELEMETRY_HOST="${TELEMETRY_HOST%%/*}"
 if [ -z "$TELEMETRY_HOST" ] ||
-   ! strings "$APP_PATH/Contents/MacOS/caseboard" | grep -Fq "$TELEMETRY_HOST"; then
+   ! grep -aFq "$TELEMETRY_HOST" "$APP_PATH/Contents/MacOS/caseboard"; then
   echo "  ❌ 公开包未检测到匿名遥测 endpoint" >&2
   exit 1
 fi

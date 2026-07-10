@@ -129,7 +129,10 @@ if [ ! -f "$UPDATER_PATH" ] || [ ! -s "$UPDATER_PATH.sig" ]; then
   echo "  ❌ updater 包或签名缺失: $UPDATER_PATH(.sig)" >&2
   exit 1
 fi
-if ! strings "$APP_PATH/Contents/MacOS/caseboard" | grep -Fq "$CASEBOARD_TELEMETRY_URL"; then
+TELEMETRY_HOST="${CASEBOARD_TELEMETRY_URL#*://}"
+TELEMETRY_HOST="${TELEMETRY_HOST%%/*}"
+if [ -z "$TELEMETRY_HOST" ] ||
+   ! strings "$APP_PATH/Contents/MacOS/caseboard" | grep -Fq "$TELEMETRY_HOST"; then
   echo "  ❌ 公开包未检测到匿名遥测 endpoint" >&2
   exit 1
 fi

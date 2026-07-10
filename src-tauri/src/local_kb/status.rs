@@ -131,7 +131,7 @@ fn read_index_stats(kb: &LocalKb) -> (u64, serde_json::Value) {
     };
     let count = map.len() as u64;
     let mut breakdown: HashMap<&'static str, u64> = HashMap::new();
-    for (_k, v) in map.iter() {
+    for v in map.values() {
         let bucket = bucket_of(&v.query_type);
         *breakdown.entry(bucket).or_insert(0) += 1;
     }

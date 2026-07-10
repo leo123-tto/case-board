@@ -132,7 +132,8 @@ fn server_from_def(name: &str, def: &Value) -> Option<McpServerConfig> {
             url: url.to_string(),
             headers,
         }
-    } else if let Some(cmd) = obj.get("command").and_then(|c| c.as_str()) {
+    } else {
+        let cmd = obj.get("command").and_then(|c| c.as_str())?;
         let args = obj
             .get("args")
             .and_then(|a| a.as_array())
@@ -156,8 +157,6 @@ fn server_from_def(name: &str, def: &Value) -> Option<McpServerConfig> {
             args,
             env,
         }
-    } else {
-        return None;
     };
     let name = if name.trim().is_empty() {
         derive_name(&transport)

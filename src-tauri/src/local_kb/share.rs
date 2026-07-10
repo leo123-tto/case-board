@@ -172,7 +172,7 @@ pub fn export_to_zip(kb: &LocalKb, opts: ExportOptions) -> Result<ExportResult, 
     zip.write_all(&index_blob)?;
 
     // 3) 每个 entry 复制
-    for (_key, entry) in index_map.iter() {
+    for entry in index_map.values() {
         let on_disk = kb.yuandian_cache_dir.join(&entry.path);
         if !on_disk.exists() {
             // index 跟磁盘不一致 — 静默跳过,不阻断整次导出

@@ -2,17 +2,42 @@ name: Build Windows
 
 # 在 Windows runner 上编译 .exe 安装器(NSIS),供 Release 分发。
 # 公开仓的 GitHub-hosted runner 免费。手动触发:
-#   gh workflow run build-windows.yml
+#   gh workflow run build-windows.yml --ref main -f release_ref=v0.4.7
 # macOS 的 dmg 在本机用 scripts/release.sh 打包,这里只补 Windows 包。
 on:
   workflow_dispatch:
+    inputs:
+      release_ref:
+        description: "要构建的发布 tag，例如 v0.4.7"
+        required: true
+        type: string
 
 jobs:
   build-windows:
     name: Build Windows installer (.exe)
     runs-on: windows-latest
     steps:
+      # workflow 始终从 main scope 触发，以便不同 tag 复用同一份 Rust cache；
+      # 实际源码仍严格 checkout 到输入的 release tag。
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+
+      - name: Verify release ref and version
+        shell: pwsh
+        run: |
+          $expected = "${{ inputs.release_ref }}"
+          if ($expected -notmatch '^v\d+\.\d+\.\d+$') {
+            Write-Error "release_ref must be a three-part SemVer tag: $expected"
+            exit 1
+          }
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          if ("v$version" -ne $expected) {
+            Write-Error "package.json version v$version does not match $expected"
+            exit 1
+          }
+          git describe --tags --exact-match HEAD
+          Write-Host "building $expected at $(git rev-parse HEAD)"
 
       - uses: pnpm/action-setup@v4
         with:

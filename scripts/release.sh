@@ -1,57 +1,69 @@
 #!/bin/bash
-# CaseBoard release builder · 2026-05-24 e
+# CaseBoard public macOS release builder · 2026-07-10
 #
-# 一键产出 macOS dmg 安装包,并打开 Finder 显示位置(方便上传)。
+# 统一产出 Apple Silicon / Intel macOS 的 dmg + updater 包。
 #
 # 用法:
-#   bash scripts/release.sh
+#   bash scripts/release.sh aarch64
+#   bash scripts/release.sh x86_64
 #
 # 前置:
 #   - 已在 ~/.cargo/bin 装好 cargo / 已在 PATH
 #   - 已 pnpm install(node_modules 完整)
 #
 # 产出:
-#   src-tauri/target/release/bundle/dmg/案件看板_<version>_<arch>.dmg
+#   target[/<rust-target>]/release/bundle/dmg/案件看板_<version>_<arch>.dmg
 
-set -e
+set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# 读 package.json 的 version
+# 读 package.json 的 version，并把两种架构统一映射到真实产物路径。
 VERSION=$(node -p "require('./package.json').version")
-ARCH=$(uname -m)
-# arm64 → aarch64;Tauri 用 aarch64 命名
-if [ "$ARCH" = "arm64" ]; then ARCH="aarch64"; fi
+REQUESTED_ARCH="${1:-aarch64}"
+case "$REQUESTED_ARCH" in
+  aarch64|arm64)
+    ARCH="aarch64"
+    FILE_ARCH="aarch64"
+    BUNDLE_ROOT="target/release/bundle"
+    TARGET_ARGS=()
+    ;;
+  x86_64|x64|intel)
+    ARCH="x86_64"
+    FILE_ARCH="x64"
+    BUNDLE_ROOT="target/x86_64-apple-darwin/release/bundle"
+    TARGET_ARGS=(--target x86_64-apple-darwin)
+    ;;
+  *)
+    echo "用法: bash scripts/release.sh [aarch64|x86_64]" >&2
+    exit 2
+    ;;
+esac
 
 echo "════════════════════════════════════════════════════════"
 echo "  CaseBoard release · v${VERSION} · ${ARCH}"
 echo "════════════════════════════════════════════════════════"
 echo
 
-# 1. 前端构建 (Tauri build 会自动跑 beforeBuildCommand,所以这步可省;留作显式)
-echo "▶ Step 1/2: 前端构建 (pnpm build)"
-pnpm build
-echo
-
-# 2. Tauri 构建(签名/dmg/app)
-echo "▶ Step 2/2: Tauri 构建 (pnpm tauri build --bundles app,dmg)"
+# Tauri 会通过 beforeBuildCommand 自动跑一次 pnpm build；不要重复构建前端。
+echo "▶ Step 1/2: Tauri 构建 (app + dmg)"
 echo "    (首次约 5-10 分钟,后续 1-2 分钟。期间不会弹窗,可放心等)"
-# 注入匿名遥测配置(telemetry/.env.telemetry 为 gitignored;key 进 dmg 但不进 git)。
-# 缺文件时 option_env! 取不到 → 遥测在该 dmg 里自动禁用,不报错。
-if [ -f telemetry/.env.telemetry ]; then
-  # shellcheck disable=SC1091
-  . telemetry/.env.telemetry
-  echo "    ✓ 已注入遥测配置(CASEBOARD_TELEMETRY_URL/KEY)"
-else
-  echo "    ⚠️ 未找到 telemetry/.env.telemetry —— 本次 dmg 不含遥测"
-fi
-pnpm tauri build --bundles app,dmg
+
+# 公开包必须由父 shell 注入更新签名和匿名遥测；缺一项立即失败，避免发出不可更新/无统计包。
+: "${TAURI_SIGNING_PRIVATE_KEY:?缺少 TAURI_SIGNING_PRIVATE_KEY}"
+: "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:?缺少 TAURI_SIGNING_PRIVATE_KEY_PASSWORD}"
+: "${CASEBOARD_TELEMETRY_URL:?缺少 CASEBOARD_TELEMETRY_URL}"
+: "${CASEBOARD_TELEMETRY_KEY:?缺少 CASEBOARD_TELEMETRY_KEY}"
+echo "    ✓ 更新签名与匿名遥测环境已就绪"
+
+pnpm tauri build "${TARGET_ARGS[@]}" --bundles app,dmg
 
 # 找产出
 # 注意:本项目是 cargo workspace,target 目录在仓库根而不是 src-tauri/target
-DMG_PATH="target/release/bundle/dmg/案件看板_${VERSION}_${ARCH}.dmg"
-APP_PATH="target/release/bundle/macos/案件看板.app"
+DMG_PATH="$BUNDLE_ROOT/dmg/案件看板_${VERSION}_${FILE_ARCH}.dmg"
+APP_PATH="$BUNDLE_ROOT/macos/案件看板.app"
+UPDATER_PATH="$BUNDLE_ROOT/macos/案件看板.app.tar.gz"
 
 # 3. 后处理:往 dmg 里塞「请先阅读.txt」+ AppleScript 设置窗口布局
 # 原因:macOS 15.1+ 苹果封死「右键 → 打开」绕过 ad-hoc 签名的路径,
@@ -60,8 +72,8 @@ APP_PATH="target/release/bundle/macos/案件看板.app"
 # 改用纯文本指引 + AppleScript 把指引放在 dmg 窗口顶部最显眼位置。
 if [ -f "$DMG_PATH" ]; then
   echo
-  echo "▶ Step 3/3: 嵌入「请先阅读.txt」+ 设置 dmg 窗口布局"
-  WRITABLE_DMG="target/release/bundle/dmg/_writable.dmg"
+  echo "▶ Step 2/2: 嵌入「请先阅读.txt」+ 设置 dmg 窗口布局"
+  WRITABLE_DMG="$BUNDLE_ROOT/dmg/_writable.dmg"
   VOLNAME="案件看板"
   README="scripts/请先阅读.txt"
 
@@ -111,23 +123,31 @@ APPLESCRIPT
   echo "  ✓ 请先阅读.txt + 窗口布局已嵌入"
 fi
 
+if [ ! -f "$UPDATER_PATH" ] || [ ! -s "$UPDATER_PATH.sig" ]; then
+  echo "  ❌ updater 包或签名缺失: $UPDATER_PATH(.sig)" >&2
+  exit 1
+fi
+if ! strings "$APP_PATH/Contents/MacOS/caseboard" | grep -Fq "$CASEBOARD_TELEMETRY_URL"; then
+  echo "  ❌ 公开包未检测到匿名遥测 endpoint" >&2
+  exit 1
+fi
+
 echo
 echo "════════════════════════════════════════════════════════"
 if [ -f "$DMG_PATH" ]; then
   SIZE=$(du -sh "$DMG_PATH" | cut -f1)
   echo "  ✅ DMG 产出成功"
   echo "  位置: $DMG_PATH"
+  echo "  更新包: $UPDATER_PATH"
   echo "  大小: $SIZE"
   echo
-  echo "  下一步(自行分发):"
-  echo "    1. 把 dmg 上传到你的分发渠道(对象存储 / 自有站点等)"
-  echo "    2. (可选)在 GitHub 推 tag v${VERSION},发 Release"
-  echo "    3. 提示:未签名 dmg 在 macOS 15.1+ 需用户跑 xattr -cr,见 scripts/请先阅读.txt"
-  open -R "$DMG_PATH"
+  echo "  下一步:交给 release manifest 统一上传 GitHub Release 与 lawtools.top"
+  echo "  提示:未签名 dmg 在 macOS 15.1+ 需用户跑 xattr -cr,见 scripts/请先阅读.txt"
+  [ "${CASEBOARD_NO_REVEAL:-0}" = "1" ] || open -R "$DMG_PATH"
 else
   echo "  ❌ DMG 未找到,可能在别的路径(检查 build 日志)"
   echo "  期望位置: $DMG_PATH"
-  ls -la "src-tauri/target/release/bundle/dmg/" 2>/dev/null || echo "  bundle/dmg 目录不存在"
+  ls -la "$BUNDLE_ROOT/dmg/" 2>/dev/null || echo "  bundle/dmg 目录不存在"
   exit 1
 fi
 echo "════════════════════════════════════════════════════════"

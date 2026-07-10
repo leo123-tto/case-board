@@ -32,7 +32,7 @@ jobs:
         run: pnpm build
 
   rust:
-    name: Rust (check + clippy + test)
+    name: Rust (fmt + clippy)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +43,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: ". -> target"
 
       - name: Install Tauri system deps (macOS no-op)
         run: |

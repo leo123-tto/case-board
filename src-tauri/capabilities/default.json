@@ -8,17 +8,8 @@
     "core:window:allow-close",
     "opener:default",
     "dialog:default",
-    "fs:default",
-    "fs:allow-read-file",
     "updater:default",
     "process:default",
-    "process:allow-restart",
-    {
-      "identifier": "fs:scope",
-      "allow": [
-        { "path": "$HOME/**" },
-        { "path": "$TEMP/**" }
-      ]
-    }
+    "process:allow-restart"
   ]
 }

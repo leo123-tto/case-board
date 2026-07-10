@@ -31,8 +31,8 @@ pub struct Document {
     pub extracted_text_hash: Option<String>,
     /// 缓存键 = "<modified_at>:<size>",变了就重抽
     pub cache_key: Option<String>,
-    /// 2026-05-25 加(migration 0014):最近一次抽取失败的错误信息。
-    /// 三轮重试(8 → 4 → 1)全失败后才会落进来。成功 / skipped 时清 NULL。
+    /// 最近一次处理说明：failed 时为错误原因，skipped 时为跳过/仅文本归档原因。
+    /// 成功完整抽取时清 NULL。
     pub last_error: Option<String>,
     /// 2026-05-26 加(migration 0017):文档来源,区分 'scan' / 'llm_extract' / 'chat'。
     /// - 'scan':扫描原始文件夹时录入的源文件(默认)
@@ -81,6 +81,8 @@ pub struct SyncStats {
     pub deleted: usize,
     /// 路径变化但文件身份唯一可确认；复用原文档行与抽取缓存
     pub moved: usize,
+    /// 文件夹扫描时遇到的权限、失联或元数据错误；不参与数据库 diff 计数。
+    pub scan_warnings: Vec<String>,
 }
 
 /// 把一次扫描的所有结果同步到 DB(2026-05-23 晚十 重写,**不再 DELETE+INSERT 全表**)。
@@ -371,6 +373,21 @@ pub async fn reset_for_reextract(pool: &SqlitePool, id: &str) -> Result<u64, sql
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
+}
+
+/// 启动恢复：上次进程退出时仍处于 `processing` 的文档不可能还在后台运行。
+///
+/// 不自动重新请求 OCR/LLM（避免用户一开机就再次消耗额度），而是明确标为 failed，复用案件页
+/// 「重试失败材料」入口。这样异常退出、系统重启或强制关闭后不会永久卡在“抽取中”。
+pub async fn recover_orphaned_processing_documents(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE documents SET extraction_status = 'failed', \
+         last_error = '上次处理未正常结束（应用退出、系统重启或异常中断）。请确认网络、余额和设置后，点击“重试失败材料”。' \
+         WHERE extraction_status = 'processing' AND deleted_at IS NULL",
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// 2026-06-13 · 设置/清除文档级 OCR 后端覆盖(去水印重识别)。

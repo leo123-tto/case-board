@@ -99,6 +99,50 @@ pub fn parse_with_doc_filenames(content: &str, case_docs: &[(String, String)]) -
     }
 }
 
+/// 按引用到的文件名懒加载正文进行校验。
+///
+/// 大案件可能有上百份、数百万字正文；聊天开始前把全部 MD 读进内存，只为最终可能出现的
+/// 1~3 条引用做核验，会造成明显延迟和内存峰值。本入口先解析 citation，再只读取实际引用的文件。
+pub fn parse_with_doc_paths(content: &str, case_docs: &[(String, String)]) -> ParsedCitations {
+    let (cleaned, json_block) = extract_block(content);
+    let mut citations = match json_block {
+        Some(j) => parse_json_array(&j),
+        None => Vec::new(),
+    };
+    let mut loaded: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for citation in &mut citations {
+        if citation.kind != "doc" {
+            continue;
+        }
+        let Some(quote) = citation
+            .quote
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+        else {
+            continue;
+        };
+        let Some((_, path)) = case_docs
+            .iter()
+            .find(|(filename, _)| filename == &citation.source)
+        else {
+            citation.verified = false;
+            continue;
+        };
+        let full = loaded
+            .entry(path.clone())
+            .or_insert_with(|| std::fs::read_to_string(path).ok());
+        citation.verified = full
+            .as_deref()
+            .is_some_and(|content| doc_quote_matches(content, quote));
+    }
+    ParsedCitations {
+        content_cleaned: cleaned,
+        citations,
+    }
+}
+
 /// 归一化用于宽松匹配:去掉所有空白 + 统一常见全/半角标点,降低"原文一字不差"误判。
 fn normalize_for_match(s: &str) -> String {
     s.chars()

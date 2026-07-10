@@ -163,8 +163,8 @@ export function TeamModule() {
   }
 
   return (
-    <div className="h-full overflow-auto bg-background">
-      <div className="mx-auto max-w-6xl px-6 py-6">
+    <div className="app-shell h-full overflow-auto">
+      <div className="app-page-enter mx-auto max-w-6xl px-4 py-6 sm:px-6 xl:px-8">
         {/* 顶栏 */}
         <div className="mb-4 flex flex-wrap items-center gap-3">
           <h2 className="flex items-center gap-2 text-lg font-semibold text-foreground">
@@ -294,17 +294,13 @@ function TeamOnboard({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <div className="h-full overflow-auto bg-background">
-      <div className="mx-auto max-w-3xl px-6 py-10">
+    <div className="app-shell h-full overflow-auto">
+      <div className="app-page-enter mx-auto max-w-3xl px-4 py-8 sm:px-6 xl:py-10">
         <div className="mb-8 text-center">
           <Users className="mx-auto mb-3 size-10 text-sky-500" />
           <h2 className="mb-2 text-lg font-semibold text-foreground">团队看板</h2>
           <p className="text-sm text-muted-foreground">
-            团队成员的在办案件、进度、重要日期,一个看板全看到。
-          </p>
-          <p className="mt-1 text-xs text-muted-foreground">
-            无需服务器:同一办公网内的队友 App 自动互相同步(谁在所谁中转);
-            只同步案件登记信息,不传任何文档原文。
+            同一办公网内同步案件登记信息，不传文档原文。
           </p>
         </div>
 
@@ -1183,8 +1179,8 @@ function TeamCaseDetail({
   }
 
   return (
-    <div className="h-full overflow-auto bg-background">
-      <div className="mx-auto max-w-4xl px-6 py-6">
+    <div className="app-shell h-full overflow-auto">
+      <div className="app-page-enter mx-auto max-w-4xl px-4 py-6 sm:px-6 xl:px-8">
         {/* 头部 */}
         <div className="mb-4 flex flex-wrap items-center gap-2">
           <button

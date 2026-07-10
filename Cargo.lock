@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "caseboard"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -583,7 +583,6 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
- "tauri-plugin-fs",
  "tauri-plugin-opener",
  "tauri-plugin-process",
  "tauri-plugin-updater",

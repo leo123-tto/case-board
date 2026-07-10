@@ -97,7 +97,7 @@ export function verifyYuandianKey(apiKey: string): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_yuandian_key", { apiKey });
 }
 
-/** 2026-05-25 V0.1.8:检测远程最新版本(公开更新元数据 version.json)。
+/** 2026-05-25 V0.1.8:检测远程最新版本(lawtools.top 的 version.json)。
  *  失败时 has_update=false + error 字段填上原因,前端可静默忽略。*/
 export function checkForUpdate(): Promise<UpdateInfo> {
   return invoke<UpdateInfo>("check_for_update");
@@ -1017,6 +1017,11 @@ export function updateCaseOverrides(
   return invoke<void>("update_case_overrides", { caseId, overridesJson });
 }
 
+/** 清空首次 AI 识别 + 人工确认的我方代理立场,其它用户编辑不动。 */
+export function resetCaseOurSide(caseId: string): Promise<void> {
+  return invoke<void>("reset_case_our_side", { caseId });
+}
+
 /**
  * 2026-05-26 V0.1.13 · 写入"首页在办案件"用户拖动后的顺序。
  *
@@ -1040,6 +1045,11 @@ export function recomputeCaseExtraction(caseId: string): Promise<number> {
   return invoke<number>("recompute_case_extraction", { caseId });
 }
 
+/** 批量重试本案所有 failed 源材料,修好余额/Key/模型后使用。 */
+export function retryFailedCaseDocuments(caseId: string): Promise<number> {
+  return invoke<number>("retry_failed_case_documents", { caseId });
+}
+
 /**
  * 刷新案件源文件(增量同步)。
  *
@@ -1056,6 +1066,7 @@ export interface SyncStats {
   unchanged: number;
   deleted: number;
   moved: number;
+  scan_warnings: string[];
 }
 
 export function refreshCaseFiles(
@@ -1496,6 +1507,7 @@ export interface CaseMergeReport {
   added: number;
   deduped: number;
   skipped: number;
+  skipReasons: string[];
   filledFields: string[];
 }
 

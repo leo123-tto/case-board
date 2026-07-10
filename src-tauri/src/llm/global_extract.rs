@@ -20,6 +20,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::tabular_digest::{
+    spreadsheet_text_to_markdown_digest, DEFAULT_SPREADSHEET_DIGEST_MAX_CHARS,
+};
+
 use crate::llm::{
     capability::{LlmProviderKind, ProviderCapability},
     gateway::{complete_non_stream_chat, LlmChatMessage, NonStreamChatRequest},
@@ -311,32 +315,211 @@ const SYSTEM_PROMPT_COMBINED: &str = r###"你是资深律师助理,精通法律�
 pub struct CombinedExtractResult {
     pub table: GlobalExtractTable,
     pub report_md: String,
+    /// 反序列化后的确定性字段质量检查结果，不要求模型输出。
+    #[serde(skip)]
+    pub validation_warnings: Vec<String>,
 }
 
 const GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS: u32 = 12_288;
 const MINIMAX_GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS: u32 = 32_768;
 const EXPERIENCE_DISTILL_MAX_OUTPUT_TOKENS: u32 = 4_096;
 
+const DEEPSEEK_GLOBAL_EXTRACT_MAX_INPUT_CHARS: usize = 900_000;
+const MINIMAX_GLOBAL_EXTRACT_MAX_INPUT_CHARS: usize = 900_000;
+const LARGE_COMPAT_GLOBAL_EXTRACT_MAX_INPUT_CHARS: usize = 220_000;
+const LOCAL_GLOBAL_EXTRACT_MAX_INPUT_CHARS: usize = 90_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetedCorpus {
+    pub corpus: String,
+    pub original_text_chars: usize,
+    pub included_text_chars: usize,
+    pub truncated_docs: usize,
+    pub spreadsheet_digest_docs: usize,
+}
+
 /// 拼接所有文档为一个 LLM 输入。
 pub fn build_corpus(docs: &[DocInput]) -> String {
+    build_corpus_with_char_budget(docs, usize::MAX).corpus
+}
+
+pub fn global_extract_input_char_budget(config: &LlmConfig) -> usize {
+    let capability = ProviderCapability::from_backend("", &config.endpoint, &config.model);
+    match capability.kind {
+        LlmProviderKind::DeepSeek => DEEPSEEK_GLOBAL_EXTRACT_MAX_INPUT_CHARS,
+        LlmProviderKind::MiniMaxNative => MINIMAX_GLOBAL_EXTRACT_MAX_INPUT_CHARS,
+        LlmProviderKind::LocalOpenAiCompat => LOCAL_GLOBAL_EXTRACT_MAX_INPUT_CHARS,
+        LlmProviderKind::GlmCompat
+        | LlmProviderKind::MimoCompat
+        | LlmProviderKind::CustomCompat
+        | LlmProviderKind::UnknownOpenAiCompat => LARGE_COMPAT_GLOBAL_EXTRACT_MAX_INPUT_CHARS,
+    }
+}
+
+pub fn build_corpus_with_char_budget(docs: &[DocInput], max_chars: usize) -> BudgetedCorpus {
+    let original_text_chars = docs
+        .iter()
+        .map(|d| d.text_md.chars().count())
+        .sum::<usize>();
     let mut s = String::new();
     s.push_str(&format!(
         "本案件共 {} 份文档,以下逐份列出。\n\n",
         docs.len()
     ));
-    for (i, d) in docs.iter().enumerate() {
-        s.push_str(&format!(
-            "\n========== 文档 {}/{}: {} | 分类: {} | 阶段: {} ==========\n\n",
-            i + 1,
-            docs.len(),
-            d.filename,
-            d.category.as_deref().unwrap_or("—"),
-            d.stage.as_deref().unwrap_or("—"),
-        ));
-        s.push_str(d.text_md.trim());
+
+    let headers = docs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            format!(
+                "\n========== 文档 {}/{}: {} | 分类: {} | 阶段: {} ==========\n\n",
+                i + 1,
+                docs.len(),
+                d.filename,
+                d.category.as_deref().unwrap_or("—"),
+                d.stage.as_deref().unwrap_or("—"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let fixed_chars = s.chars().count()
+        + headers
+            .iter()
+            .map(|header| header.chars().count() + 1)
+            .sum::<usize>();
+    let text_budget = max_chars.saturating_sub(fixed_chars);
+    let analysis_texts = docs
+        .iter()
+        .map(|d| {
+            spreadsheet_text_to_markdown_digest(
+                &d.filename,
+                d.text_md.trim(),
+                DEFAULT_SPREADSHEET_DIGEST_MAX_CHARS,
+            )
+            .unwrap_or_else(|| d.text_md.trim().to_string())
+        })
+        .collect::<Vec<_>>();
+    let spreadsheet_digest_docs = docs
+        .iter()
+        .zip(analysis_texts.iter())
+        .filter(|(d, text)| text.as_str() != d.text_md.trim())
+        .count();
+    let text_lengths = analysis_texts
+        .iter()
+        .map(|text| text.chars().count())
+        .collect::<Vec<_>>();
+    let allocations = allocate_text_budgets(&text_lengths, text_budget);
+
+    let mut included_text_chars = 0usize;
+    let mut truncated_docs = 0usize;
+    for ((text, header), allocation) in analysis_texts
+        .iter()
+        .zip(headers.iter())
+        .zip(allocations.iter())
+    {
+        s.push_str(header);
+        let (text, truncated, kept_chars) = clip_text_preserving_edges(text, *allocation);
+        if truncated {
+            truncated_docs += 1;
+        }
+        included_text_chars += kept_chars;
+        s.push_str(&text);
         s.push('\n');
     }
-    s
+
+    if max_chars != usize::MAX && s.chars().count() > max_chars {
+        s = s.chars().take(max_chars).collect();
+    }
+
+    BudgetedCorpus {
+        corpus: s,
+        original_text_chars,
+        included_text_chars,
+        truncated_docs,
+        spreadsheet_digest_docs,
+    }
+}
+
+fn allocate_text_budgets(lengths: &[usize], total_budget: usize) -> Vec<usize> {
+    if lengths.is_empty() || total_budget == 0 {
+        return vec![0; lengths.len()];
+    }
+    let mut allocations = vec![0usize; lengths.len()];
+    let mut active = lengths
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, len)| (*len > 0).then_some(idx))
+        .collect::<Vec<_>>();
+    let mut remaining = total_budget;
+
+    while !active.is_empty() && remaining > 0 {
+        let share = remaining / active.len();
+        if share == 0 {
+            for idx in active {
+                if remaining == 0 {
+                    break;
+                }
+                if allocations[idx] < lengths[idx] {
+                    allocations[idx] += 1;
+                    remaining -= 1;
+                }
+            }
+            break;
+        }
+
+        let mut next = Vec::new();
+        let mut spent = 0usize;
+        for idx in active {
+            let need = lengths[idx].saturating_sub(allocations[idx]);
+            let add = need.min(share);
+            allocations[idx] += add;
+            spent += add;
+            if allocations[idx] < lengths[idx] {
+                next.push(idx);
+            }
+        }
+        if spent == 0 {
+            break;
+        }
+        remaining = remaining.saturating_sub(spent);
+        active = next;
+    }
+
+    allocations
+}
+
+fn clip_text_preserving_edges(text: &str, char_budget: usize) -> (String, bool, usize) {
+    let total = text.chars().count();
+    if total <= char_budget {
+        return (text.to_string(), false, total);
+    }
+    if char_budget == 0 {
+        return (String::new(), true, 0);
+    }
+
+    let marker = "\n\n【中间内容已省略:原文过长,已按全案分析上下文预算保留开头和结尾】\n\n";
+    let marker_len = marker.chars().count();
+    if char_budget <= marker_len + 20 {
+        let clipped = text.chars().take(char_budget).collect::<String>();
+        return (clipped, true, char_budget);
+    }
+
+    let content_budget = char_budget - marker_len;
+    let head_budget = content_budget * 2 / 3;
+    let tail_budget = content_budget - head_budget;
+    let head = text.chars().take(head_budget).collect::<String>();
+    let tail = text
+        .chars()
+        .rev()
+        .take(tail_budget)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    (
+        format!("{head}{marker}{tail}"),
+        true,
+        head_budget + tail_budget,
+    )
 }
 
 fn build_combined_user_content(
@@ -406,8 +589,234 @@ pub async fn extract_combined(
     } else {
         strip_markdown_fence(&output.content)
     };
-    serde_json::from_str::<CombinedExtractResult>(&cleaned)
-        .map_err(|e| LlmError::ContentJson(format!("{}\n---原始---\n{}", e, cleaned)))
+    let mut result = serde_json::from_str::<CombinedExtractResult>(&cleaned)
+        .map_err(|e| LlmError::ContentJson(format!("{}\n---原始---\n{}", e, cleaned)))?;
+    result.validation_warnings = validate_and_normalize_table(&mut result.table);
+    Ok(result)
+}
+
+/// 对模型已通过 JSON schema 的结果再做业务一致性检查。这里不猜法律事实，只处理可以确定的
+/// 机械错误（非法日期、越界枚举、负金额、同一主体同时落原被告、最新审级快照不一致）。
+fn validate_and_normalize_table(table: &mut GlobalExtractTable) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    for value in [
+        &mut table.case_no,
+        &mut table.court,
+        &mut table.cause,
+        &mut table.resolution,
+        &mut table.status_text,
+        &mut table.summary,
+    ] {
+        normalize_optional_text(value);
+    }
+    normalize_date_field("立案日期", &mut table.filed_at, &mut warnings);
+
+    if table
+        .claim_amount
+        .is_some_and(|amount| amount <= 0.0 || !amount.is_finite())
+    {
+        warnings.push("诉讼请求金额不是有效正数，已留空待人工确认。".into());
+        table.claim_amount = None;
+    }
+
+    normalize_string_list(&mut table.plaintiffs);
+    normalize_string_list(&mut table.defendants);
+    normalize_string_list(&mut table.third_parties);
+    normalize_string_list(&mut table.judges);
+
+    if let Some(value) = table.workflow_status.as_deref().map(str::trim) {
+        const ALLOWED: &[&str] = &[
+            "接案",
+            "立案中",
+            "仲裁中",
+            "待开庭",
+            "审理中",
+            "已调解",
+            "上诉期",
+            "二审中",
+            "再审中",
+            "执行中",
+            "已结案",
+        ];
+        if !ALLOWED.contains(&value) {
+            warnings.push(format!(
+                "案件状态“{}”不在 11 档枚举内，已保留原有看板状态。",
+                value
+            ));
+            table.workflow_status = None;
+        } else {
+            table.workflow_status = Some(value.to_string());
+        }
+    }
+
+    if let Some(value) = table.our_side.as_deref().map(str::trim) {
+        const ALLOWED: &[&str] = &["原告方", "被告方", "第三人", "反诉混合"];
+        if !ALLOWED.contains(&value) {
+            warnings.push(format!(
+                "我方代理立场“{}”不在允许枚举内，已留空待律师确认。",
+                value
+            ));
+            table.our_side = None;
+        } else {
+            table.our_side = Some(value.to_string());
+        }
+    }
+
+    let defendants: std::collections::HashSet<&str> =
+        table.defendants.iter().map(String::as_str).collect();
+    let overlaps: Vec<String> = table
+        .plaintiffs
+        .iter()
+        .filter(|name| defendants.contains(name.as_str()))
+        .cloned()
+        .collect();
+    if !overlaps.is_empty() {
+        warnings.push(format!(
+            "主体同时出现在原告与被告字段：{}。可能混入反诉或审级称谓，请人工复核。",
+            overlaps.join("、")
+        ));
+    }
+
+    table.key_dates.retain_mut(|date| {
+        date.event = date.event.trim().to_string();
+        if date.event.is_empty() {
+            warnings.push("发现事件类型为空的关键日期，已丢弃该空行。".into());
+            return false;
+        }
+        normalize_date_field(
+            &format!("关键日期“{}”", date.event),
+            &mut date.date,
+            &mut warnings,
+        );
+        normalize_date_field(
+            &format!("关键日期“{}”到期日", date.event),
+            &mut date.expires_at,
+            &mut warnings,
+        );
+        if let (Some(start), Some(end)) = (date.date.as_deref(), date.expires_at.as_deref()) {
+            let start = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d").ok();
+            let end = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d").ok();
+            if matches!((start, end), (Some(start), Some(end)) if end < start) {
+                warnings.push(format!(
+                    "关键日期“{}”的到期日早于起始日，已清空到期日以免生成错误提醒。",
+                    date.event
+                ));
+                date.expires_at = None;
+            }
+        }
+        true
+    });
+
+    for instance in &mut table.instances {
+        normalize_optional_text(&mut instance.level);
+        normalize_optional_text(&mut instance.case_no);
+        normalize_optional_text(&mut instance.authority);
+        normalize_date_field("审级立案日期", &mut instance.filed_at, &mut warnings);
+        if let Some(level) = instance.level.as_deref() {
+            if !["仲裁", "一审", "二审", "再审"].contains(&level) {
+                warnings.push(format!("未知审级“{}”不会写入审级表，请人工复核。", level));
+            }
+        }
+    }
+    for repayment in &mut table.repayments {
+        normalize_date_field("实际还款日期", &mut repayment.paid_at, &mut warnings);
+        if repayment
+            .amount
+            .is_some_and(|amount| amount <= 0.0 || !amount.is_finite())
+        {
+            warnings.push("实际还款金额不是有效正数，该笔不会自动入账。".into());
+            repayment.amount = None;
+        }
+    }
+
+    if let Some(latest) = table
+        .instances
+        .iter()
+        .filter_map(|instance| {
+            let rank = match instance.level.as_deref()? {
+                "仲裁" => 1,
+                "一审" => 2,
+                "二审" => 3,
+                "再审" => 4,
+                _ => return None,
+            };
+            Some((rank, instance))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, instance)| instance)
+    {
+        if latest.case_no.is_some() && table.case_no != latest.case_no {
+            warnings.push("顶层案号与最新审级案号不一致，已按最新审级校正。".into());
+            table.case_no = latest.case_no.clone();
+        }
+        if latest.authority.is_some() && table.court != latest.authority {
+            warnings.push("顶层承办机关与最新审级不一致，已按最新审级校正。".into());
+            table.court = latest.authority.clone();
+        }
+    }
+
+    warnings
+}
+
+fn normalize_optional_text(value: &mut Option<String>) {
+    *value = value
+        .take()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+}
+
+fn normalize_string_list(values: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    values.retain_mut(|value| {
+        *value = value.trim().to_string();
+        !value.is_empty() && seen.insert(value.clone())
+    });
+}
+
+fn normalize_date_field(label: &str, value: &mut Option<String>, warnings: &mut Vec<String>) {
+    let Some(raw) = value.take() else { return };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return;
+    }
+    if let Some(normalized) = normalize_date(raw) {
+        *value = Some(normalized);
+    } else {
+        warnings.push(format!(
+            "{}“{}”不是有效日期，已留空待人工确认。",
+            label, raw
+        ));
+    }
+}
+
+fn normalize_date(raw: &str) -> Option<String> {
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        return Some(date.format("%Y-%m-%d").to_string());
+    }
+    if raw.len() >= 10 {
+        if let Some(prefix) = raw.get(..10) {
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(prefix, "%Y-%m-%d") {
+                return Some(date.format("%Y-%m-%d").to_string());
+            }
+        }
+    }
+    let normalized = raw
+        .replace(['年', '月'], "-")
+        .replace('日', "")
+        .replace(['/', '.'], "-");
+    let parts: Vec<&str> = normalized
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let year = parts[0].parse::<i32>().ok()?;
+    let month = parts[1].parse::<u32>().ok()?;
+    let day = parts[2].parse::<u32>().ok()?;
+    chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .map(|date| date.format("%Y-%m-%d").to_string())
 }
 
 /// 项目1:从已结案/判决案件的信息 + 分析报告,提炼一张「办案经验卡片」(Markdown),

@@ -2,8 +2,8 @@
  * 即时悬停说明气泡。
  *
  * 取代原生 `title` —— 原生 tooltip 在 Tauri WebView 里延迟约 2-3 秒、还是不显眼的
- * 系统小黄条(作者反馈"看不到")。本组件用纯 CSS group-hover 即时弹出,深色反色
- * (bg-foreground/text-background,明暗模式都高对比),默认往上弹、水平居中。
+ * 系统小黄条(作者反馈"看不到")。本组件用纯 CSS group-hover 即时弹出,
+ * 统一使用与主界面一致的浅色磨砂浮层,默认往上弹、水平居中。
  *
  * 用法:用它包住任意可悬停元素(按钮 / 图标 / 文字):
  *   <HoverHint hint="仅导出元典缓存,不含笔记/案件">
@@ -33,7 +33,7 @@ export function HoverHint({
       {children}
       <span
         role="tooltip"
-        className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1.5 hidden w-max max-w-[240px] -translate-x-1/2 rounded-md bg-foreground px-2.5 py-1.5 text-xs leading-relaxed text-background shadow-lg group-hover:block"
+        className="glass-tooltip pointer-events-none invisible absolute bottom-full left-1/2 z-50 mb-2 w-max max-w-[260px] -translate-x-1/2 translate-y-1 scale-[0.98] rounded-lg px-3 py-2 text-xs opacity-0 transition-[opacity,transform,visibility] duration-150 ease-out group-focus-within:visible group-focus-within:translate-y-0 group-focus-within:scale-100 group-focus-within:opacity-100 group-hover:visible group-hover:translate-y-0 group-hover:scale-100 group-hover:opacity-100"
       >
         {hint}
       </span>

@@ -100,7 +100,7 @@ pub fn resolve_python(configured: Option<&str>) -> String {
     if let Some(c) = configured {
         let c = c.trim();
         if !c.is_empty() {
-            return c.to_string();
+            return shellexpand::tilde(c).into_owned();
         }
     }
     if let Some(v) = venv_python_path() {

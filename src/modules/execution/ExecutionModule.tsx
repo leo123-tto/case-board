@@ -118,9 +118,9 @@ export function ExecutionModule({ onCalculateInterest }: Props) {
   }
 
   return (
-    <main className="flex h-full w-full flex-col bg-background">
+    <main className="app-shell flex h-full w-full flex-col">
       {/* 顶部 nav */}
-      <header className="border-b border-border bg-card/50 px-8 py-3">
+      <header className="app-subheader border-b px-4 py-3 sm:px-6 xl:px-8">
         <div className="mx-auto flex max-w-6xl items-center justify-between">
           <div className="flex items-center gap-2">
             <Gavel className="size-4 text-muted-foreground" />
@@ -134,8 +134,8 @@ export function ExecutionModule({ onCalculateInterest }: Props) {
         </div>
       </header>
 
-      <div className="flex-1 overflow-auto px-8 py-8">
-        <div className="mx-auto max-w-6xl">
+      <div className="flex-1 overflow-auto px-4 py-6 sm:px-6 xl:px-8 xl:py-8">
+        <div className="app-page-enter mx-auto max-w-6xl">
           {loading ? (
             <div className="flex h-40 items-center justify-center">
               <Loader2 className="size-5 animate-spin text-muted-foreground" />
@@ -183,16 +183,13 @@ function isExecutionCandidate(caseData: Case): boolean {
 
 function EmptyExecution() {
   return (
-    <div className="rounded-lg border border-dashed border-border bg-card/30 p-12 text-center">
+    <div className="rounded-xl border border-dashed border-border bg-card/45 p-12 text-center">
       <Gavel className="mx-auto size-10 text-muted-foreground/40" />
       <h2 className="mt-4 text-base font-semibold text-foreground">
         当前没有"执行中"案件
       </h2>
       <p className="mt-2 max-w-md mx-auto text-sm text-muted-foreground">
-        案件状态切到「执行中」后会自动出现在这里。
-        <br />
-        诉讼首页案件卡片右上角的状态下拉可以手工切到「执行中」,或者由
-        LLM 在全局抽时自动给出。
+        案件状态切到「执行中」后会自动显示。
       </p>
     </div>
   );
@@ -242,7 +239,7 @@ function ExecutionCard({
     <button
       type="button"
       onClick={onOpen}
-      className="group flex flex-col rounded-lg border border-border bg-card p-5 text-left transition-all hover:shadow-md"
+      className="interactive-surface group flex flex-col rounded-xl border border-border bg-card/92 p-5 text-left hover:border-brand/25"
     >
       <h3 className="line-clamp-1 text-sm font-semibold text-foreground">
         {caseData.name}

@@ -90,6 +90,8 @@ pub struct MergeReport {
     pub deduped: usize,
     /// 资料包里登记但实际文件读不出 / 缺失而跳过的数。
     pub skipped: usize,
+    /// 跳过原因(本地展示,不再只给一个无从核对的数字)。
+    pub skip_reasons: Vec<String>,
     /// 补到目标案件空白字段上的字段名(如 "案号" / "案件概括")。
     pub filled_fields: Vec<String>,
 }
@@ -381,6 +383,9 @@ async fn merge_into(
             .is_some();
         if !read_ok || bytes.is_empty() {
             report.skipped += 1;
+            report
+                .skip_reasons
+                .push(format!("{}:资料包内文件缺失或为空", bf.name));
             continue;
         }
         // 二次校验内容哈希,顺带防包内同内容不同名重复。
@@ -390,8 +395,11 @@ async fn merge_into(
             continue;
         }
         let dest = unique_dest(&dest_dir, &bf.name);
-        if std::fs::write(&dest, &bytes).is_err() {
+        if let Err(e) = std::fs::write(&dest, &bytes) {
             report.skipped += 1;
+            report
+                .skip_reasons
+                .push(format!("{}:无法落盘({})", bf.name, e.kind()));
             continue;
         }
         let dest_str = dest.to_string_lossy().into_owned();
@@ -463,6 +471,21 @@ fn sanitize_filename(name: &str) -> String {
     }
     if s.is_empty() {
         s = "file".to_string();
+    }
+    let stem = Path::new(&s)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            });
+    if reserved {
+        s.insert(0, '_');
     }
     s
 }

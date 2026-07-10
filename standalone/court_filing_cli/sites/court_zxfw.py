@@ -311,7 +311,7 @@ class CourtZxfwService:  # pragma: no cover
 
         # ── 第1优先: Cookie 登录 ──
         if self._cookie_service is not None:
-            cookie_path = self._get_cookie_path(account)
+            cookie_path = self._cookie_path_arg(account)
             loaded = self._cookie_service.load(self.context, cookie_path)
             if loaded:
                 logger.info("已加载 Cookie，尝试跳过登录")
@@ -399,13 +399,22 @@ class CourtZxfwService:  # pragma: no cover
         safe_account = account.replace("@", "_at_").replace("/", "_")
         return f"cookies/{self.site_name}/{safe_account}.json"
 
+    def _cookie_path_arg(self, account: str) -> str | None:
+        """仅在 CookieService 没有构造期绝对路径时才提供历史相对路径。
+
+        CLI 的 `--cookie-dir` 会构造 `CookieService(storage_path=<绝对文件>)`；若这里仍把
+        `_get_cookie_path()` 作为显式参数传入,就会覆盖绝对路径并尝试写只读资源目录。
+        """
+        configured = getattr(self._cookie_service, "storage_path", None)
+        return None if configured else self._get_cookie_path(account)
+
     def _save_cookies(self, account: str) -> None:
         """保存当前浏览器上下文的 Cookie"""
         if self._cookie_service is None:
             return
-        cookie_path = self._get_cookie_path(account)
-        self._cookie_service.save(self.context, cookie_path)
-        logger.info("Cookie 已保存, account=%s, path=%s", account, cookie_path)
+        cookie_path = self._cookie_path_arg(account)
+        saved_path = self._cookie_service.save(self.context, cookie_path)
+        logger.info("Cookie 已保存, account=%s, path=%s", account, saved_path)
 
     def _try_captcha_login(
         self,

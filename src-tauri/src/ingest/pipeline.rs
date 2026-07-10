@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
@@ -39,6 +40,17 @@ const INTER_ROUND_SLEEP_SEC: u64 = 3;
 /// 1400ms 间隔 = ~43 次/分钟,留 7 次 buffer 避免撞顶。
 /// 节流只对**云端 OCR**生效(本机 vision / pdftotext / textutil 不消耗配额)。
 const SUBMIT_MIN_INTERVAL_MS: u64 = 1400;
+
+/// 全应用同一时间只跑一个案件级抽取管线。案内仍按 8→4→1 并发，所以百份材料不会退化成
+/// 单文件串行；这里防止用户在多个案件连续点击刷新/重试后形成 N×8 并发、进度事件互相覆盖。
+static EXTRACTION_PIPELINE_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// 真正跨案件、跨重试轮次共享的 MinerU 提交节流器。
+static GLOBAL_SUBMIT_THROTTLE: OnceLock<SubmitThrottle> = OnceLock::new();
+
+fn global_submit_throttle() -> &'static SubmitThrottle {
+    GLOBAL_SUBMIT_THROTTLE.get_or_init(SubmitThrottle::new)
+}
 
 /// 全局节流闸门 —— 控制 MinerU API 提交频率,避开 50 文件/分钟限流。
 ///
@@ -164,6 +176,8 @@ pub enum ProgressEvent {
         /// 此前静默吞掉、浮层照样显示"全部完成",用户以为成功)
         analysis_ok: bool,
         analysis_error: Option<String>,
+        /// 基于不完整语料、字段逻辑冲突或下游附表写入失败等非致命问题。
+        analysis_warning: Option<String>,
     },
     /// 本机服务 / 云端 token 没就绪,整批没法开跑 — 2026-05-23 加
     Error { case_id: String, error: String },
@@ -175,6 +189,77 @@ pub enum DocOutcome {
     Extracted,
     Skipped { reason: String },
     Failed { error: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureDisposition {
+    /// 网络抖动、限流、服务端错误或偶发格式错误:允许进入下一轮降并发重试。
+    Retryable,
+    /// 当前材料/请求确定性失败(如 400 上下文超限):本材料立即失败,不浪费后两轮。
+    Terminal,
+    /// 账号/鉴权/模型地址属于整批共享配置错误:当前材料失败并让本批其余材料快速收口。
+    AbortBatch,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessOutcome {
+    outcome: DocOutcome,
+    disposition: FailureDisposition,
+}
+
+impl ProcessOutcome {
+    fn finished(outcome: DocOutcome) -> Self {
+        Self {
+            outcome,
+            disposition: FailureDisposition::Terminal,
+        }
+    }
+
+    fn failed(error: String, disposition: FailureDisposition) -> Self {
+        Self {
+            outcome: DocOutcome::Failed { error },
+            disposition,
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        self.disposition == FailureDisposition::Retryable
+    }
+}
+
+fn classify_failure(error: &str) -> FailureDisposition {
+    let normalized = error.to_ascii_lowercase();
+    // 这些状态来自同一批共享的 LLM key / endpoint / model。继续对几十份材料逐一请求
+    // 不可能自愈,只会制造「抽取中半小时」的假卡死。
+    if [401, 402, 403, 404].iter().any(|code| {
+        normalized.contains(&format!("llm 返回错误状态 {code}:"))
+            || normalized.contains(&format!("llm returned status {code}"))
+    }) || normalized.contains("insufficient balance")
+    {
+        return FailureDisposition::AbortBatch;
+    }
+    // 其它 4xx 是确定性请求错误(上下文过长、参数/schema 不兼容等),同一材料降并发也无效。
+    if [400, 405, 409, 410, 422].iter().any(|code| {
+        normalized.contains(&format!("llm 返回错误状态 {code}:"))
+            || normalized.contains(&format!("llm returned status {code}"))
+    }) {
+        return FailureDisposition::Terminal;
+    }
+    FailureDisposition::Retryable
+}
+
+fn batch_abort_error(first_error: &str) -> String {
+    format!(
+        "批量抽取已停止：检测到会影响整批材料的共享故障。请先按首个错误检查磁盘、数据库、余额、API Key、模型或接口，再点「重试失败材料」。首个错误:{}",
+        first_error
+    )
+}
+
+fn persistence_failure(action: &str, error: impl std::fmt::Display) -> ProcessOutcome {
+    ProcessOutcome::failed(
+        format!("保存抽取结果失败（{}）：{}", action, error),
+        FailureDisposition::AbortBatch,
+    )
 }
 
 /// 在 tokio task 里跑批处理。调用立即返回,前端通过事件订阅进度。
@@ -269,17 +354,47 @@ async fn run_extraction(
     documents: &[Document],
     run_analysis: bool,
 ) -> Result<(), String> {
+    let _pipeline_permit = EXTRACTION_PIPELINE_SLOT
+        .acquire()
+        .await
+        .expect("extraction pipeline semaphore must stay open");
+
+    // 等待全局槽位期间，前一个任务可能已处理了同一批文档。重新读当前状态，并只保留调用方
+    // 原本提交的 doc id，避免用旧快照重复 OCR；单文档重抽也不会误带本案其它 pending 材料。
+    let scoped_ids: std::collections::HashSet<&str> = documents
+        .iter()
+        .map(|document| document.id.as_str())
+        .collect();
+    let current_documents = match crate::db::documents::list_documents_by_case(pool, case_id).await
+    {
+        Ok(documents) => documents,
+        Err(error) => {
+            let _ = app.emit(
+                "extraction_progress",
+                ProgressEvent::Error {
+                    case_id: case_id.to_string(),
+                    error: format!("读取待处理材料失败: {}", error),
+                },
+            );
+            return Ok(());
+        }
+    };
+    let scoped_documents: Vec<Document> = current_documents
+        .into_iter()
+        .filter(|document| scoped_ids.contains(document.id.as_str()))
+        .collect();
+
     // 2026-05-23 晚十:重扫不重抽 — 只处理 pending 状态的文档(done / skipped / failed 跳过)
     // 如果用户想强制重抽某文档,可以手工 UPDATE extraction_status='pending'(V0.X 加按钮)
     // 2026-05-24 g · 并发改造:收成 owned Vec<Document>,这样 buffer_unordered 的 closure 可以 move
-    let pending: Vec<Document> = documents
+    let pending: Vec<Document> = scoped_documents
         .iter()
         .filter(|d| d.extraction_status == "pending" && d.deleted_at.is_none())
         .cloned()
         .collect();
 
     let total = pending.len();
-    let total_scanned = documents.len();
+    let total_scanned = scoped_documents.len();
     crate::dlog!(
         "[pipeline] case={} 扫到 {} 份,本次需抽 {} 份(其余已 done / skipped / failed)",
         case_id,
@@ -361,9 +476,9 @@ async fn run_extraction(
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     let completed = Arc::new(AtomicUsize::new(0));
-
-    // 全局节流闸门,跨三轮 + 所有并发 task 共享(避开 MinerU 50 文件/分钟限流)
-    let throttle = Arc::new(SubmitThrottle::new());
+    // 共享账号/配置错误(401/402/403/404)一旦出现,后续尚未真正开始的文档直接失败收口,
+    // 避免 N 份材料 × 3 轮继续撞同一个确定性错误。
+    let batch_abort = Arc::new(std::sync::Mutex::new(None::<String>));
 
     // doc.id → 该 doc 的最终 outcome(每轮覆盖)
     let mut final_outcomes: HashMap<String, DocOutcome> = HashMap::with_capacity(total);
@@ -385,7 +500,7 @@ async fn run_extraction(
             queue.len(),
         );
 
-        let round_results: Vec<(Document, DocOutcome)> =
+        let round_results: Vec<(Document, ProcessOutcome)> =
             stream::iter(queue.into_iter().enumerate())
                 .map(|(index, doc)| {
                     let app = app.clone();
@@ -396,29 +511,72 @@ async fn run_extraction(
                     let ocr_provider = ocr_provider.clone();
                     let llm_provider = llm_provider.clone();
                     let completed = Arc::clone(&completed);
-                    let throttle = Arc::clone(&throttle);
+                    let throttle = global_submit_throttle();
+                    let batch_abort = Arc::clone(&batch_abort);
                     let filename = doc.filename.clone();
                     let doc_id = doc.id.clone();
                     async move {
-                        let outcome = process_one_doc(
-                            &app,
-                            &pool,
-                            &case_id_owned,
-                            &llm_config,
-                            &ocr_ctx,
-                            &ocr_provider,
-                            &llm_provider,
-                            index,
-                            total,
-                            doc.clone(),
-                            round_num,
-                            is_final,
-                            &throttle,
-                        )
-                        .await;
+                        let abort_error = batch_abort
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.clone());
+                        let processed = if let Some(error) = abort_error {
+                            let persist_result = sqlx::query(
+                                "UPDATE documents SET extraction_status = 'failed', last_error = ? WHERE id = ?",
+                            )
+                            .bind(&error)
+                            .bind(&doc.id)
+                            .execute(&pool)
+                            .await;
+                            match persist_result {
+                                Ok(_) => ProcessOutcome::failed(error, FailureDisposition::Terminal),
+                                Err(persist_error) => {
+                                    persistence_failure("批量故障状态", persist_error)
+                                }
+                            }
+                        } else {
+                            process_one_doc(
+                                &app,
+                                &pool,
+                                &case_id_owned,
+                                &llm_config,
+                                &ocr_ctx,
+                                &ocr_provider,
+                                &llm_provider,
+                                index + 1,
+                                total,
+                                doc.clone(),
+                                round_num,
+                                is_final,
+                                throttle,
+                            )
+                            .await
+                        };
+
+                        if processed.disposition == FailureDisposition::AbortBatch {
+                            if let DocOutcome::Failed { error } = &processed.outcome {
+                                // 持久化故障本身可能已恢复（如瞬时 SQLite busy）；再尽力把当前文档
+                                // 从 processing 收口为 failed，避免只能等下次启动恢复。
+                                let _ = sqlx::query(
+                                    "UPDATE documents SET extraction_status = 'failed', last_error = ? \
+                                     WHERE id = ? AND extraction_status = 'processing'",
+                                )
+                                .bind(error)
+                                .bind(&doc.id)
+                                .execute(&pool)
+                                .await;
+                                if let Ok(mut guard) = batch_abort.lock() {
+                                    if guard.is_none() {
+                                        *guard = Some(batch_abort_error(error));
+                                    }
+                                }
+                            }
+                        }
 
                         // 只有最终结果(成功 / skipped / 第 3 轮失败)才递增 completed_count + emit DocFinished
-                        let is_terminal = !matches!(outcome, DocOutcome::Failed { .. }) || is_final;
+                        let is_terminal = !matches!(processed.outcome, DocOutcome::Failed { .. })
+                            || is_final
+                            || !processed.is_retryable();
                         if is_terminal {
                             let done_so_far = completed.fetch_add(1, Ordering::SeqCst) + 1;
                             let _ = app.emit(
@@ -427,14 +585,14 @@ async fn run_extraction(
                                     case_id: case_id_owned,
                                     doc_id,
                                     filename,
-                                    index,
+                                    index: index + 1,
                                     total,
                                     completed_count: done_so_far,
-                                    outcome: outcome.clone(),
+                                    outcome: processed.outcome.clone(),
                                 },
                             );
                         }
-                        (doc, outcome)
+                        (doc, processed)
                     }
                 })
                 .buffer_unordered(concurrency)
@@ -444,13 +602,13 @@ async fn run_extraction(
         // 收集本轮结果:成功/skipped/最终失败 → 写入 final_outcomes;
         // 非最终轮的失败 → 进下一轮 queue
         let mut next_queue: Vec<Document> = Vec::new();
-        for (doc, outcome) in round_results {
-            match &outcome {
-                DocOutcome::Failed { .. } if !is_final => {
+        for (doc, processed) in round_results {
+            match &processed.outcome {
+                DocOutcome::Failed { .. } if !is_final && processed.is_retryable() => {
                     next_queue.push(doc);
                 }
                 _ => {
-                    final_outcomes.insert(doc.id.clone(), outcome);
+                    final_outcomes.insert(doc.id.clone(), processed.outcome);
                 }
             }
         }
@@ -477,7 +635,28 @@ async fn run_extraction(
     // 拼所有 MD → DeepSeek 1M 上下文 → 两次并发 LLM call(填表 + 案件分析报告)
     // 2026-06-13(胡彬律师反馈):run_analysis=false(单文档重识别)时跳过,不烧 DeepSeek;
     //   用户识别完一批后手动点「重新分析」一次即可。
-    let (analysis_ok, analysis_error) = if run_analysis {
+    let aborted_error = batch_abort.lock().ok().and_then(|guard| guard.clone());
+    // 等待全局队列期间，同一批材料可能已经被前一个任务处理并完成分析。此时 total=0 且
+    // analysis_stale=0，直接收口，避免重复烧一次全案 LLM；源文件删除等真正变化会先标 stale。
+    let analysis_stale = if total == 0 && run_analysis {
+        sqlx::query_scalar::<_, i64>("SELECT analysis_stale FROM cases WHERE id = ?")
+            .bind(case_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(1)
+            != 0
+    } else {
+        true
+    };
+    let (analysis_ok, analysis_error, analysis_warning) = if let Some(error) = aborted_error {
+        crate::dlog!(
+            "[global_extract] case={} 跳过:批量抽取已因共享配置错误停止",
+            case_id
+        );
+        (false, Some(error), None)
+    } else if run_analysis && (total > 0 || analysis_stale) {
         // 2026-06-11:这步耗时几十秒~几分钟,先 emit Analyzing 让前端浮层显示"通读全案分析中"
         let _ = app.emit(
             "extraction_progress",
@@ -500,14 +679,24 @@ async fn run_extraction(
                 .map(|e| format!(" err={}", e))
                 .unwrap_or_default(),
         );
-        (report.table_ok, report.error.clone())
+        let analysis_ok = report.table_ok && report.report_ok;
+        (
+            analysis_ok,
+            report.error.clone().or_else(|| {
+                (!report.report_ok).then_some("案件画像已更新，但分析报告未能保存".to_string())
+            }),
+            report.warning.clone(),
+        )
     } else {
-        // 跳过自动分析:不是失败,标 ok(前端 banner 不报警);画像待用户手动「重新分析」更新。
+        // 单文档重识别或重复排队任务：不是失败，标 ok，前端 banner 不报警。
         crate::dlog!(
-            "[global_extract] case={} 跳过自动分析(单文档重识别,省钱),待用户手动「重新分析」",
-            case_id
+            "[global_extract] case={} 跳过自动分析(run_analysis={}, total={}, stale={})",
+            case_id,
+            run_analysis,
+            total,
+            analysis_stale,
         );
-        (true, None)
+        (true, None, None)
     };
 
     let _ = app.emit(
@@ -521,6 +710,7 @@ async fn run_extraction(
             elapsed_ms: start.elapsed().as_millis(),
             analysis_ok,
             analysis_error,
+            analysis_warning,
         },
     );
 
@@ -551,7 +741,7 @@ async fn process_one_doc(
     round_num: usize,
     is_final_round: bool,
     throttle: &SubmitThrottle,
-) -> DocOutcome {
+) -> ProcessOutcome {
     // 文件名加轮次后缀(第 2/3 轮),前端能感知"在重试"
     let display_name = if round_num > 1 {
         format!(
@@ -576,10 +766,14 @@ async fn process_one_doc(
         },
     );
 
-    let _ = sqlx::query("UPDATE documents SET extraction_status = 'processing' WHERE id = ?")
-        .bind(&doc.id)
-        .execute(pool)
-        .await;
+    if let Err(error) =
+        sqlx::query("UPDATE documents SET extraction_status = 'processing' WHERE id = ?")
+            .bind(&doc.id)
+            .execute(pool)
+            .await
+    {
+        return persistence_failure("标记处理中", error);
+    }
 
     // 2026-06-14:云端 OCR 单文档轮询进度 → 前端"排队 / 识别中(已 N 秒)"子状态。
     // 建一个单文档级回传通道 + 转发任务:OCR 轮询循环每拍 send 一次 OcrPollUpdate,
@@ -703,19 +897,20 @@ async fn process_one_doc(
             text_md,
             metrics: _,
         } => {
-            let json = serde_json::to_string(&fields).unwrap_or_else(|_| "null".into());
+            let json = match serde_json::to_string(&fields) {
+                Ok(json) => json,
+                Err(error) => return persistence_failure("序列化字段", error),
+            };
             let extracted_text_path = match write_extracted_md(case_id, &doc.id, &text_md) {
-                Ok(p) => Some(p),
+                Ok(p) => p,
                 Err(e) => {
                     crate::dlog!("[pipeline] 写 extracts/.md 失败: {}", e);
-                    None
+                    return persistence_failure("写入抽取正文", e);
                 }
             };
-            let extracted_text_hash = extracted_text_path
-                .as_ref()
-                .map(|_| crate::db::documents::stable_text_hash(&text_md));
+            let extracted_text_hash = crate::db::documents::stable_text_hash(&text_md);
             // 成功 → 清掉 last_error(可能是上次失败留下的)
-            let _ = sqlx::query(
+            if let Err(error) = sqlx::query(
                 "UPDATE documents SET extracted_fields = ?, extracted_text_path = ?, extracted_text_hash = ?, \
                  extraction_status = 'done', last_error = NULL WHERE id = ?",
             )
@@ -724,8 +919,11 @@ async fn process_one_doc(
             .bind(&extracted_text_hash)
             .bind(&doc.id)
             .execute(pool)
-            .await;
-            DocOutcome::Extracted
+            .await
+            {
+                return persistence_failure("写入字段状态", error);
+            }
+            ProcessOutcome::finished(DocOutcome::Extracted)
         }
         ExtractResult::PartialExtracted {
             fields,
@@ -733,19 +931,21 @@ async fn process_one_doc(
             warning,
             metrics: _,
         } => {
-            if is_final_round {
-                let json = serde_json::to_string(&fields).unwrap_or_else(|_| "null".into());
+            let disposition = classify_failure(&warning);
+            if is_final_round || disposition != FailureDisposition::Retryable {
+                let json = match serde_json::to_string(&fields) {
+                    Ok(json) => json,
+                    Err(error) => return persistence_failure("序列化部分字段", error),
+                };
                 let extracted_text_path = match write_extracted_md(case_id, &doc.id, &text_md) {
-                    Ok(p) => Some(p),
+                    Ok(p) => p,
                     Err(e) => {
                         crate::dlog!("[pipeline] PartialExtracted 写 extracts/.md 失败: {}", e);
-                        None
+                        return persistence_failure("写入部分抽取正文", e);
                     }
                 };
-                let extracted_text_hash = extracted_text_path
-                    .as_ref()
-                    .map(|_| crate::db::documents::stable_text_hash(&text_md));
-                let _ = sqlx::query(
+                let extracted_text_hash = crate::db::documents::stable_text_hash(&text_md);
+                if let Err(error) = sqlx::query(
                     "UPDATE documents SET extracted_fields = ?, extracted_text_path = ?, extracted_text_hash = ?, \
                      extraction_status = 'failed', last_error = ? WHERE id = ?",
                 )
@@ -755,13 +955,19 @@ async fn process_one_doc(
                 .bind(&warning)
                 .bind(&doc.id)
                 .execute(pool)
-                .await;
+                .await
+                {
+                    return persistence_failure("写入部分抽取状态", error);
+                }
             } else {
-                let _ =
+                if let Err(error) =
                     sqlx::query("UPDATE documents SET extraction_status = 'pending' WHERE id = ?")
                         .bind(&doc.id)
                         .execute(pool)
-                        .await;
+                        .await
+                {
+                    return persistence_failure("重新排队部分抽取材料", error);
+                }
                 crate::dlog!(
                     "[pipeline] case={} doc={} 第 {} 轮部分抽取失败,排队下一轮: {}",
                     case_id,
@@ -770,16 +976,21 @@ async fn process_one_doc(
                     warning
                 );
             }
-            DocOutcome::Failed { error: warning }
+            ProcessOutcome::failed(warning, disposition)
         }
         ExtractResult::Skipped { reason, metrics: _ } => {
-            let _ = sqlx::query(
-                "UPDATE documents SET extraction_status = 'skipped', last_error = NULL WHERE id = ?",
+            // skipped 不是失败，但原因必须持久化；顶部进度条消失后用户仍能在材料行看到为什么跳过。
+            if let Err(error) = sqlx::query(
+                "UPDATE documents SET extraction_status = 'skipped', last_error = ? WHERE id = ?",
             )
+            .bind(&reason)
             .bind(&doc.id)
             .execute(pool)
-            .await;
-            DocOutcome::Skipped { reason }
+            .await
+            {
+                return persistence_failure("写入跳过原因", error);
+            }
+            ProcessOutcome::finished(DocOutcome::Skipped { reason })
         }
         // 只抽了文本、没抽字段:状态保持 'skipped'(透明 — 没跑 LLM 字段),但写
         // extracted_text_path,使 read_case_doc / find_in_document / 全文搜索可读。
@@ -787,35 +998,40 @@ async fn process_one_doc(
             text_md,
             metrics: _,
         } => {
+            let reason =
+                "已抽文本未抽字段（归档/身份材料不进入自动案件画像，可由 AI 助手按需读取）";
             let extracted_text_path = match write_extracted_md(case_id, &doc.id, &text_md) {
-                Ok(p) => Some(p),
+                Ok(p) => p,
                 Err(e) => {
                     crate::dlog!("[pipeline] TextOnly 写 extracts/.md 失败: {}", e);
-                    None
+                    return persistence_failure("写入归档正文", e);
                 }
             };
-            let extracted_text_hash = extracted_text_path
-                .as_ref()
-                .map(|_| crate::db::documents::stable_text_hash(&text_md));
-            let _ = sqlx::query(
+            let extracted_text_hash = crate::db::documents::stable_text_hash(&text_md);
+            if let Err(error) = sqlx::query(
                 "UPDATE documents SET extracted_text_path = ?, extracted_text_hash = ?, \
-                 extraction_status = 'skipped', last_error = NULL WHERE id = ?",
+                 extraction_status = 'skipped', last_error = ? WHERE id = ?",
             )
             .bind(&extracted_text_path)
             .bind(&extracted_text_hash)
+            .bind(reason)
             .bind(&doc.id)
             .execute(pool)
-            .await;
-            DocOutcome::Skipped {
-                reason: "已抽文本未抽字段(证据/低价值材料,可被 AI 读取但不占字段)".to_string(),
+            .await
+            {
+                return persistence_failure("写入归档抽取状态", error);
             }
+            ProcessOutcome::finished(DocOutcome::Skipped {
+                reason: reason.to_string(),
+            })
         }
         ExtractResult::Failed {
             error,
             text_md,
             metrics: _,
         } => {
-            if is_final_round {
+            let disposition = classify_failure(&error);
+            if is_final_round || disposition != FailureDisposition::Retryable {
                 let mut extracted_text_hash: Option<String> = None;
                 let extracted_text_path = text_md.as_deref().and_then(|text| {
                     match write_extracted_md(case_id, &doc.id, text) {
@@ -831,7 +1047,7 @@ async fn process_one_doc(
                     }
                 });
                 // 三轮都失败 → 真的 failed,落 last_error 给用户/事后排查看
-                let _ = sqlx::query(
+                if let Err(persist_error) = sqlx::query(
                     "UPDATE documents SET extracted_text_path = COALESCE(?, extracted_text_path), \
                      extracted_text_hash = COALESCE(?, extracted_text_hash), \
                      extraction_status = 'failed', last_error = ? WHERE id = ?",
@@ -841,21 +1057,32 @@ async fn process_one_doc(
                 .bind(&error)
                 .bind(&doc.id)
                 .execute(pool)
-                .await;
+                .await
+                {
+                    return persistence_failure("写入失败状态", persist_error);
+                }
                 crate::dlog!(
-                    "[pipeline] case={} doc={} 三轮全失败: {}",
+                    "[pipeline] case={} doc={} {}: {}",
                     case_id,
                     doc.filename,
+                    if is_final_round {
+                        "三轮全失败"
+                    } else {
+                        "确定性失败,不再重试"
+                    },
                     error
                 );
             } else {
                 // 中间轮失败 → 回退 pending 状态,等下一轮 caller 再喂进来
                 // (不写 last_error,因为下一轮可能成功;只在最终失败才落 error)
-                let _ =
+                if let Err(persist_error) =
                     sqlx::query("UPDATE documents SET extraction_status = 'pending' WHERE id = ?")
                         .bind(&doc.id)
                         .execute(pool)
-                        .await;
+                        .await
+                {
+                    return persistence_failure("重新排队失败材料", persist_error);
+                }
                 crate::dlog!(
                     "[pipeline] case={} doc={} 第 {} 轮失败,排队下一轮: {}",
                     case_id,
@@ -864,7 +1091,7 @@ async fn process_one_doc(
                     error
                 );
             }
-            DocOutcome::Failed { error }
+            ProcessOutcome::failed(error, disposition)
         }
     };
 

@@ -244,6 +244,8 @@ export interface Document {
   extracted_text_hash: string | null;
   /** 缓存键 = "<mtime>:<size>" */
   cache_key: string | null;
+  /** failed 时为错误原因，skipped 时为跳过/仅文本归档说明。 */
+  last_error: string | null;
   /**
    * V0.2 D2(migration 0018)· 引用弹窗排序用。
    * `null` = 未置顶;有值时是 ISO 时间戳,越新越靠前。AttachmentPicker 据此分组。
@@ -268,6 +270,8 @@ export interface ImportResult {
   case: Case;
   docs: ScannedDoc[];
   is_existing: boolean;
+  /** 权限不足、网络盘失联等扫描阶段问题；导入可继续，但材料清单可能不完整。 */
+  scan_warnings: string[];
 }
 
 /** 多案件检测:一个候选案件。对应 Rust `case_split::CaseCandidate`。 */
@@ -1034,6 +1038,8 @@ export type ProgressEvent =
       /** 2026-06-11:全案 LLM 分析是否成功;false 时 agg 字段与详情页没有更新 */
       analysis_ok: boolean;
       analysis_error: string | null;
+      /** 非致命但需要复核的问题：语料不完整、字段冲突、附表保存失败等。 */
+      analysis_warning: string | null;
     }
   | { stage: "error"; case_id: string; error: string };
 

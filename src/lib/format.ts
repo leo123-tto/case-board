@@ -46,11 +46,13 @@ export function formatBytes(bytes: number): string {
  *   // → "/a/b/.../f/g"
  */
 export function shortenPath(path: string, keepEnds = 2): string {
-  const parts = path.split("/").filter(Boolean);
+  const separator = path.includes("\\") ? "\\" : "/";
+  const parts = path.split(/[\\/]/).filter(Boolean);
   if (parts.length <= keepEnds * 2 + 1) return path;
   const head = parts.slice(0, keepEnds);
   const tail = parts.slice(-keepEnds);
-  return "/" + [...head, "...", ...tail].join("/");
+  const prefix = path.startsWith("\\\\") ? "\\\\" : path.startsWith("/") ? "/" : "";
+  return prefix + [...head, "...", ...tail].join(separator);
 }
 
 /**

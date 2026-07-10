@@ -15,8 +15,9 @@ use sqlx::SqlitePool;
 
 use crate::db::case_instances::NewInstance;
 use crate::llm::global_extract::{
-    build_corpus, extract_combined, report_path_for_case, DocInput, GlobalExtractTable,
-    InstanceExtract, RepaymentExtract,
+    build_corpus_with_char_budget, extract_combined, global_extract_input_char_budget,
+    report_path_for_case, BudgetedCorpus, DocInput, GlobalExtractTable, InstanceExtract,
+    RepaymentExtract,
 };
 use crate::llm::LlmConfig;
 
@@ -216,60 +217,109 @@ pub async fn run_global_extract(
 
     let docs_count = docs.len();
     let input_signature = analysis_input_signature(&signature_parts);
-    let corpus = build_corpus(&docs);
+    let corpus_budget = global_extract_input_char_budget(llm_config);
+    let budgeted_corpus = build_corpus_with_char_budget(&docs, corpus_budget);
+    if let Some(w) = corpus_budget_warning(&budgeted_corpus, corpus_budget) {
+        warning = append_warning(warning, w);
+    }
+    let corpus = budgeted_corpus.corpus;
     crate::dlog!(
-        "[global_extract] case={} 拼了 {} 份 MD,{} chars(~{} tokens)",
+        "[global_extract] case={} 拼了 {} 份 MD,{} chars(~{} tokens), 原始正文 {} chars, 纳入正文 {} chars, 表格摘要 {} 份, 裁剪文档 {} 份, 预算 {} chars",
         case_id,
         docs_count,
         corpus.len(),
-        corpus.len() / 4
+        corpus.len() / 4,
+        budgeted_corpus.original_text_chars,
+        budgeted_corpus.included_text_chars,
+        budgeted_corpus.spreadsheet_digest_docs,
+        budgeted_corpus.truncated_docs,
+        corpus_budget
     );
 
-    // 2b. 读律师已确认的「我方代理立场」(详情页改的走 user_overrides_json.fields.agg_our_side)。
-    // 有则回喂当 LLM 输入,保证用户纠正立场后报告/画像按正确立场重写(advisor 命门②:立场双向)。
-    let confirmed_our_side = read_confirmed_our_side(pool, case_id).await;
+    // 2b. 读已锁定的「我方代理立场」:人工确认优先,否则读取第一次 AI 识别值。
+    // 一旦有值就回喂给 LLM,新增材料/重新分析只能沿该立场写报告,不能自行翻转。
+    let confirmed_our_side = read_locked_our_side(pool, case_id).await;
 
     // 3. 单次 LLM call 同时拿表格 + 报告(2026-05-24 i 合并)
     let combined = extract_combined(llm_config, &corpus, confirmed_our_side.as_deref()).await;
 
     let (table_ok, report_ok, report_path_str, err) = match combined {
         Ok(r) => {
+            for validation_warning in &r.validation_warnings {
+                warning = append_warning(warning, validation_warning.clone());
+            }
+            let mut persistence_errors = Vec::new();
             // 报告 MD 落盘
             let report_path = match report_path_for_case(case_id) {
                 Ok(p) => match std::fs::write(&p, &r.report_md) {
                     Ok(_) => Some(p.to_string_lossy().to_string()),
                     Err(e) => {
                         crate::dlog!("[global_extract] 写报告 MD 失败:{}", e);
+                        persistence_errors.push(format!("写案件分析报告失败: {}", e));
                         None
                     }
                 },
                 Err(e) => {
                     crate::dlog!("[global_extract] 算报告路径失败:{}", e);
+                    persistence_errors.push(format!("准备案件分析报告路径失败: {}", e));
                     None
                 }
             };
             // 写 cases 表
-            if let Err(e) =
-                write_table_to_cases(pool, case_id, &r.table, report_path.as_deref()).await
-            {
-                crate::dlog!("[global_extract] 写 cases 失败:{}", e);
-            } else if let Err(e) =
-                crate::db::ai_jobs::mark_case_analysis_current(pool, case_id, &input_signature)
+            let table_ok =
+                match write_table_to_cases(pool, case_id, &r.table, report_path.as_deref()).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        crate::dlog!("[global_extract] 写 cases 失败:{}", e);
+                        persistence_errors.push(format!("写案件画像字段失败: {}", e));
+                        false
+                    }
+                };
+
+            if table_ok {
+                // 审级与还款是画像的下游表；主表失败时不继续制造半写入状态。
+                let mut downstream_ok = true;
+                if let Err(e) = write_instances(pool, case_id, &r.table.instances).await {
+                    downstream_ok = false;
+                    crate::dlog!("[global_extract] 写 case_instances 失败:{}", e);
+                    warning = append_warning(
+                        warning,
+                        format!("案件画像已更新，但审级明细保存失败: {}", e),
+                    );
+                }
+                if let Err(e) =
+                    write_repayments(pool, case_id, &r.table.repayments, &payment_sources).await
+                {
+                    downstream_ok = false;
+                    crate::dlog!("[global_extract] 写还款记录失败:{}", e);
+                    warning = append_warning(
+                        warning,
+                        format!("案件画像已更新，但 AI 识别还款记录保存失败: {}", e),
+                    );
+                }
+                let freshness_result = if downstream_ok {
+                    crate::db::ai_jobs::mark_case_analysis_current(pool, case_id, &input_signature)
+                        .await
+                } else {
+                    crate::db::ai_jobs::mark_case_analysis_stale(
+                        pool,
+                        case_id,
+                        "analysis_persistence_partial",
+                    )
                     .await
-            {
-                crate::dlog!("[global_extract] 写分析输入签名失败:{}", e);
+                };
+                if let Err(e) = freshness_result {
+                    crate::dlog!("[global_extract] 写分析新鲜度标记失败:{}", e);
+                    warning = append_warning(
+                        warning,
+                        format!("案件画像已写入，但分析新鲜度标记保存失败: {}", e),
+                    );
+                }
             }
-            // 2026-06-11 审级模型:instances 落库 + 当前审级快照回写 agg_*
-            if let Err(e) = write_instances(pool, case_id, &r.table.instances).await {
-                crate::dlog!("[global_extract] 写 case_instances 失败:{}", e);
-            }
-            // 还款自动入账(幂等,标 [AI识别])
-            if let Err(e) =
-                write_repayments(pool, case_id, &r.table.repayments, &payment_sources).await
-            {
-                crate::dlog!("[global_extract] 写还款记录失败:{}", e);
-            }
-            (true, report_path.is_some(), report_path, None)
+
+            let report_ok = report_path.is_some();
+            let error = (!persistence_errors.is_empty()).then(|| persistence_errors.join("；"));
+            (table_ok, report_ok, report_path, error)
         }
         Err(e) => {
             crate::dlog!("[global_extract] LLM 调用失败:{}", e);
@@ -297,6 +347,41 @@ fn corpus_incomplete_warning(not_done: i64) -> Option<String> {
         "有 {} 份文档未纳入本次语料,报告基于不完整材料生成,建议先处理失败/未完成材料后重新分析。",
         not_done
     ))
+}
+
+fn corpus_budget_warning(corpus: &BudgetedCorpus, budget: usize) -> Option<String> {
+    if corpus.truncated_docs == 0 && corpus.spreadsheet_digest_docs == 0 {
+        return None;
+    }
+    let mut details = Vec::new();
+    if corpus.spreadsheet_digest_docs > 0 {
+        details.push(format!(
+            "已将 {} 份表格材料转为 Markdown 摘要",
+            corpus.spreadsheet_digest_docs
+        ));
+    }
+    if corpus.truncated_docs > 0 {
+        details.push(format!(
+            "已按 {} 字上下文预算裁剪 {} 份超长文档",
+            budget, corpus.truncated_docs
+        ));
+    }
+    Some(format!(
+        "本案材料过长(原始正文约 {} 字),{}后分析;超长台账/扫描件可能只保留摘要、开头和结尾。",
+        corpus.original_text_chars,
+        details.join(";")
+    ))
+}
+
+fn append_warning(existing: Option<String>, next: String) -> Option<String> {
+    let next = next.trim();
+    if next.is_empty() {
+        return existing;
+    }
+    match existing {
+        Some(prev) if !prev.trim().is_empty() => Some(format!("{} {}", prev.trim(), next)),
+        _ => Some(next.to_string()),
+    }
 }
 
 /// 对所有案件依次跑一遍全局抽。**串行**(每个案件单 LLM call 已经够慢),
@@ -532,30 +617,17 @@ pub fn workflow_status_en_to_zh(en: &str) -> &str {
     }
 }
 
-/// 读律师在详情页确认/纠正过的「我方代理立场」(user_overrides_json.fields.agg_our_side)。
-/// 返回 None = 用户没改过 → 让 LLM 自行推断;Some = 以用户值为准回喂 LLM。
-async fn read_confirmed_our_side(pool: &SqlitePool, case_id: &str) -> Option<String> {
-    // 列可空 → query_scalar 的列类型是 Option<String>,fetch_optional 再裹一层 → 两次 flatten。
-    let json: String = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT user_overrides_json FROM cases WHERE id = ?",
-    )
-    .bind(case_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten()?;
-    let parsed: serde_json::Value = serde_json::from_str(&json).ok()?;
-    let v = parsed
-        .get("fields")
-        .and_then(|f| f.get("agg_our_side"))
-        .and_then(|x| x.as_str())?;
-    let v = v.trim();
-    if v.is_empty() {
-        None
-    } else {
-        Some(v.to_string())
-    }
+/// 读取已经锁定的立场。人工 override 优先;没有人工值时,首次 AI 识别的 agg_our_side
+/// 也视为已锁定并回喂。只有显式「重置立场」把二者清空后,AI 才能重新判断。
+async fn read_locked_our_side(pool: &SqlitePool, case_id: &str) -> Option<String> {
+    let row: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT user_overrides_json, agg_our_side FROM cases WHERE id = ?")
+            .bind(case_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()?;
+    crate::db::cases::effective_our_side(row.1.as_deref(), row.0.as_deref())
 }
 
 /// 把 LLM 抽出来的 GlobalExtractTable 写到 cases 表里。
@@ -581,6 +653,15 @@ async fn write_table_to_cases(
     let status_text_opt = t.status_text.as_deref().filter(|s| !s.trim().is_empty());
     let summary_opt = t.summary.as_deref().filter(|s| !s.trim().is_empty());
     let our_side_opt = t.our_side.as_deref().filter(|s| !s.trim().is_empty());
+    let overrides_json: Option<String> =
+        sqlx::query_scalar("SELECT user_overrides_json FROM cases WHERE id = ?")
+            .bind(case_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    let manual_our_side = crate::db::cases::user_override_our_side(overrides_json.as_deref());
+    let has_manual_our_side = manual_our_side.is_some();
+    let manual_or_llm_our_side = manual_our_side.as_deref().or(our_side_opt);
 
     // D9-1:LLM 输出中文状态 → 前端/DB 统一英文 StatusId(单一口径);不在表内则 None(保留 DB 现值,
     // 用户可能手工标过)。修复"LLM 写中文、前端只认英文 → 推断状态在看板/执行 tab 落不了地"。
@@ -589,7 +670,7 @@ async fn write_table_to_cases(
         .as_deref()
         .and_then(workflow_status_zh_to_en);
 
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE cases SET \
             agg_case_no = COALESCE(?, agg_case_no), \
             agg_court = COALESCE(?, agg_court), \
@@ -606,7 +687,9 @@ async fn write_table_to_cases(
             agg_fees = COALESCE(?, agg_fees), \
             agg_resolution = COALESCE(?, agg_resolution), \
             agg_status_text = COALESCE(?, agg_status_text), \
-            agg_our_side = COALESCE(?, agg_our_side), \
+            agg_our_side = CASE WHEN ? \
+                THEN COALESCE(?, agg_our_side) \
+                ELSE COALESCE(agg_our_side, ?) END, \
             case_summary = COALESCE(?, case_summary), \
             case_report_path = COALESCE(?, case_report_path), \
             case_report_generated_at = ?, \
@@ -630,6 +713,8 @@ async fn write_table_to_cases(
     .bind(&fees_json)
     .bind(resolution_opt)
     .bind(status_text_opt)
+    .bind(has_manual_our_side)
+    .bind(manual_or_llm_our_side)
     .bind(our_side_opt)
     .bind(summary_opt)
     .bind(report_path)
@@ -643,6 +728,10 @@ async fn write_table_to_cases(
     .bind(case_id)
     .execute(pool)
     .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
 
     Ok(())
 }

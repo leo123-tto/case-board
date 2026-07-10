@@ -27,6 +27,8 @@ use serde::Deserialize;
 const BASE_URL: &str = "https://mineru.net/api/v4";
 const POLL_INTERVAL_MS: u64 = 3000;
 const HTTP_TIMEOUT_SEC: u64 = 60;
+/// 200MB 上限文件在普通上行带宽下可能明显超过 60 秒；仅上传请求放宽，轮询仍保持短超时。
+const UPLOAD_TIMEOUT_SEC: u64 = 300;
 /// 下载结果 zip 的重试次数 / 退避(MinerU 处理已成功、zip_url 有效 → 重下不额外烧积分,
 /// 救 openxlab 结果 CDN 偶发抖动;持续被网络层拦截则重试无用,见 classify_dl_err 的提示)。
 const ZIP_DL_RETRIES: u32 = 4;
@@ -139,10 +141,12 @@ pub async fn extract_with_mineru_http(
 
     // ---- Step 2: PUT 上传文件二进制 ----
     // 官方要求:**不设 Content-Type**
-    let file_bytes = std::fs::read(path).map_err(|e| format!("读文件失败: {}", e))?;
+    let (file_body, file_length) = crate::ingest::ocr::streaming_file_body(path).await?;
     let resp = client
         .put(&upload_url)
-        .body(file_bytes)
+        .header(reqwest::header::CONTENT_LENGTH, file_length)
+        .body(file_body)
+        .timeout(Duration::from_secs(UPLOAD_TIMEOUT_SEC))
         .send()
         .await
         .map_err(|e| format!("上传文件失败: {}", e))?;

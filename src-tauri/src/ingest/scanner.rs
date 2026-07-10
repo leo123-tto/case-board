@@ -30,6 +30,17 @@ pub struct ScannedDoc {
     pub modified_at: Option<String>,
 }
 
+/// 一次扫描的完整结果。
+///
+/// 过去 `WalkDir::flatten()` 会把权限不足、目录瞬时失联等错误直接吞掉，用户只会看到
+/// “扫描完成但材料变少”。主导入/刷新链路现在读取本报告并把 warning 透传到前端；老的
+/// `scan_folder*` 包装仍保留，供不需要改变接口的内部调用复用。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ScanReport {
+    pub docs: Vec<ScannedDoc>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScanOptions {
     pub reference_materials: bool,
@@ -336,7 +347,27 @@ pub fn scan_folder(root: &Path) -> Vec<ScannedDoc> {
 }
 
 pub fn scan_folder_with_options(root: &Path, options: ScanOptions) -> Vec<ScannedDoc> {
+    let report = scan_folder_with_report(root, options);
+    for warning in &report.warnings {
+        crate::dlog!("[scanner] {}", warning);
+    }
+    report.docs
+}
+
+/// 带错误明细的扫描入口。warning 最多保留 20 条，避免异常网络盘产生上万条提示；超出部分
+/// 会合并成一条计数摘要。
+pub fn scan_folder_with_report(root: &Path, options: ScanOptions) -> ScanReport {
     let mut docs = Vec::new();
+    let mut warnings = Vec::new();
+    let mut suppressed_warnings = 0usize;
+
+    let mut push_warning = |warning: String| {
+        if warnings.len() < 20 {
+            warnings.push(warning);
+        } else {
+            suppressed_warnings += 1;
+        }
+    };
 
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
         // 跳过整个忽略目录(不递归进去)
@@ -344,7 +375,18 @@ pub fn scan_folder_with_options(root: &Path, options: ScanOptions) -> Vec<Scanne
         !IGNORED_DIRS.iter().any(|d| name.as_ref() == *d)
     });
 
-    for entry in walker.flatten() {
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let location = error
+                    .path()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_else(|| root.to_string_lossy().to_string());
+                push_warning(format!("无法扫描 {}: {}", location, error));
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -359,6 +401,13 @@ pub fn scan_folder_with_options(root: &Path, options: ScanOptions) -> Vec<Scanne
 
         let path = entry.path();
         let meta = entry.metadata();
+        if let Err(error) = &meta {
+            push_warning(format!(
+                "无法读取文件信息 {}: {}",
+                path.to_string_lossy(),
+                error
+            ));
+        }
         let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
         let modified_at = meta.as_ref().ok().and_then(|m| m.modified().ok()).map(|t| {
             let dt: chrono::DateTime<chrono::Utc> = t.into();
@@ -387,7 +436,14 @@ pub fn scan_folder_with_options(root: &Path, options: ScanOptions) -> Vec<Scanne
         });
     }
 
-    docs
+    if suppressed_warnings > 0 {
+        warnings.push(format!(
+            "另有 {} 条扫描错误未逐条显示，请检查文件夹权限或网络盘连接",
+            suppressed_warnings
+        ));
+    }
+
+    ScanReport { docs, warnings }
 }
 
 // ============================================================================

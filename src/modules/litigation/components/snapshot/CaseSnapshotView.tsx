@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Pencil } from "lucide-react";
+import { Pencil, RotateCcw } from "lucide-react";
 import {
   DndContext,
   type DragEndEvent,
@@ -15,7 +15,9 @@ import {
 } from "@dnd-kit/sortable";
 
 import { type Case, type CaseInstance, type Document } from "@/lib/types";
-import { listCaseInstances } from "@/lib/api";
+import { listCaseInstances, resetCaseOurSide } from "@/lib/api";
+import { confirmDialog } from "@/lib/dialog";
+import { toast } from "@/components/ui/toast";
 import { formatYuan } from "@/lib/format";
 import { computeCaseSnapshot } from "@/lib/caseSnapshot";
 import { extractExecutionCaseNoFromCase, getTrialCaseNo } from "@/lib/caseNumbers";
@@ -66,6 +68,7 @@ export function CaseSnapshotView({
   showWorkLogs = false,
   showWorkReports = false,
   onWorkLogSaved,
+  onReloadCase,
 }: {
   caseData: Case;
   documents: Document[];
@@ -76,10 +79,34 @@ export function CaseSnapshotView({
   showWorkLogs?: boolean;
   showWorkReports?: boolean;
   onWorkLogSaved?: () => void;
+  onReloadCase?: () => void;
 }) {
   // 刑事 tab 只做「标签级」适配(老板:先复刻框架 + 能做的轻适配,不深改字段管线)。
   const isCriminal = domain === "criminal";
   const ov = useCaseOverrides(caseData.id, caseData.user_overrides_json);
+  const [resettingOurSide, setResettingOurSide] = useState(false);
+
+  const handleResetOurSide = async () => {
+    if (resettingOurSide) return;
+    const ok = await confirmDialog(
+      "重置后会清空当前已锁定的我方代理立场。你可以重新人工选择,或点「重新分析」让 AI 重新识别。案件材料和其它人工修改不会变化。",
+      { danger: true, okLabel: "重置立场" },
+    );
+    if (!ok) return;
+    setResettingOurSide(true);
+    try {
+      // 先把本地尚未落盘的其它编辑一起保存,再由后端只移除立场字段。
+      ov.clearField("agg_our_side");
+      await ov.flush();
+      await resetCaseOurSide(caseData.id);
+      onReloadCase?.();
+      toast("我方代理立场已重置 · 可重新选择,或重新分析让 AI 再识别", "success");
+    } catch (e) {
+      toast(`重置立场失败:${e}`, "error");
+    } finally {
+      setResettingOurSide(false);
+    }
+  };
 
   // 2026-06-11 审级模型:多审级案件([仲裁]→一审→二审→[再审])加载审级实例,
   // ≥2 个审级时渲染「审级历程」卡(最新在上)。重抽后(agg_computed_at 变)自动刷新。
@@ -596,7 +623,7 @@ export function CaseSnapshotView({
       )}
 
       {/* Hero:案由 + 案号 + 法院 + vs banner + 关键数字 */}
-      <section className="rounded-lg border border-border bg-card px-6 py-5 shadow-sm">
+      <section className="surface-card overflow-hidden px-5 py-5 sm:px-6">
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <h2 className="text-xl font-semibold text-foreground">
             {isEditMode ? (
@@ -689,22 +716,35 @@ export function CaseSnapshotView({
                   value={snap.our_side ?? ""}
                   onChange={(e) => {
                     const v = e.target.value;
-                    if (v === "") ov.clearField("agg_our_side");
-                    else ov.setField("agg_our_side", v);
+                    if (v) ov.setField("agg_our_side", v);
                   }}
                   className="rounded border border-border bg-background px-2 py-0.5 text-sm text-foreground"
                   aria-label="选择我方代理立场"
                 >
-                  <option value="">未确认(跟随 AI 判断)</option>
+                  <option value="" disabled>请选择立场</option>
                   <option value="原告方">原告方</option>
                   <option value="被告方">被告方</option>
                   <option value="第三人">第三人</option>
                   <option value="反诉混合">反诉混合</option>
                 </select>
-                {ov.hasFieldOverride("agg_our_side") && (
-                  <span className="text-xs text-sky-700">
-                    已手改 · 改完去下方「原文件 → 重新分析」让报告/画像按新立场重写
-                  </span>
+                <span className="text-xs text-sky-700">
+                  {ov.hasFieldOverride("agg_our_side")
+                    ? "人工确认 · 已锁定；重新分析后报告会同步新立场"
+                    : caseData.agg_our_side
+                      ? "AI 首次识别 · 已锁定；新增材料不会自动改判"
+                      : "尚未识别；选择后立即锁定"}
+                </span>
+                {(snap.our_side || caseData.agg_our_side) && (
+                  <button
+                    type="button"
+                    onClick={() => void handleResetOurSide()}
+                    disabled={resettingOurSide}
+                    className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-background hover:text-foreground disabled:cursor-wait disabled:opacity-60"
+                    title="清空当前锁定立场,允许重新选择或重新识别"
+                  >
+                    <RotateCcw className={resettingOurSide ? "size-3 animate-spin" : "size-3"} />
+                    重置立场
+                  </button>
                 )}
               </>
             ) : snap.our_side ? (

@@ -156,19 +156,19 @@ export function useCaseOverrides(
   // 公共 mutation 包装:更新 state + ref + 重置 debounce timer
   const mutate = useCallback(
     (fn: (o: UserOverrides) => UserOverrides) => {
-      setOverrides((prev) => {
-        const next = fn(prev);
-        latestRef.current = next;
-        if (timerRef.current) clearTimeout(timerRef.current);
-        const cid = caseIdRef.current;
-        if (cid) {
-          timerRef.current = setTimeout(() => {
-            timerRef.current = null;
-            void writeToDb(cid, latestRef.current);
-          }, DEBOUNCE_MS);
-        }
-        return next;
-      });
+      // 先基于 ref 同步算出 next,再交给 React 渲染。这样调用方紧接着 await flush()
+      // 时一定拿到刚才的值,不会被 React 的异步 state 调度留在旧快照。
+      const next = fn(latestRef.current);
+      latestRef.current = next;
+      setOverrides(next);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      const cid = caseIdRef.current;
+      if (cid) {
+        timerRef.current = setTimeout(() => {
+          timerRef.current = null;
+          void writeToDb(cid, latestRef.current);
+        }, DEBOUNCE_MS);
+      }
     },
     [writeToDb],
   );

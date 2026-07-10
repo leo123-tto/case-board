@@ -24,8 +24,8 @@ export function TransactionModule() {
   // 详情视图:合同审查
   if (activeTool === "contract_review") {
     return (
-      <main className="flex h-full w-full flex-col bg-background">
-        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+      <main className="app-shell flex h-full w-full flex-col">
+        <header className="app-subheader flex shrink-0 items-center gap-3 border-b px-4 py-2.5 sm:px-6">
           <button
             type="button"
             onClick={() => setActiveTool(null)}
@@ -41,7 +41,7 @@ export function TransactionModule() {
           </h2>
         </header>
         <div className="flex-1 overflow-auto">
-          <div className="mx-auto max-w-4xl space-y-5 px-8 py-6">
+          <div className="app-page-enter mx-auto max-w-4xl space-y-5 px-4 py-5 sm:px-6 xl:px-8 xl:py-6">
             <p className="text-[11px] text-muted-foreground/70">
               审查方法论参考杨卫薪律师 contract-copilot(CC BY-NC),prompt / 引擎 /
               意见书均由本系统自建。
@@ -56,8 +56,8 @@ export function TransactionModule() {
   // 详情视图:合同起草
   if (activeTool === "contract_draft") {
     return (
-      <main className="flex h-full w-full flex-col bg-background">
-        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+      <main className="app-shell flex h-full w-full flex-col">
+        <header className="app-subheader flex shrink-0 items-center gap-3 border-b px-4 py-2.5 sm:px-6">
           <button
             type="button"
             onClick={() => setActiveTool(null)}
@@ -73,7 +73,7 @@ export function TransactionModule() {
           </h2>
         </header>
         <div className="flex-1 overflow-auto">
-          <div className="mx-auto max-w-4xl px-8 py-6">
+          <div className="app-page-enter mx-auto max-w-4xl px-4 py-5 sm:px-6 xl:px-8 xl:py-6">
             <ContractDraftTool />
           </div>
         </div>
@@ -83,15 +83,15 @@ export function TransactionModule() {
 
   // 卡片网格(默认)
   return (
-    <main className="flex h-full w-full flex-col bg-background">
+    <main className="app-shell flex h-full w-full flex-col">
       <div className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-4xl space-y-5 px-8 py-6">
+        <div className="app-page-enter mx-auto max-w-4xl space-y-6 px-4 py-6 sm:px-6 xl:px-8 xl:py-8">
           <header>
             <h1 className="text-lg font-semibold tracking-tight text-foreground">
               非诉
             </h1>
             <p className="mt-1 text-xs text-muted-foreground">
-              合同与非诉业务工具。点卡片进入对应功能。
+              合同审查与起草。
             </p>
           </header>
 
@@ -99,13 +99,13 @@ export function TransactionModule() {
             <LegalToolCard
               icon={ShieldCheck}
               title="合同审查"
-              desc="上传合同 .docx → AI 三层扫描 → 分级风险清单 + 审查意见书 / 修订批注版 Word。"
+              desc="扫描合同风险，生成意见书与修订版 Word。"
               onClick={() => setActiveTool("contract_review")}
             />
             <LegalToolCard
               icon={FileSignature}
               title="合同起草"
-              desc="描述交易需求 → AI 按三观四步法识别类型、引导补全要素、生成合同草案,可导出 Word。"
+              desc="补全交易要素，生成可导出的合同草案。"
               badge="Beta"
               onClick={() => setActiveTool("contract_draft")}
             />

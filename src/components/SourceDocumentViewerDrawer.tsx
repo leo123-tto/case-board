@@ -13,7 +13,6 @@ import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { readFile } from "@tauri-apps/plugin-fs";
 import {
   X,
   Loader2,
@@ -31,6 +30,7 @@ import {
 import {
   allowCaseAssets,
   readTextFile,
+  readCaseFileBytes,
   openInDefaultApp,
   revealInFinder,
   convertDocToDocx,
@@ -39,6 +39,11 @@ import {
   addDocumentBookmark,
   deleteDocumentBookmark,
 } from "@/lib/api";
+import {
+  workbookToPreviewSheets,
+  type SpreadsheetPreviewSheet,
+  type SpreadsheetPreviewUtils,
+} from "@/lib/spreadsheetPreview";
 import type { Document, Bookmark, SearchHit } from "@/lib/types";
 import { cn, docDisplayName } from "@/lib/utils";
 
@@ -707,7 +712,7 @@ function PdfView({
   );
 }
 
-/** .docx(docx-preview)/ Excel(SheetJS)板内渲染:读字节 → 渲进容器。库都是动态 import(代码分包)。 */
+/** .docx(docx-preview)/ Excel(SheetJS)板内渲染:读字节 → 板内预览。库都是动态 import(代码分包)。 */
 function OfficeView({
   path,
   filename,
@@ -720,30 +725,30 @@ function OfficeView({
   const containerRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<"loading" | "ok" | "error">("loading");
   const [err, setErr] = useState<string | null>(null);
+  const [sheets, setSheets] = useState<SpreadsheetPreviewSheet[]>([]);
 
   useEffect(() => {
     let cancelled = false;
     setStatus("loading");
     setErr(null);
+    setSheets([]);
     (async () => {
       try {
         if (isSpreadsheet(filename)) {
-          // .xlsx / .xls / .csv → 每个 sheet 渲成 HTML 表格
-          const bytes = await readFile(path); // office 文件小,IPC 字节可接受
+          // .xlsx / .xls / .csv → 只取文本矩阵,由 React 渲染为 inert text。
+          const bytes = await readCaseFileBytes(path); // office 文件小,IPC 字节可接受
           const XLSX = await import("xlsx");
           const wb = XLSX.read(bytes, { type: "array" });
-          if (cancelled || !containerRef.current) return;
-          containerRef.current.innerHTML = wb.SheetNames.map((name) => {
-            const html = XLSX.utils.sheet_to_html(wb.Sheets[name]);
-            return `<div class="mb-1 mt-3 text-xs font-semibold text-stone-500">${name}</div>${html}`;
-          }).join("");
+          const previewSheets = workbookToPreviewSheets(wb, XLSX.utils as SpreadsheetPreviewUtils);
+          if (cancelled) return;
+          setSheets(previewSheets);
         } else {
           // .docx 直接渲;老 .doc/.rtf/.odt 先转成 .docx(mac textutil / Win soffice)再渲
           const docxPath = isConvertibleDoc(filename)
             ? await convertDocToDocx(path)
             : path;
           if (cancelled) return;
-          const bytes = await readFile(docxPath);
+          const bytes = await readCaseFileBytes(docxPath);
           if (cancelled || !containerRef.current) return;
           containerRef.current.innerHTML = "";
           const { renderAsync } = await import("docx-preview");
@@ -786,18 +791,63 @@ function OfficeView({
           </button>
         </div>
       )}
-      {/* 容器常驻挂载(renderAsync 需要已挂载的 DOM 节点) */}
-      <div
-        ref={containerRef}
-        className={cn(
-          "bg-white px-4 py-4",
-          status !== "ok" && "hidden",
-          // Excel 表格基础样式
-          "[&_table]:my-2 [&_table]:border-collapse [&_table]:text-xs",
-          "[&_td]:border [&_td]:border-stone-200 [&_td]:px-2 [&_td]:py-1",
-          "[&_th]:border [&_th]:border-stone-200 [&_th]:bg-stone-50 [&_th]:px-2 [&_th]:py-1",
-        )}
-      />
+      {status === "ok" && isSpreadsheet(filename) && <SpreadsheetPreview sheets={sheets} />}
+      {!isSpreadsheet(filename) && (
+        // 容器常驻挂载(renderAsync 需要已挂载的 DOM 节点)
+        <div
+          ref={containerRef}
+          className={cn(
+            "bg-white px-4 py-4",
+            status !== "ok" && "hidden",
+          )}
+        />
+      )}
+    </div>
+  );
+}
+
+function SpreadsheetPreview({ sheets }: { sheets: SpreadsheetPreviewSheet[] }) {
+  if (sheets.length === 0) {
+    return (
+      <div className="flex min-h-[180px] items-center justify-center bg-white text-sm text-stone-400">
+        这份表格没有可预览内容
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-5 bg-white px-4 py-4">
+      {sheets.map((sheet, sheetIndex) => (
+        <section key={`${sheetIndex}-${sheet.name}`} className="min-w-0">
+          <div className="mb-1 mt-1 text-xs font-semibold text-stone-500">
+            {sheet.name}
+          </div>
+          {sheet.rows.length === 0 ? (
+            <div className="rounded border border-stone-200 px-3 py-2 text-xs text-stone-400">
+              空表
+            </div>
+          ) : (
+            <div className="overflow-auto">
+              <table className="border-collapse text-xs">
+                <tbody>
+                  {sheet.rows.map((row, rowIndex) => (
+                    <tr key={rowIndex}>
+                      {row.map((cell, cellIndex) => (
+                        <td
+                          key={cellIndex}
+                          className="max-w-[360px] whitespace-pre-wrap break-words border border-stone-200 px-2 py-1 align-top text-stone-700"
+                        >
+                          {cell}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      ))}
     </div>
   );
 }

@@ -85,43 +85,43 @@ const LEGAL_TOOLS: LegalTool[] = [
   {
     id: "number",
     title: "数字大写转换器",
-    desc: "阿拉伯数字实时转中文大写金额,支持角分",
+    desc: "数字转中文大写金额，支持角分。",
     icon: Hash,
   },
   {
     id: "daycal",
     title: "天数计算器",
-    desc: "算两个日期之间天数,或从某天加减若干天推算",
+    desc: "计算日期间隔，或按天数推算日期。",
     icon: Calendar,
   },
   {
     id: "fee",
     title: "律师费计算器",
-    desc: "按案件类型 + 标的额计算律师服务费(一口价 / 基础+风险)",
+    desc: "按案件类型与标的额估算律师费。",
     icon: Calculator,
   },
   {
     id: "legalfee",
     title: "诉讼费计算器",
-    desc: "按《诉讼费用交纳办法》算财产 / 离婚案件诉讼费 + 财产保全费",
+    desc: "计算诉讼费与财产保全费。",
     icon: Scale,
   },
   {
     id: "interest",
     title: "利息 / 执行款计算器",
-    desc: "借款利息(LPR 历史)+ 执行款(多案 / 还款抵扣 / 五阶段清偿 / 迟延履行利息)",
+    desc: "计算 LPR 利息、执行款、还款抵扣和迟延履行利息。",
     icon: TrendingUp,
   },
   {
     id: "traffic",
     title: "交通事故赔偿计算器",
-    desc: "残疾/死亡赔偿金、被扶养人生活费、各项费用 + 责任比例 + 交强险扣减,带法律依据",
+    desc: "计算伤残、死亡、被扶养人等交通事故赔偿。",
     icon: Car,
   },
   {
     id: "labor",
     title: "劳动解除赔偿计算器",
-    desc: "经济补偿 N / 代通知金 N+1 / 违法解除 2N + 3 倍社平封顶 + 未休年假,带法律依据",
+    desc: "计算 N、N+1、2N、封顶与未休年假。",
     icon: Briefcase,
   },
 ];
@@ -150,8 +150,8 @@ export function ToolsModule({
   // ──────────── 知识库共享(独立于计算器,自带视图) ────────────
   if (activeTool === "kbshare") {
     return (
-      <main className="flex h-full w-full flex-col bg-background">
-        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+      <main className="app-shell flex h-full w-full flex-col">
+        <header className="app-subheader flex shrink-0 items-center gap-3 border-b px-4 py-2.5 sm:px-6">
           <button
             type="button"
             onClick={() => setActiveTool(null)}
@@ -164,7 +164,7 @@ export function ToolsModule({
           <h2 className="text-sm font-medium text-foreground">本地知识库共享</h2>
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
-          <div className="mx-auto max-w-3xl px-6 py-6">
+          <div className="app-page-enter mx-auto max-w-3xl px-4 py-5 sm:px-6 xl:py-6">
             <KbShareTool />
           </div>
         </div>
@@ -175,8 +175,8 @@ export function ToolsModule({
   // ──────────── 案件资料包合并(双人办案,自带视图) ────────────
   if (activeTool === "casebundle") {
     return (
-      <main className="flex h-full w-full flex-col bg-background">
-        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+      <main className="app-shell flex h-full w-full flex-col">
+        <header className="app-subheader flex shrink-0 items-center gap-3 border-b px-4 py-2.5 sm:px-6">
           <button
             type="button"
             onClick={() => setActiveTool(null)}
@@ -189,7 +189,7 @@ export function ToolsModule({
           <h2 className="text-sm font-medium text-foreground">案件资料包合并(双人办案)</h2>
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
-          <div className="mx-auto max-w-3xl px-6 py-6">
+          <div className="app-page-enter mx-auto max-w-3xl px-4 py-5 sm:px-6 xl:py-6">
             <CaseBundleTool />
           </div>
         </div>
@@ -200,8 +200,8 @@ export function ToolsModule({
   // ──────────── 办案画像(案件数据分析,自带视图) ────────────
   if (activeTool === "lawyerinsights") {
     return (
-      <main className="flex h-full w-full flex-col bg-background">
-        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+      <main className="app-shell flex h-full w-full flex-col">
+        <header className="app-subheader flex shrink-0 items-center gap-3 border-b px-4 py-2.5 sm:px-6">
           <button
             type="button"
             onClick={() => setActiveTool(null)}
@@ -214,7 +214,7 @@ export function ToolsModule({
           <h2 className="text-sm font-medium text-foreground">办案画像</h2>
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
-          <div className="mx-auto max-w-5xl px-6 py-6">
+          <div className="app-page-enter mx-auto max-w-5xl px-4 py-5 sm:px-6 xl:py-6">
             <LawyerInsightsTool />
           </div>
         </div>
@@ -225,8 +225,8 @@ export function ToolsModule({
   // ──────────── 法院短信处理(独立于计算器,自带视图) ────────────
   if (activeTool === "courtsms") {
     return (
-      <main className="flex h-full w-full flex-col bg-background">
-        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+      <main className="app-shell flex h-full w-full flex-col">
+        <header className="app-subheader flex shrink-0 items-center gap-3 border-b px-4 py-2.5 sm:px-6">
           <button
             type="button"
             onClick={() => setActiveTool(null)}
@@ -239,7 +239,7 @@ export function ToolsModule({
           <h2 className="text-sm font-medium text-foreground">法院短信处理</h2>
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
-          <div className="mx-auto max-w-3xl px-6 py-6">
+          <div className="app-page-enter mx-auto max-w-3xl px-4 py-5 sm:px-6 xl:py-6">
             <CourtSmsTool />
           </div>
         </div>
@@ -250,8 +250,8 @@ export function ToolsModule({
   // ──────────── 快递查询(独立于计算器,自带视图) ────────────
   if (activeTool === "courier") {
     return (
-      <main className="flex h-full w-full flex-col bg-background">
-        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+      <main className="app-shell flex h-full w-full flex-col">
+        <header className="app-subheader flex shrink-0 items-center gap-3 border-b px-4 py-2.5 sm:px-6">
           <button
             type="button"
             onClick={() => setActiveTool(null)}
@@ -264,7 +264,7 @@ export function ToolsModule({
           <h2 className="text-sm font-medium text-foreground">快递查询</h2>
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
-          <div className="mx-auto max-w-3xl px-6 py-6">
+          <div className="app-page-enter mx-auto max-w-3xl px-4 py-5 sm:px-6 xl:py-6">
             <CourierTool />
           </div>
         </div>
@@ -275,8 +275,8 @@ export function ToolsModule({
   // ──────────── 滴答清单 ToDo 同步(独立于计算器,自带视图) ────────────
   if (activeTool === "ticktick") {
     return (
-      <main className="flex h-full w-full flex-col bg-background">
-        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+      <main className="app-shell flex h-full w-full flex-col">
+        <header className="app-subheader flex shrink-0 items-center gap-3 border-b px-4 py-2.5 sm:px-6">
           <button
             type="button"
             onClick={() => setActiveTool(null)}
@@ -289,7 +289,7 @@ export function ToolsModule({
           <h2 className="text-sm font-medium text-foreground">滴答清单 ToDo 同步</h2>
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
-          <div className="mx-auto max-w-3xl px-6 py-6">
+          <div className="app-page-enter mx-auto max-w-3xl px-4 py-5 sm:px-6 xl:py-6">
             <TickTickPanel />
           </div>
         </div>
@@ -300,8 +300,8 @@ export function ToolsModule({
   // ──────────── 飞书联动（日历 + 手机提醒） ────────────
   if (activeTool === "feishu") {
     return (
-      <main className="flex h-full w-full flex-col bg-background">
-        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+      <main className="app-shell flex h-full w-full flex-col">
+        <header className="app-subheader flex shrink-0 items-center gap-3 border-b px-4 py-2.5 sm:px-6">
           <button
             type="button"
             onClick={() => setActiveTool(null)}
@@ -314,7 +314,7 @@ export function ToolsModule({
           <h2 className="text-sm font-medium text-foreground">飞书联动</h2>
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
-          <div className="mx-auto max-w-3xl px-6 py-6">
+          <div className="app-page-enter mx-auto max-w-3xl px-4 py-5 sm:px-6 xl:py-6">
             <FeishuCalendarTool />
           </div>
         </div>
@@ -325,8 +325,8 @@ export function ToolsModule({
   // ──────────── 辅助在线立案(独立于计算器,自带视图) ────────────
   if (activeTool === "courtfiling") {
     return (
-      <main className="flex h-full w-full flex-col bg-background">
-        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+      <main className="app-shell flex h-full w-full flex-col">
+        <header className="app-subheader flex shrink-0 items-center gap-3 border-b px-4 py-2.5 sm:px-6">
           <button
             type="button"
             onClick={() => setActiveTool(null)}
@@ -339,7 +339,7 @@ export function ToolsModule({
           <h2 className="text-sm font-medium text-foreground">辅助在线立案</h2>
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
-          <div className="mx-auto max-w-3xl px-6 py-6">
+          <div className="app-page-enter mx-auto max-w-3xl px-4 py-5 sm:px-6 xl:py-6">
             <CourtFilingTool />
           </div>
         </div>
@@ -354,8 +354,8 @@ export function ToolsModule({
   // ────────────────────────── 工具视图态 ──────────────────────────
   if (tool) {
     return (
-      <main className="flex h-full w-full flex-col bg-background">
-        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+      <main className="app-shell flex h-full w-full flex-col">
+        <header className="app-subheader flex shrink-0 items-center gap-3 border-b px-4 py-2.5 sm:px-6">
           <button
             type="button"
             onClick={() => setActiveTool(null)}
@@ -369,7 +369,7 @@ export function ToolsModule({
         </header>
 
         <div className="min-h-0 flex-1 overflow-auto">
-          <div className="mx-auto max-w-3xl px-6 py-6">
+          <div className="app-page-enter mx-auto max-w-3xl px-4 py-5 sm:px-6 xl:py-6">
             {tool.id === "number" && <NumberConverter />}
             {tool.id === "daycal" && <DateCalculator />}
             {tool.id === "fee" && <LawyerFeeCalculator />}
@@ -396,12 +396,28 @@ export function ToolsModule({
 
   // ────────────────────────── 工具列表态 ──────────────────────────
   return (
-    <main className="flex h-full w-full flex-col bg-background">
+    <main className="app-shell flex h-full w-full flex-col">
       <div className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl space-y-6 px-8 py-6">
+        <div className="app-page-enter mx-auto max-w-6xl space-y-8 px-4 py-6 sm:px-6 xl:px-8 xl:py-8">
+          <header className="flex flex-wrap items-end justify-between gap-4">
+            <div>
+              <p className="font-mono text-caption uppercase tracking-wider text-brand">
+                WORKSPACE
+              </p>
+              <h1 className="mt-1 text-2xl font-semibold tracking-tight text-foreground">
+                工具
+              </h1>
+              <p className="mt-1 text-sm text-muted-foreground">
+                常用计算、案件协作与自动化集中在这里。
+              </p>
+            </div>
+            <span className="rounded-md border border-brand/10 bg-brand-soft/60 px-2.5 py-1 font-mono text-caption text-brand">
+              {LEGAL_TOOLS.length + 9} 项可用
+            </span>
+          </header>
           {/* 法律计算工具(可用) */}
-          <section className="space-y-2">
-            <div className="px-1">
+          <section className="space-y-3">
+            <div className="border-l-2 border-brand/45 pl-3">
               <h2 className="text-sm font-semibold text-foreground">
                 法律计算工具
               </h2>
@@ -420,104 +436,104 @@ export function ToolsModule({
           </section>
 
           {/* 知识库共享(团队协作 · 省积分) */}
-          <section className="space-y-2">
-            <div className="px-1">
+          <section className="space-y-3">
+            <div className="border-l-2 border-brand/45 pl-3">
               <h2 className="text-sm font-semibold text-foreground">
                 知识库共享
               </h2>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                把花积分查过的元典结果打包发给同事,或导入同事的包 —— 团队互相省积分
+                导入或导出元典缓存资料包，团队共享查询结果。
               </p>
             </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <LegalToolCard
                 icon={Share2}
                 title="本地知识库共享"
-                desc="导出 / 导入元典缓存资料包(.zip),团队互通、互相省积分"
+                desc="导入或导出元典缓存资料包。"
                 onClick={() => setActiveTool("kbshare")}
               />
               <LegalToolCard
                 icon={Combine}
                 title="案件资料包(双人办案合并)"
-                desc="导出某案件给合办律师 / 导入对方资料包合并进同一案件,材料按内容去重、并集、不冲突"
+                desc="导出或合并合办律师的案件资料包。"
                 onClick={() => setActiveTool("casebundle")}
               />
             </div>
           </section>
 
           {/* 案件数据分析 */}
-          <section className="space-y-2">
-            <div className="px-1">
+          <section className="space-y-3">
+            <div className="border-l-2 border-brand/45 pl-3">
               <h2 className="text-sm font-semibold text-foreground">案件数据分析</h2>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                基于看板里的本机案件数据做统计和导出,不给不存在的胜诉率、收入、案源渠道硬下结论
+                统计本机案件数据，不推测缺失指标。
               </p>
             </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <LegalToolCard
                 icon={BarChart3}
                 title="办案画像"
-                desc="统计高频案由、主要法院、代理立场、案件状态和标的金额,导出 Markdown 给 AI 继续分析"
+                desc="统计案由、法院、代理立场、状态与标的金额。"
                 onClick={() => setActiveTool("lawyerinsights")}
               />
             </div>
           </section>
 
           {/* 日程 / 待办同步 */}
-          <section className="space-y-2">
-            <div className="px-1">
+          <section className="space-y-3">
+            <div className="border-l-2 border-brand/45 pl-3">
               <h2 className="text-sm font-semibold text-foreground">日程 / 待办同步</h2>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                跟手机滴答清单双向同步个人待办,首页展示;用你自己注册的滴答应用连自己账号
+                连接滴答或飞书，把待办与日历带到手机。
               </p>
             </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <LegalToolCard
                 icon={ListChecks}
                 title="滴答清单 ToDo 同步"
-                desc="连接手机滴答(收件箱),双向同步待办、勾完成两边同步;每分钟 + 切回 App 自动同步"
+                desc="双向同步手机滴答待办。"
                 onClick={() => setActiveTool("ticktick")}
               />
               <LegalToolCard
                 icon={CalendarClock}
                 title="飞书联动"
-                desc="读取飞书日历，也可把案件待办和关键日期每天推送到飞书手机；两项均可独立开关"
+                desc="读取飞书日历，推送案件待办与关键日期。"
                 onClick={() => setActiveTool("feishu")}
               />
             </div>
           </section>
 
           {/* 案件自动化 */}
-          <section className="space-y-2">
-            <div className="px-1">
+          <section className="space-y-3">
+            <div className="border-l-2 border-brand/45 pl-3">
               <h2 className="text-sm font-semibold text-foreground">案件自动化</h2>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                把重复的取件 / 归档动作交给程序
+                处理重复的收件、查询与归档工作。
               </p>
             </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <LegalToolCard
                 icon={Gavel}
                 title="法院短信处理"
-                desc="粘贴一张网送达短信 → 自动下载文书、归档进对应案件、抽取上看板"
+                desc="从送达短信下载文书并归档到案件。"
                 onClick={() => setActiveTool("courtsms")}
               />
               <LegalToolCard
                 icon={Truck}
                 title="快递查询"
-                desc="查 EMS / 顺丰等物流轨迹(寄送达、材料追踪);需配快递100 key"
+                desc="查询 EMS、顺丰等物流轨迹。"
                 onClick={() => setActiveTool("courier")}
               />
               <LegalToolCard
                 icon={Gavel}
                 title="辅助在线立案(实验)"
-                desc="一张网自动填到预览页停、不自动提交;配置+律师档案在此,发起在案件详情页;需本机 Python 运行时"
+                desc="自动填写到预览页，不会提交。"
                 onClick={() => setActiveTool("courtfiling")}
               />
               <LegalToolCard
                 icon={FileOutput}
                 title="要素式文书转换（Beta）"
-                desc="共同测试版：抽取要素、人工复核后生成 Word；结果必须由律师核对"
+                desc="抽取要素，人工复核后生成 Word。"
                 onClick={() => setActiveTool("elementconvert")}
               />
             </div>

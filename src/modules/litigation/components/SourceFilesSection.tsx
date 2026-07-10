@@ -92,6 +92,8 @@ export function SourceFilesSection({
   refreshing,
   onReanalyze,
   reanalyzing,
+  onRetryFailed,
+  retryingFailed,
 }: {
   total: number;
   aiArtifacts: Document[];
@@ -124,6 +126,9 @@ export function SourceFilesSection({
   /** 2026-06-11 · 重新分析:只重跑全案 LLM 分析(不重跑 OCR),分析失败后的重试入口 */
   onReanalyze: () => void;
   reanalyzing: boolean;
+  /** 余额/Key/模型恢复后,一次重试本案全部 failed 源材料。 */
+  onRetryFailed: () => void;
+  retryingFailed: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const toggle = () => setExpanded((v) => !v);
@@ -132,7 +137,7 @@ export function SourceFilesSection({
 
   // 非 AI 产物的源文件,派生原始文件夹树(只读派生,跟着 source_path 走)
   const sourceDocs = useMemo(
-    () => documents.filter((d) => !d.is_ai_artifact),
+    () => documents.filter((d) => !d.is_ai_artifact && !d.deleted_at),
     [documents],
   );
   const tree = useMemo(
@@ -148,6 +153,8 @@ export function SourceFilesSection({
     onMarkSubmissionStage,
     onRename,
   };
+  const failedDocs = sourceDocs.filter((doc) => doc.extraction_status === "failed");
+  const failedCount = failedDocs.length;
 
   return (
     <section className="rounded-lg border border-border bg-card shadow-sm">
@@ -179,6 +186,24 @@ export function SourceFilesSection({
           </span>
         </div>
         <div className="flex items-center gap-3">
+          {failedCount > 0 && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onRetryFailed();
+              }}
+              disabled={retryingFailed}
+              title="修好 LLM 余额、Key 或模型后,一次重试本案全部失败材料"
+              className={cn(
+                "inline-flex items-center gap-1 rounded-md border border-amber-300 bg-amber-50 px-2.5 py-1 text-xs text-amber-800 transition-colors hover:bg-amber-100",
+                retryingFailed && "cursor-wait opacity-60",
+              )}
+            >
+              <RefreshCw className={cn("size-3", retryingFailed && "animate-spin")} />
+              {retryingFailed ? "启动中…" : `重试失败 ${failedCount}`}
+            </button>
+          )}
           <button
             type="button"
             onClick={(e) => {
@@ -221,6 +246,30 @@ export function SourceFilesSection({
 
       {expanded && (
         <div className="space-y-6 border-t border-border px-5 py-5">
+          {failedDocs.length > 0 && (
+            <div
+              role="alert"
+              className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-3 text-xs text-amber-950"
+            >
+              <p className="font-medium">
+                {failedDocs.length} 份材料处理失败。请先按下面原因修复，再重试失败材料。
+              </p>
+              <ul className="mt-2 space-y-1">
+                {failedDocs.slice(0, 8).map((doc) => (
+                  <li key={doc.id} className="break-words">
+                    <span className="font-medium">{docDisplayName(doc)}</span>
+                    <span className="text-amber-800">
+                      {`：${doc.last_error?.trim() || "OCR 或字段识别失败，未返回具体原因"}`}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              {failedDocs.length > 8 && (
+                <p className="mt-2 text-amber-800">另有 {failedDocs.length - 8} 份失败材料。</p>
+              )}
+            </div>
+          )}
+
           {/* 视图切换 */}
           <div className="flex items-center gap-1 rounded-lg bg-muted/40 p-1 text-xs">
             <ViewTab active={viewMode === "organize"} onClick={() => setViewMode("organize")}>
@@ -695,8 +744,8 @@ function FileTile({
       onContextMenu={onContextMenu}
       title={
         renamed
-          ? `${docDisplayName(doc)}\n原文件名:${doc.filename}(右键可重命名/标记)`
-          : `${doc.filename}(右键可重命名/标记)`
+          ? `${docDisplayName(doc)}\n原文件名:${doc.filename}(右键可重命名/标记)${doc.last_error ? `\n处理说明：${doc.last_error}` : ""}`
+          : `${doc.filename}(右键可重命名/标记)${doc.last_error ? `\n处理说明：${doc.last_error}` : ""}`
       }
       className={cn(
         "group relative flex aspect-square flex-col items-center justify-center gap-1.5 rounded-xl border p-2 text-center transition",
@@ -1731,11 +1780,12 @@ function ExtractStatus({
     );
   }
   if (status === "failed") {
+    const failureDetail = doc.last_error?.trim() || "OCR 或字段识别出错，未返回具体原因";
     return (
       <span className="flex shrink-0 items-center gap-1">
         <span
           className="inline-flex items-center gap-1 rounded bg-destructive/10 px-1.5 py-0.5 text-label font-medium text-destructive"
-          title="这份文档抽取失败(OCR 或字段识别出错),点右边按钮重抽"
+          title={`这份文档抽取失败：${failureDetail}\n修复对应问题后，可点右边按钮重抽。`}
         >
           <CircleAlert className="size-3" />
           抽取失败
@@ -1754,11 +1804,12 @@ function ExtractStatus({
     );
   }
   // skipped 及其他
+  const skippedDetail = doc.last_error?.trim() || "该材料按当前策略跳过";
   return (
     <span className="flex shrink-0 items-center gap-0.5">
       <span
         className="text-label text-muted-foreground/60"
-        title="律所规范/程序材料,按设计不抽取正文(仍可在 chat 里读全文);如需可手动重抽"
+        title={skippedDetail}
       >
         跳过
       </span>

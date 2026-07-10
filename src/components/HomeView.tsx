@@ -606,28 +606,29 @@ export function HomeView({
   }, [ctxMenu]);
 
   return (
-    <main className="flex h-full w-full flex-col bg-background">
-      <header className="border-b border-border bg-card/50 px-8 py-3">
+    <main className="app-shell flex h-full w-full flex-col">
+      <header className="app-subheader border-b px-4 py-3 sm:px-6 xl:px-8">
         <div className="mx-auto flex max-w-6xl items-center">
           <h1 className="text-sm font-semibold tracking-tight text-foreground">案件看板</h1>
         </div>
       </header>
 
       <div className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl px-8 py-8">
+        <div className="app-page-enter mx-auto max-w-6xl px-4 py-6 sm:px-6 xl:px-8 xl:py-8">
           <div className="mb-10 grid grid-cols-1 gap-6 md:grid-cols-2">
-            <div className="relative md:pr-40">
+            <div className="relative overflow-hidden rounded-xl border border-brand/10 bg-brand-soft/55 p-5 shadow-[inset_0_1px_0_oklch(1_0_0/0.72)] md:pr-44">
               <Button
                 onClick={onImport}
-                className="absolute right-0 top-0 hidden border border-border bg-background text-foreground shadow-sm hover:bg-muted md:inline-flex"
+                variant="outline"
+                className="absolute right-5 top-5 hidden md:inline-flex"
               >
                 <FolderOpen className="size-3.5" />
                 导入案件
               </Button>
-              <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+              <p className="font-mono text-caption uppercase tracking-wider text-brand">
                 OVERVIEW · {monthLabel}
               </p>
-              <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
+              <h1 className="mt-2 text-3xl font-semibold tracking-tight text-foreground xl:text-4xl">
                 {greeting}
               </h1>
               <p className="mt-2 text-sm text-muted-foreground">
@@ -652,7 +653,7 @@ export function HomeView({
               )}
               <Button
                 onClick={onImport}
-                className="mt-5 bg-foreground text-background hover:bg-foreground/90 md:hidden"
+                className="mt-5 md:hidden"
               >
                 <FolderOpen className="size-3.5" />
                 导入案件
@@ -730,7 +731,7 @@ export function HomeView({
               </div>
 
               {filterBarOn && (
-              <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card/60 p-3">
+              <div className="surface-card flex flex-wrap items-center gap-2 bg-card/70 p-3">
                 <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   排序
                   <select
@@ -812,8 +813,7 @@ export function HomeView({
                 </div>
                 <p className="w-full text-[11px] leading-relaxed text-muted-foreground">
                   点上方 <CheckSquare className="mb-0.5 inline size-3" />
-                  「多选」可勾选多个案件批量删除 ——
-                  只删看板里的记录,不动你的原始文件夹,以后还能重新导入。
+                  「多选」只删除看板记录，不动原始文件夹。
                 </p>
               </div>
               )}
@@ -829,7 +829,7 @@ export function HomeView({
                     visibleIds.length > 0 &&
                     selectedVisible.length === visibleIds.length;
                   return (
-                    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-sky-200 bg-sky-50/70 px-3 py-2.5 dark:border-sky-900/50 dark:bg-sky-950/30">
+                    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-brand/20 bg-brand-soft/75 px-3 py-2.5">
                       <span className="text-sm font-medium text-foreground">
                         已选 {selectedVisible.length} 个
                       </span>
@@ -874,11 +874,11 @@ export function HomeView({
             {cases.length === 0 ? (
               <EmptyCases onImport={onImport} />
             ) : filteredRows.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-border bg-card/30 px-6 py-12 text-center text-sm text-muted-foreground">
+              <div className="rounded-xl border border-dashed border-border bg-card/45 px-6 py-12 text-center text-sm text-muted-foreground">
                 没有符合筛选条件的案件
               </div>
             ) : effViewMode === "list" ? (
-              <div className="overflow-hidden rounded-xl border border-border bg-card">
+              <div className="surface-card overflow-hidden">
                 {filteredRows.map((row) => (
                   <CaseListRow
                     key={row.caseData.id}
@@ -1052,10 +1052,10 @@ function CaseCard({
   return (
     <div
       className={cn(
-        "group relative flex cursor-pointer flex-col rounded-xl border border-border bg-card p-5 text-left shadow-sm transition-all hover:border-foreground/30 hover:bg-foreground/[0.025] hover:shadow-lg",
+        "interactive-surface group relative flex cursor-pointer flex-col rounded-xl border border-border bg-card/92 p-5 text-left shadow-sm hover:border-brand/25 hover:bg-card",
         isDragging && "border-dashed",
         isClosed && "opacity-60",
-        selectMode && selected && "border-sky-400 bg-sky-50/60 ring-2 ring-sky-300 dark:bg-sky-950/30",
+        selectMode && selected && "border-brand bg-brand-soft/70 ring-2 ring-brand/25",
       )}
       onClick={handleActivate}
       onContextMenu={onContextMenu}
@@ -1163,7 +1163,7 @@ function CaseListRow({
   return (
     <div
       className={cn(
-        "grid cursor-pointer grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-muted/50",
+        "grid cursor-pointer grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-4 py-3 text-left transition-[transform,background-color] duration-150 last:border-b-0 hover:bg-brand-soft/45 active:scale-[0.997]",
         status.id === "closed" && "opacity-60",
         selectMode && selected && "bg-sky-50/70 dark:bg-sky-950/30",
       )}
@@ -1391,7 +1391,7 @@ function ImportantDates({
     durationMs: 500,
   });
   return (
-    <div className="rounded-xl border border-border bg-card p-5">
+    <div className="surface-card p-5">
       <div className="mb-3 flex items-baseline justify-between">
         <h2 className="text-sm font-semibold tracking-tight">重要提醒</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
@@ -1403,7 +1403,7 @@ function ImportantDates({
           <CalendarClock className="size-6 text-muted-foreground/40" />
           <p className="mt-2 text-xs text-muted-foreground">暂无近期事件</p>
           <p className="mt-1 text-caption text-muted-foreground/70">
-            导入案件后,开庭 / 保全续封会自动出现在这里
+            导入后，开庭和续封提醒会显示在这里。
           </p>
         </div>
       ) : (
@@ -1494,7 +1494,7 @@ function TodoSummary({ onPickCase }: { onPickCase: (caseId: string) => void }) {
   if (rows.length === 0) return null;
 
   return (
-    <div className="rounded-xl border border-border bg-card p-5">
+    <div className="surface-card p-5">
       <div className="mb-3 flex items-baseline justify-between">
         <h2 className="text-sm font-semibold tracking-tight">待办汇总</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
@@ -1618,7 +1618,7 @@ function MyTodosCard() {
   const open = items.filter((i) => !i.done);
 
   return (
-    <div className="rounded-xl border border-border bg-card p-5">
+    <div className="surface-card p-5">
       <div className="mb-3 flex items-baseline justify-between">
         <h2 className="text-sm font-semibold tracking-tight">我的待办</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
@@ -1934,7 +1934,7 @@ function CalendarPanel({
   };
 
   return (
-    <section className="rounded-xl border border-border bg-card p-5">
+    <section className="surface-card p-5">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <CalendarDays className="size-4 text-muted-foreground" />
@@ -2504,10 +2504,10 @@ function getGreeting(name: string | null): string {
 
 function EmptyCases({ onImport }: { onImport: () => void }) {
   return (
-    <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-card/30 px-6 py-16 text-center">
+    <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-card/45 px-6 py-16 text-center">
       <FolderOpen className="size-10 text-muted-foreground/40" />
       <p className="mt-4 text-base font-medium text-foreground">还没有导入任何案件</p>
-      <p className="mt-1 text-sm text-muted-foreground">选择一个案件文件夹开始</p>
+      <p className="mt-1 text-sm text-muted-foreground">选择案件文件夹即可开始。</p>
       <Button onClick={onImport} className="mt-6">
         <FolderOpen className="size-3.5" />
         导入案件文件夹

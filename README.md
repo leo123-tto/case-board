@@ -11,7 +11,7 @@
 
 ## 是什么
 
-CaseBoard 是单人律师的**案件进展可视化看板**,定位:取代 Excel 案件登记表。
+CaseBoard 是面向个人律师和小团队的**案件进展可视化看板**,定位:取代 Excel 案件登记表。
 
 - **打开 App 一眼看清** 案件在哪个阶段、关键信息是什么 —— 不用再去源文件夹翻
 - **当前阶段的信息显示在最前** —— 在执行就显执行卡,在审理就显审理卡
@@ -40,14 +40,14 @@ CaseBoard 是单人律师的**案件进展可视化看板**,定位:取代 Excel 
 
 ### 🪄 LLM 全局抽 — 不靠规则,模型通读全案
 
-把案件所有文档(起诉状 / 判决书 / 调解书 / 笔录 / 合同 / 身份证 等)的文本拼起来,**一次性喂给 DeepSeek 1M 上下文模型**,让它输出:
+把案件材料按格式提取并在上下文预算内组成全案语料;超大表格先生成受控摘要,长材料会分块处理,再让模型输出:
 
 1. **结构化 JSON 填表** — 案号 / 法院 / 案由 / 当事人 / 法官 / 关键日期 / 收费 / 调解结果 / 案件一句话概括 全部自动填到数据库
 2. **完整案件分析报告 MD** — 资深律师助理视角的案件梳理,包含案件概况 / 当事人与代理 / 时间线 / 争议焦点 / 程序进展 / 关键日期提醒 / 法院联系 / 注意事项
 
 对比传统"规则聚合":跨文档关联 / 反诉去污 / 同名合并 / 字段去重 全由 LLM 自动处理,**改字段只需改 prompt**,不再维护几百行规则代码。
 
-实测一个 18 份文档的案件,DeepSeek v4-flash 全局抽 25 秒,成本 < ¥0.01。
+实际耗时和成本取决于材料数量、OCR 页数、模型与网络状态;界面会显示逐份进度和失败原因。
 
 ### 🔍 元典查被执行人 + LLM 风险提示报告(执行模块独占)
 
@@ -91,13 +91,13 @@ LLM 抽 key_dates 时自动给出 `expires_at`(应用法律知识):
 - **HTML**:陶土红 × 羊皮纸 法律文书专业风格(衬线标题 + meta pills + 案件速览 + 报告正文 + 打印优化),内嵌 CSS 单文件可分享
 - **Word**:走 macOS 原生 textutil HTML → docx,Times + 中文字体,字号符合 Word 视角(14px 正文 / 15px 一级标题 / 16px 居中大标题)
 
-### 🚀 8 路并发抽取
+### 🚀 大批量材料排队与动态并发
 
-OCR + LLM 抽取走 `buffer_unordered(8)` 流式并发(任意时刻最多 8 个 task,完成一个补一个,不是批处理),OCR 调用 wrap `spawn_blocking` 不阻塞 tokio worker。18 份案件实测 ~70 秒以内。
+抽取任务先进入全应用案件级队列,案内按服务状态从 8 路逐步降到 4/1 路;云端上传采用流式读取和共享节流,避免多案件叠加、大 PDF 整文件入内存或账户级错误反复重试。失败材料可在账户恢复后整案重试。
 
 ### 💬 反馈通道
 
-App 内右下「💬 反馈」按钮 → 自动收集诊断信息(版本 / OS / provider / 案件数 / 文档数 / 最近抽取失败的 filename,**永不含案件名 / 当事人 / 文档内容**)→ 写桌面 MD 文件 → 用户自行手工发送给项目维护者。带匿名 client_id(UUID 前 8 位)关联同人多次反馈。
+App 内右下「💬 反馈」按钮 → 自动收集脱敏诊断信息(版本 / OS / provider / 计数 / 最近失败文件名,**不含案件名 / 当事人 / 文档内容**)→ 用户确认后可匿名上传给维护者,也可只生成本地 MD 自行发送。匿名 client_id 仅用于关联同一设备的多次反馈。
 
 ### 💰 DeepSeek 余额监控
 
@@ -109,14 +109,20 @@ App 内右下「💬 反馈」按钮 → 自动收集诊断信息(版本 / OS / 
 - 抽取出的结构化数据、报告、数据库存在本机 `~/Library/Application Support/CaseBoard/`
 - ⚠️ 但**默认走云端**:文本抽取 / OCR 会把文档内容发往 DeepSeek / MinerU 处理(介意请改用本机模型)
 - API key / token 永远不进代码、不入 git;只存本机 `settings.json`(后续升 Keychain)
-- 反馈通道生成本地 MD 文件由用户**手工**发出,App 永不主动上送
+- 反馈只在用户明确点击上传后发送脱敏诊断;也可选择只生成本地 MD
 - MCP 接入需要在 App 内显式授权,记录在 `mcp_clients` 表
 
 ## 安装
 
 从 [lawtools.top](https://lawtools.top) 下载最新安装包。
 
-macOS 首次打开:在 Applications 找到「案件看板」**右键 → 打开**(因为暂未购买 Apple 公证,直接双击会被 macOS 拦截),弹警告时点「打开」,以后双击即可。
+macOS 包暂未做 Developer ID 公证。安装后若系统提示“已损坏”或无法验证,按 dmg 内《请先阅读》执行:
+
+```bash
+xattr -cr /Applications/案件看板.app
+```
+
+然后重新打开;也可到「系统设置 → 隐私与安全」确认仍要打开。
 
 系统要求:macOS 11+ / Windows 10+。
 
@@ -155,7 +161,8 @@ pnpm tauri dev
 ### 打包 dmg
 
 ```bash
-bash scripts/release.sh
+bash scripts/release.sh aarch64   # Apple Silicon
+bash scripts/release.sh x86_64    # Intel 交叉编译
 ```
 
 产出 `target/release/bundle/dmg/案件看板_<version>_aarch64.dmg`,首次约 2-3 分钟。
@@ -163,19 +170,14 @@ bash scripts/release.sh
 ### 测试 / 质量基线
 
 ```bash
-cargo test -p caseboard              # Rust 单元测试 + 集成测试
-cargo clippy --all-targets -- -D warnings   # 零 warning
-pnpm build                           # 前端 TypeScript + Vite 检查
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+pnpm exec tsc --noEmit && pnpm build
 ```
 
-### Windows / Linux 移植(欢迎 PR)
+### Windows / Linux
 
-目前只在 macOS 上开发和测试。Tauri 2 本身跨平台,数据目录已走跨平台 API(`directories::ProjectDirs`),主要适配点集中在几处 macOS 专属调用:
-
-1. `src-tauri/src/lib.rs` 里 3 处 `Command::new("open")`(打开文件 / 目录 / URL)→ Windows 需换 `explorer` / `cmd /c start`,或统一改用 [tauri-plugin-opener](https://tauri.app/plugin/opener/)
-2. `src-tauri/src/lib.rs` 用 macOS 自带 `textutil` 抽 Word/RTF 纯文本 → 需替代实现(Word **导出**已是纯 Rust 原生 OOXML,见 `src-tauri/src/export.rs`,不受影响)
-3. `scripts/release.sh` 出 dmg 是 macOS 专属(`hdiutil` / `osascript`)→ Windows 直接 `pnpm tauri build` 产 msi/nsis 即可。⚠️ Windows 下务必走 `pnpm tauri build`(只想要 exe、不打安装包可加 `--no-bundle`),**别用 `cargo build --release`** —— 它不跑 tauri-cli 的 codegen,前端 `dist/` 不会嵌进 exe,产物能编过但启动白屏、WebView 报 `localhost refused`(感谢 [@zzf516988659-del](https://github.com/zzf516988659-del) 反馈,issue #2)
-4. Word 导出用的中文字体(仿宋 / 黑体 / 方正小标宋)按字体名写入 docx,Windows 上前两者系统自带,效果需实测
+Windows x64 已进入正式发版矩阵,由 GitHub Actions 构建 NSIS 安装包并执行启动冒烟;路径、Ctrl 快捷键、npm `.cmd`、配置目录、Cookie 与资料包等共性兼容已处理。Linux 尚未进入官方发布矩阵,欢迎提交不含真实案件 fixture 的 PR。
 
 ## 项目结构
 
@@ -205,8 +207,8 @@ caseboard/
 
 ## 状态
 
-- ✅ 当前公开版 v0.3.25,可装可用(下载见 [lawtools.top](https://lawtools.top))
-- 🐢 个人项目节奏:issue / PR 会看,但不承诺响应时限;Windows / Linux 移植欢迎 PR(适配点见上文)
+- ✅ 当前公开版 v0.4.7,提供 macOS Apple Silicon、macOS Intel 与 Windows x64 安装包(下载见 [lawtools.top](https://lawtools.top))
+- 🐢 个人项目节奏:issue / PR 会看,但不承诺响应时限;Linux 适配欢迎 PR
 
 ## 反馈 & 贡献
 

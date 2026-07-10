@@ -85,7 +85,7 @@ export function CardSection({
   }
 
   return (
-    <section className="rounded-lg border border-border bg-card px-6 py-4 shadow-sm">
+    <section className="surface-card px-5 py-4 sm:px-6">
       <div className="mb-3 flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           {dragHandle && (

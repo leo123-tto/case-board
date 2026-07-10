@@ -52,10 +52,9 @@ pub struct AgentLoopRequest {
     pub max_tokens: u32,
     /// "auto" / "required" / "none";固定任务一般用 "required"
     pub tool_choice: String,
-    /// V0.2 D6.5 · 给 `<CITATIONS>` 解析校验 `type=doc` 时 quote 是否在文档里。
-    /// 由调用方(commands.rs)从 `documents.extracted_text_path` 读出 `(filename, full_text)`。
-    /// 空数组也合法,只是 doc 类型 citation 不会做 quote 校验(verified 默认 true)。
-    pub case_docs_for_citation_check: Vec<(String, String)>,
+    /// 给 `<CITATIONS>` 校验 `type=doc` 引用。值为 `(filename, extracted_text_path)`，
+    /// 最终只懒加载真正被引用的文件，避免每轮聊天预读整案全文。
+    pub case_doc_paths_for_citation_check: Vec<(String, String)>,
 }
 
 /// agent_loop 跑完一次的回执(给 commands.rs 落库 + 反馈 MD 性能埋点)。
@@ -809,9 +808,9 @@ pub async fn run_chat_with_tools(
     let session_stats = session.read().map(|s| s.clone()).unwrap_or_default();
 
     // V0.2 D6.5 · 切出 <CITATIONS> 块,校验 doc quote
-    let parsed = super::citations::parse_with_doc_filenames(
+    let parsed = super::citations::parse_with_doc_paths(
         &full_content,
-        &req.case_docs_for_citation_check,
+        &req.case_doc_paths_for_citation_check,
     );
 
     Ok(AgentLoopOutput {

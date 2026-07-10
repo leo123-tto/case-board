@@ -75,13 +75,24 @@ export function ModuleTabs({
     width: 0,
   });
   useLayoutEffect(() => {
-    const el = rowRef.current?.querySelector<HTMLElement>(
-      `[data-tab="${active}"]`,
-    );
-    if (el) {
-      // 内缩 8px(对齐原 inset-x-2 视觉),让下划线比 tab 略窄更精致
-      setUnderline({ left: el.offsetLeft + 8, width: el.offsetWidth - 16 });
-    }
+    const row = rowRef.current;
+    if (!row) return;
+    const update = () => {
+      const el = row.querySelector<HTMLElement>(`[data-tab="${active}"]`);
+      if (!el) {
+        setUnderline({ left: 0, width: 0 });
+        return;
+      }
+      // 内缩 10px,让下划线与新的轻底色选中态同时存在但不过重。
+      setUnderline({ left: el.offsetLeft + 10, width: Math.max(0, el.offsetWidth - 20) });
+    };
+    const frame = window.requestAnimationFrame(update);
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    observer?.observe(row);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+    };
   }, [active]);
 
   // 公开顶层 tab + 私人专属顶层 tab(开源仓为空)。「独立」排最后(设置之后)。
@@ -96,16 +107,16 @@ export function ModuleTabs({
     ];
 
   return (
-    <nav className="flex shrink-0 border-b border-border bg-card/50 px-8">
+    <nav className="app-topbar relative z-20 flex shrink-0 border-b px-3 sm:px-5 xl:px-8">
       <div
         ref={rowRef}
-        className="relative mx-auto flex w-full min-w-0 max-w-none items-center gap-1 overflow-x-auto overflow-y-hidden"
+        className="relative mx-auto flex h-12 w-full min-w-0 max-w-none items-center gap-1 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
         {/* 左侧首页按钮 — 单独样式,跟 tab 视觉区分(图标 + 边框 + 不带下划线) */}
         <button
           type="button"
           onClick={onGoHome}
-          className="mr-2 inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-card px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          className="mr-2 inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-border/80 bg-card/80 px-2.5 text-xs font-medium text-muted-foreground shadow-xs transition-[transform,background-color,color,border-color,box-shadow] duration-150 hover:border-brand/20 hover:bg-brand-soft/70 hover:text-foreground hover:shadow-sm active:scale-[0.97]"
           title="回到首页(诉讼案件看板)"
           aria-label="首页"
         >
@@ -124,14 +135,14 @@ export function ModuleTabs({
               data-tab={m.id}
               onClick={() => onSwitch(m.id)}
               className={cn(
-                "relative flex shrink-0 items-center gap-1.5 whitespace-nowrap px-4 py-3 text-sm transition-colors",
+                "relative flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-3 text-sm transition-[transform,background-color,color] duration-150 active:scale-[0.97] xl:px-3.5",
                 isActive
-                  ? "text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
+                  ? "bg-brand-soft/72 text-foreground"
+                  : "text-muted-foreground hover:bg-accent/70 hover:text-foreground",
               )}
               aria-current={isActive ? "page" : undefined}
             >
-              <Icon className="size-4" />
+              <Icon className={cn("size-4 transition-colors", isActive && "text-brand")} />
               <span className="font-medium whitespace-nowrap">{m.label}</span>
               {m.beta && <BetaBadge className="ml-0.5" />}
             </button>
@@ -140,12 +151,16 @@ export function ModuleTabs({
 
         {/* 单条滑动下划线(平滑移动到激活 tab) */}
         <span
-          className="pointer-events-none absolute bottom-0 h-0.5 rounded-full bg-foreground transition-all duration-300 ease-out"
+          className="pointer-events-none absolute bottom-0 h-0.5 rounded-full bg-brand transition-[left,width] duration-200 ease-[cubic-bezier(0.16,1,0.3,1)]"
           style={{ left: underline.left, width: underline.width }}
         />
 
         {/* 右侧插槽(DeepSeek 余额 chip 等) */}
-        {rightSlot && <div className="ml-auto flex shrink-0 items-center gap-2">{rightSlot}</div>}
+        {rightSlot && (
+          <div className="ml-auto flex shrink-0 items-center gap-1.5 pl-2 sm:gap-2">
+            {rightSlot}
+          </div>
+        )}
       </div>
     </nav>
   );

@@ -353,6 +353,52 @@ pub async fn update_user_overrides(
     Ok(())
 }
 
+/// 显式重置「我方代理立场」:同时清掉首次 AI 识别值和人工 override,
+/// 但保留 user_overrides_json 里的其它字段/隐藏卡片/排序。
+pub async fn reset_our_side(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT user_overrides_json FROM cases WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    let cleaned = clear_our_side_override_json(current.as_deref());
+    sqlx::query(
+        "UPDATE cases SET agg_our_side = NULL, user_overrides_json = ?, \
+         updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(cleaned)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn clear_our_side_override_json(json: Option<&str>) -> Option<String> {
+    let raw = json?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        // 不因重置一个字段损坏/丢弃整份未知格式的用户覆盖。
+        return Some(raw.to_string());
+    };
+    let Some(root) = value.as_object_mut() else {
+        return Some(raw.to_string());
+    };
+    if let Some(fields) = root.get_mut("fields").and_then(|v| v.as_object_mut()) {
+        fields.remove("agg_our_side");
+        if fields.is_empty() {
+            root.remove("fields");
+        }
+    }
+    if root.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&value).ok()
+    }
+}
+
 // ============================================================================
 // 测试
 // ============================================================================

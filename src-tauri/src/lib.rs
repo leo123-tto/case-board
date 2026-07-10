@@ -28,6 +28,7 @@ pub mod proc_util;
 pub mod case_bundle;
 pub mod private;
 pub mod settings;
+pub mod tabular_digest;
 pub mod team;
 pub mod telemetry;
 pub mod ticktick;
@@ -35,7 +36,7 @@ pub mod update;
 pub mod verify;
 pub mod yuandian;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -46,7 +47,7 @@ use crate::db::documents::{self as documents_db, Document};
 use crate::element_convert::*;
 use crate::ingest::case_split;
 use crate::ingest::pipeline;
-use crate::ingest::scanner::{scan_folder, scan_folder_with_options, ScanOptions, ScannedDoc};
+use crate::ingest::scanner::{scan_folder, scan_folder_with_report, ScanOptions, ScannedDoc};
 
 // ============================================================================
 // 公共类型
@@ -67,6 +68,8 @@ pub struct ImportResult {
     pub docs: Vec<ScannedDoc>,
     /// 是否是 upsert 命中已存在的案件(true = 之前导入过,这次只刷新)
     pub is_existing: bool,
+    /// 扫描阶段遇到的权限、失联或元数据读取问题。导入本身可以继续，但前端必须明确提示。
+    pub scan_warnings: Vec<String>,
 }
 
 /// 案件 + 它的文档列表(用于详情页)。
@@ -129,7 +132,7 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
 
 /// 把案件源文件夹加进 asset 协议 scope(运行期、按案件 `allow_directory`),
 /// 让源文件查看器能用流式 `asset://` 协议在 iframe 里原生渲染该案 PDF(大扫描件不占内存、自带 Range)。
-/// 比 `fs:scope` 的 `$HOME/**` 更窄(守「别用 `**`」铁律);scope 在会话内累加、不撤销(都是用户自己的文件夹)。
+/// 比旧版全家目录文件系统 scope 更窄;scope 在会话内累加、不撤销(都是用户自己的文件夹)。
 /// 前端打开案件源文件查看器**前必须 await 本命令**,否则 iframe 首次请求会 403(scope 未就绪)。
 #[tauri::command]
 async fn allow_case_assets(
@@ -188,6 +191,29 @@ async fn read_text_file(
     std::fs::read_to_string(&canonical).map_err(|e| format!("读文件失败: {}", e))
 }
 
+#[tauri::command]
+async fn read_case_file_bytes(
+    pool: tauri::State<'_, SqlitePool>,
+    path: String,
+) -> Result<Vec<u8>, String> {
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Err(format!("文件不存在: {}", path));
+    }
+    if !p.is_file() {
+        return Err(format!("不是文件: {}", path));
+    }
+    let canonical = p
+        .canonicalize()
+        .map_err(|e| format!("无法解析文件路径: {}", e))?;
+    if !preview_file_is_in_scope(pool.inner(), &path, &canonical).await? {
+        return Err("只能读取已导入案件范围内的预览文件".to_string());
+    }
+    tokio::fs::read(&canonical)
+        .await
+        .map_err(|e| format!("读文件失败: {}", e))
+}
+
 fn is_allowed_text_file_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -202,6 +228,26 @@ fn is_allowed_text_file_ext(path: &Path) -> bool {
 
 fn path_is_inside_dir(path: &Path, dir: &Path) -> bool {
     path == dir || path.starts_with(dir)
+}
+
+fn preview_conversion_cache_dir() -> PathBuf {
+    std::env::temp_dir().join("caseboard_contract_convert")
+}
+
+async fn preview_file_is_in_scope(
+    pool: &SqlitePool,
+    raw_path: &str,
+    canonical_path: &Path,
+) -> Result<bool, String> {
+    if file_is_in_case_scope(pool, raw_path, canonical_path).await? {
+        return Ok(true);
+    }
+    if let Ok(cache_dir) = preview_conversion_cache_dir().canonicalize() {
+        if path_is_inside_dir(canonical_path, &cache_dir) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn dir_is_in_case_source_scope(pool: &SqlitePool, dir: &Path) -> Result<bool, String> {
@@ -400,7 +446,8 @@ async fn import_case_folder(
         .map_err(db_err)?;
 
     // 4) 扫描文件夹(这里是同步,scanner 很快)
-    let scanned = scan_folder(p);
+    let scan = scan_folder_with_report(p, ScanOptions::default());
+    let scanned = scan.docs;
 
     // 5) 替换文档列表
     documents_db::replace_documents_for_case(pool.inner(), &case.id, &scanned)
@@ -423,6 +470,7 @@ async fn import_case_folder(
         case,
         docs: scanned,
         is_existing,
+        scan_warnings: scan.warnings,
     })
 }
 
@@ -501,12 +549,16 @@ async fn build_split_cases(
         let case = cases_db::upsert_case_for_folder(pool, &c.dir, &name, "诉讼")
             .await
             .map_err(db_err)?;
-        let mut scanned = scan_folder(dir);
+        let mut scan = scan_folder_with_report(dir, ScanOptions::default());
+        let mut scanned = scan.docs;
+        let mut scan_warnings = scan.warnings;
         // 共用材料挂到**每个**案件(migration 0019 后 (case_id, source_path) 复合唯一,可多挂)
         for sd in shared_dirs {
             let sp = Path::new(sd);
             if sp.is_dir() {
-                scanned.extend(scan_folder(sp));
+                scan = scan_folder_with_report(sp, ScanOptions::default());
+                scanned.extend(scan.docs);
+                scan_warnings.extend(scan.warnings);
             }
         }
         documents_db::replace_documents_for_case(pool, &case.id, &scanned)
@@ -516,6 +568,7 @@ async fn build_split_cases(
             case,
             docs: scanned,
             is_existing,
+            scan_warnings,
         });
     }
     Ok(results)
@@ -662,7 +715,7 @@ async fn verify_openai_compat_key(
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:公开更新元数据 version.json。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:lawtools.top 的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -4249,6 +4302,24 @@ async fn update_case_overrides(
         .map_err(db_err)
 }
 
+/// 显式清空首次 AI 识别和人工确认的代理立场。其它用户编辑保持不变。
+/// 清空后可重新人工选择,或点「重新分析」让 AI 重新识别并再次锁定。
+#[tauri::command]
+async fn reset_case_our_side(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<(), String> {
+    cases_db::reset_our_side(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)?;
+    if let Err(e) =
+        db::ai_jobs::mark_case_analysis_stale(pool.inner(), &case_id, "our_side_reset").await
+    {
+        dlog!("[case] 标记立场重置后的分析过期失败: {}", e);
+    }
+    Ok(())
+}
+
 /// 2026-05-24 (T3) 重抽该案件的所有 LLM 抽取。
 ///
 /// 用途:升级 prompt(扩字段 / 反诉视角 / is_our_side 等)后,存量
@@ -4261,7 +4332,7 @@ async fn update_case_overrides(
 ///   3. 立即返回被重置的文档数,UI 用来 toast 提示"重抽中 · N 份文档"
 ///
 /// 注意:`skipped` / `failed` 的文档**不重置**(用户可能手工跳过了某些噪音文档;
-/// failed 的可能是 LLM 暂时不可用,下次重新导入会重试)。
+/// failed 的可能是 LLM 暂时不可用,由案件页「重试失败」统一恢复)。
 #[tauri::command]
 async fn recompute_case_extraction(
     app: tauri::AppHandle,
@@ -4309,6 +4380,41 @@ async fn recompute_case_extraction(
     Ok(reset_count)
 }
 
+/// 批量重试本案所有 failed 材料。用于余额不足、Key/模型修好后一次恢复,
+/// 避免用户逐份点「重新抽取」。只动 failed 且仍存在的非 AI 源材料,
+/// 包括扫描导入和案件合并带入的材料,不碰 done/skipped/AI 产物。
+#[tauri::command]
+async fn retry_failed_case_documents(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<usize, String> {
+    let res = sqlx::query(
+        "UPDATE documents SET extraction_status = 'pending', last_error = NULL \
+         WHERE case_id = ? AND extraction_status = 'failed' \
+           AND deleted_at IS NULL AND is_ai_artifact = 0",
+    )
+    .bind(&case_id)
+    .execute(pool.inner())
+    .await
+    .map_err(|e| format!("重置失败材料失败: {}", e))?;
+    let reset_count = res.rows_affected() as usize;
+    if reset_count == 0 {
+        return Ok(0);
+    }
+    if let Err(e) =
+        db::ai_jobs::mark_case_analysis_stale(pool.inner(), &case_id, "failed_documents_retry")
+            .await
+    {
+        dlog!("[retry_failed] 标记案件分析过期失败: {}", e);
+    }
+    let documents = documents_db::list_documents_by_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)?;
+    pipeline::spawn_extraction(app, pool.inner().clone(), case_id, documents, true);
+    Ok(reset_count)
+}
+
 /// 2026-05-25 V0.1.5 「🔄 刷新源文件」按钮触发。
 ///
 /// 增量逻辑:
@@ -4347,7 +4453,7 @@ async fn refresh_case_files(
     }
 
     // 2) 扫文件夹(scanner 很快,同步即可)
-    let scanned = scan_folder_with_options(
+    let scan = scan_folder_with_report(
         folder,
         ScanOptions {
             reference_materials: reference_materials.unwrap_or(false),
@@ -4355,9 +4461,10 @@ async fn refresh_case_files(
     );
 
     // 3) diff sync,拿统计
-    let stats = documents_db::sync_documents_for_case(pool.inner(), &case_id, &scanned)
+    let mut stats = documents_db::sync_documents_for_case(pool.inner(), &case_id, &scan.docs)
         .await
         .map_err(db_err)?;
+    stats.scan_warnings = scan.warnings;
 
     if stats.added + stats.updated + stats.deleted > 0 {
         if let Err(e) =
@@ -4420,15 +4527,16 @@ async fn relink_case_folder(
         return Err("该文件夹已经关联到另一个案件".into());
     }
 
-    let scanned = scan_folder_with_options(
+    let scan = scan_folder_with_report(
         folder,
         ScanOptions {
             reference_materials: reference_materials.unwrap_or(false),
         },
     );
-    let stats = documents_db::sync_documents_for_case(pool.inner(), &case_id, &scanned)
+    let mut stats = documents_db::sync_documents_for_case(pool.inner(), &case_id, &scan.docs)
         .await
         .map_err(db_err)?;
+    stats.scan_warnings = scan.warnings;
     sqlx::query(
         "UPDATE cases SET source_folder = ?, last_scanned_at = datetime('now'), \
          updated_at = datetime('now') WHERE id = ?",
@@ -5934,7 +6042,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
@@ -5947,6 +6054,18 @@ pub fn run() {
             let pool = tauri::async_runtime::block_on(db::init_pool(&db_path)).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("初始化数据库失败: {}", e))
             })?;
+
+            // 上次异常退出时 processing 不会自行恢复；启动即转 failed，让首页/案件页明确提示并
+            // 由用户决定何时重试，避免永久显示“抽取中”或静默再次消耗 OCR/LLM 额度。
+            match tauri::async_runtime::block_on(
+                documents_db::recover_orphaned_processing_documents(&pool),
+            ) {
+                Ok(n) if n > 0 => {
+                    crate::dlog!("[startup] 已恢复 {} 份中断的抽取材料为 failed", n)
+                }
+                Ok(_) => {}
+                Err(e) => crate::dlog!("[startup] 恢复中断抽取状态失败: {}", e),
+            }
 
             // V0.2 D5.5 · 启动时把上次崩溃前没收尾的 chat_tasks 标 failed,
             // 让前端展示「重试」按钮。阈值 5 分钟,跟实施计划 § 6.9 对齐。
@@ -6024,6 +6143,7 @@ pub fn run() {
             get_case_with_docs,
             delete_case,
             read_text_file,
+            read_case_file_bytes,
             allow_case_assets,
             extract_doc_text,
             extract_fields_from_text,
@@ -6098,6 +6218,7 @@ pub fn run() {
             export_report_docx,
             export_lawyer_insights_markdown,
             recompute_case_extraction,
+            retry_failed_case_documents,
             refresh_case_files,
             relink_case_folder,
             preview_court_sms,
@@ -6109,6 +6230,7 @@ pub fn run() {
             delete_express_track,
             update_workflow_status,
             update_case_overrides,
+            reset_case_our_side,
             get_deepseek_balance,
             collect_feedback_diagnostic,
             save_feedback_md,

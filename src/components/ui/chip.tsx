@@ -11,12 +11,12 @@ import { cn } from "@/lib/utils";
  * 收敛对象:VersionChip / DeepSeekBalanceChip / FeedbackButton 等处重复的胶囊样式。
  */
 const chipVariants = cva(
-  "inline-flex items-center gap-1 rounded-full border whitespace-nowrap transition-colors",
+  "inline-flex items-center gap-1 whitespace-nowrap rounded-full border transition-[transform,background-color,color,border-color,box-shadow] duration-150 ease-out has-[button]:active:scale-[0.97] focus-within:ring-2 focus-within:ring-ring/30",
   {
     variants: {
       variant: {
         default:
-          "border-border bg-card text-muted-foreground hover:bg-accent hover:text-foreground",
+          "border-border/85 bg-card/88 text-muted-foreground shadow-[0_1px_2px_var(--shadow-color)] hover:border-brand/20 hover:bg-accent hover:text-foreground",
         muted: "border-border/60 bg-card/80 text-muted-foreground",
         warning:
           "border-amber-300/70 bg-amber-50 text-amber-800 dark:bg-amber-950/30 dark:text-amber-200",

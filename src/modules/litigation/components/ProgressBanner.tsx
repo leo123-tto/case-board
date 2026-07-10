@@ -88,8 +88,8 @@ export function ProgressBanner({
     case "completed":
       percent = 100;
       label = progress.analysis_ok
-        ? `✓ 全部完成 · 抽出 ${progress.extracted} · 跳过 ${progress.skipped} · 失败 ${progress.failed} · 用时 ${(progress.elapsed_ms / 1000).toFixed(1)} s`
-        : `⚠️ 文档处理完成,但全案分析失败(画像未更新):${progress.analysis_error ?? "未知原因"} — 可在案件里点「重新分析」重试`;
+        ? `${progress.analysis_warning ? "⚠️ 已完成，需复核" : progress.failed > 0 ? "⚠️ 已完成，有失败材料" : "✓ 全部完成"} · 抽出 ${progress.extracted} · 跳过 ${progress.skipped} · 失败 ${progress.failed} · 用时 ${(progress.elapsed_ms / 1000).toFixed(1)} s${progress.analysis_warning ? `：${progress.analysis_warning}` : ""}`
+        : `⚠️ 文档处理完成,但全案分析未完整完成:${progress.analysis_error ?? "未知原因"} — 可在案件里点「重新分析」重试`;
       break;
     case "error":
       percent = 0;
@@ -99,6 +99,9 @@ export function ProgressBanner({
 
   const done = progress.stage === "completed";
   const analysisFailed = done && !progress.analysis_ok;
+  const analysisWarning = done && progress.analysis_ok && Boolean(progress.analysis_warning);
+  const documentFailures = done && progress.failed > 0;
+  const needsAttention = analysisFailed || analysisWarning || documentFailures;
   const errored = progress.stage === "error";
   const currentIndex =
     progress.stage === "doc_finished"
@@ -123,9 +126,9 @@ export function ProgressBanner({
           onClick={onToggleMinimize}
           className={cn(
             "flex items-center gap-2 rounded-full border px-3 py-2 shadow-lg backdrop-blur transition-colors",
-            done && !analysisFailed
+            done && !needsAttention
               ? "border-emerald-200/70 bg-emerald-50/95 text-emerald-800 hover:bg-emerald-100"
-              : analysisFailed
+              : needsAttention
                 ? "border-amber-300/70 bg-amber-50/95 text-amber-800 hover:bg-amber-100"
                 : "border-border bg-card/95 hover:bg-muted",
           )}
@@ -134,7 +137,7 @@ export function ProgressBanner({
           {!done && <Loader2 className="size-3.5 animate-spin" />}
           <span className="font-mono text-xs font-medium">
             {done
-              ? analysisFailed
+              ? needsAttention
                 ? "⚠"
                 : "✓"
               : progress.stage === "analyzing"
@@ -154,9 +157,9 @@ export function ProgressBanner({
       <div
         className={cn(
           "pointer-events-auto w-full max-w-3xl rounded-xl border px-4 py-3 shadow-lg backdrop-blur",
-          done && !analysisFailed
+          done && !needsAttention
             ? "border-emerald-200/70 bg-emerald-50/95"
-            : analysisFailed
+            : needsAttention
               ? "border-amber-300/70 bg-amber-50/95"
               : errored
                 ? "border-destructive/50 bg-destructive/5"
@@ -171,8 +174,8 @@ export function ProgressBanner({
           <span
             className={cn(
               "flex-1 font-medium",
-              analysisFailed && "text-amber-800",
-              done && !analysisFailed && "text-emerald-800",
+              needsAttention && "text-amber-800",
+              done && !needsAttention && "text-emerald-800",
               errored && "text-destructive",
               !done && !errored && "text-foreground truncate",
             )}

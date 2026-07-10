@@ -40,7 +40,7 @@ pub fn lark_bin(settings: &Settings) -> String {
     if let Some(p) = settings.feishu_lark_cli_path.as_deref() {
         let p = p.trim();
         if !p.is_empty() {
-            return p.to_string();
+            return shellexpand::tilde(p).into_owned();
         }
     }
     default_lark_bin()
@@ -56,7 +56,7 @@ fn default_lark_bin() -> String {
             return "/usr/local/bin/lark-cli".to_string();
         }
     }
-    // Windows / Linux:靠系统 PATH(Windows 自动补 .exe)。
+    // Windows / Linux:靠系统 PATH。Windows 的 npm `.cmd` shim 由 proc_util 包装 cmd /C。
     "lark-cli".to_string()
 }
 
@@ -83,7 +83,7 @@ async fn lark_cli_api(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, String> {
-    let mut cmd = Command::new(bin);
+    let mut cmd = crate::proc_util::tokio_command(bin);
     apply_lark_env(&mut cmd);
     cmd.arg("api")
         .arg(method)
@@ -149,7 +149,7 @@ pub async fn fetch_calendar_events(
     start: &str,
     end: &str,
 ) -> Result<Vec<FeishuCalendarEvent>, String> {
-    let mut cmd = Command::new(bin);
+    let mut cmd = crate::proc_util::tokio_command(bin);
     apply_lark_env(&mut cmd);
     cmd.arg("calendar")
         .arg("+agenda")

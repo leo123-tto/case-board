@@ -395,9 +395,9 @@ export function ExecutionDetailView({
   };
 
   return (
-    <main className="flex h-full w-full flex-col bg-background">
+    <main className="app-shell flex h-full w-full flex-col">
       {/* 头部 */}
-      <header className="border-b border-border bg-card/50 px-8 py-5">
+      <header className="app-subheader border-b px-4 py-4 sm:px-6 xl:px-8 xl:py-5">
         <div className="mx-auto flex max-w-6xl items-start gap-4">
           <button
             type="button"
@@ -478,8 +478,8 @@ export function ExecutionDetailView({
       </header>
 
       {/* 主区 */}
-      <div className="flex-1 overflow-auto px-8 py-8">
-        <div className="mx-auto max-w-6xl space-y-6">
+      <div className="flex-1 overflow-auto px-4 py-6 sm:px-6 xl:px-8 xl:py-8">
+        <div className="app-page-enter mx-auto max-w-6xl space-y-6">
           {/* 第一行:执行标的 + 当事人快览 */}
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <Card title="执行标的 / 申请执行金额">
@@ -1072,6 +1072,7 @@ function paymentSourceDoc(payment: Payment, docs: Document[]): Document | null {
     extracted_text_path: null,
     extracted_text_hash: null,
     cache_key: null,
+    last_error: null,
     pinned_at: null,
     ocr_backend_override: null,
     display_name: null,

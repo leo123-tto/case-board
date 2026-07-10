@@ -27,7 +27,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::chat::agent_loop::{run_chat_with_tools, AgentLoopRequest, ToolCallRecord};
-use crate::chat::citations::{parse_with_doc_filenames, Citation};
+use crate::chat::citations::{parse_with_doc_paths, Citation};
 use crate::chat::constitution::build_system_prompt_with_memory;
 use crate::chat::context::TaskType;
 use crate::chat::model_router::route_model;
@@ -349,12 +349,10 @@ pub async fn case_chat_impl(
         app: Some(app.clone()),
     };
     // V0.2 D6.5 · 给 citations.parse_with_doc_filenames 用,校验 type=doc 的 quote 是否在文档里
-    let mut case_docs_for_citation_check: Vec<(String, String)> = Vec::new();
+    let mut case_doc_paths_for_citation_check: Vec<(String, String)> = Vec::new();
     for d in &docs {
         if let Some(p) = &d.extracted_text_path {
-            if let Ok(text) = tokio::fs::read_to_string(p).await {
-                case_docs_for_citation_check.push((d.filename.clone(), text));
-            }
+            case_doc_paths_for_citation_check.push((d.filename.clone(), p.clone()));
         }
     }
     let agent_req = AgentLoopRequest {
@@ -366,7 +364,7 @@ pub async fn case_chat_impl(
         max_tokens: choice.max_tokens,
         // thinking 模型不支持 tool_choice="required"(DeepSeek 400),降级 auto;详 resolve_tool_choice。
         tool_choice: resolve_tool_choice(task.needs_tools(), &choice.model).into(),
-        case_docs_for_citation_check: case_docs_for_citation_check.clone(),
+        case_doc_paths_for_citation_check: case_doc_paths_for_citation_check.clone(),
     };
     let result: Result<ChatRunFinish, String> =
         run_chat_with_tools(&llm_config, agent_req, &registry_tools, ctx, tx, cancel_rx)
@@ -464,7 +462,7 @@ pub async fn case_chat_impl(
             if final_citations.is_empty() {
                 final_citations = citations_from_save_artifact_tool_calls(
                     &final_tool_calls,
-                    &case_docs_for_citation_check,
+                    &case_doc_paths_for_citation_check,
                 );
             }
 
@@ -725,7 +723,7 @@ fn clip_history_for_replay(rows: &[ChatMessage], char_budget: usize) -> Vec<(Str
 
 fn citations_from_save_artifact_tool_calls(
     tool_calls: &[ToolCallRecord],
-    case_docs_for_citation_check: &[(String, String)],
+    case_doc_paths_for_citation_check: &[(String, String)],
 ) -> Vec<Citation> {
     let mut citations = Vec::new();
     for call in tool_calls {
@@ -736,7 +734,7 @@ fn citations_from_save_artifact_tool_calls(
             continue;
         };
         citations
-            .extend(parse_with_doc_filenames(content_md, case_docs_for_citation_check).citations);
+            .extend(parse_with_doc_paths(content_md, case_doc_paths_for_citation_check).citations);
     }
     citations
 }

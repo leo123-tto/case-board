@@ -20,6 +20,7 @@ const BASE_URL: &str = "https://paddleocr.aistudio-app.com/api/v2";
 const MODEL: &str = "PP-OCRv6";
 const POLL_INTERVAL_MS: u64 = 3000;
 const HTTP_TIMEOUT_SEC: u64 = 60;
+const UPLOAD_TIMEOUT_SEC: u64 = 180;
 
 /// 调 AI Studio PP-OCRv6 抽一个文件,去水印后返回正文(+ 被过滤行的核对附录)。
 /// `timeout_secs`:从提交到拿到结果的总超时。**失败直接透传 Err,不回退**(调用方已明确选去水印)。
@@ -41,8 +42,9 @@ pub async fn extract_with_ppocrv6(
         .map_err(|e| format!("HTTP 客户端创建失败: {}", e))?;
 
     // ---- Step 1: multipart 提交任务 ----
-    let file_bytes = std::fs::read(path).map_err(|e| format!("读文件失败: {}", e))?;
-    let part = reqwest::multipart::Part::bytes(file_bytes).file_name(filename);
+    let (file_body, file_length) = crate::ingest::ocr::streaming_file_body(path).await?;
+    let part =
+        reqwest::multipart::Part::stream_with_length(file_body, file_length).file_name(filename);
     let form = reqwest::multipart::Form::new()
         .text("model", MODEL)
         .part("file", part);
@@ -51,6 +53,7 @@ pub async fn extract_with_ppocrv6(
         .post(format!("{}/ocr/jobs", BASE_URL))
         .bearer_auth(token)
         .multipart(form)
+        .timeout(Duration::from_secs(UPLOAD_TIMEOUT_SEC))
         .send()
         .await
         .map_err(|e| format!("提交任务失败: {}", e))?;

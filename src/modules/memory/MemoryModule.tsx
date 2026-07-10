@@ -128,8 +128,8 @@ export function MemoryModule() {
   const canSave = draft.title.trim() && draft.content.trim() && !saving;
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-background">
-      <div className="border-b border-border bg-card/40 px-8 py-4">
+    <div className="app-shell flex h-full min-h-0 flex-col">
+      <div className="app-subheader border-b px-4 py-4 sm:px-6 xl:px-8">
         <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             <h1 className="text-xl font-semibold tracking-normal text-foreground">记忆</h1>
@@ -168,7 +168,7 @@ export function MemoryModule() {
         </div>
       </div>
 
-      <div className="mx-auto grid min-h-0 w-full max-w-6xl flex-1 grid-cols-[260px_minmax(0,1fr)] gap-5 px-8 py-5">
+      <div className="app-page-enter mx-auto grid min-h-0 w-full max-w-6xl flex-1 grid-cols-[220px_minmax(0,1fr)] gap-4 px-4 py-5 sm:px-6 lg:grid-cols-[260px_minmax(0,1fr)] lg:gap-5 xl:px-8">
         <aside className="min-h-0 overflow-auto border-r border-border pr-4">
           {pack && (
             <div className="mb-4 rounded-md border border-border bg-card p-3">
@@ -224,8 +224,8 @@ export function MemoryModule() {
                     type="button"
                     onClick={() => editNote(note)}
                     className={cn(
-                      "w-full rounded-md border border-border bg-card p-3 text-left hover:bg-accent/40",
-                      selectedId === note.id && "border-foreground",
+                      "interactive-surface w-full rounded-lg border border-border bg-card/85 p-3 text-left hover:border-brand/20 hover:bg-card",
+                      selectedId === note.id && "border-brand bg-brand-soft/35 ring-1 ring-brand/15",
                     )}
                   >
                     <div className="flex items-start gap-2">
@@ -248,7 +248,7 @@ export function MemoryModule() {
             )}
           </section>
 
-          <section className="min-h-0 overflow-auto rounded-md border border-border bg-card p-4">
+          <section className="surface-card min-h-0 overflow-auto p-4">
             <div className="mb-4 flex items-center justify-between gap-3">
               <div>
                 <div className="text-sm font-medium text-foreground">

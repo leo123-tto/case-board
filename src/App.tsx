@@ -558,6 +558,13 @@ function MainApp() {
           : `已导入 · 共 ${result.docs.length} 份文档`,
         "success",
       );
+      if (result.scan_warnings.length > 0) {
+        toast(
+          `导入已继续，但有 ${result.scan_warnings.length} 项未能完整扫描：${result.scan_warnings.slice(0, 3).join("；")}`,
+          "error",
+          12000,
+        );
+      }
     } catch (e) {
       setError(String(e));
       toast(`导入失败:${e}`, "error", 7000);
@@ -610,6 +617,14 @@ function MainApp() {
         }
         setSplitPlan(null);
         toast(`已拆成 ${results.length} 个案件导入`, "success");
+        const scanWarnings = [...new Set(results.flatMap((result) => result.scan_warnings))];
+        if (scanWarnings.length > 0) {
+          toast(
+            `拆分导入已继续，但有 ${scanWarnings.length} 项未能完整扫描：${scanWarnings.slice(0, 3).join("；")}`,
+            "error",
+            12000,
+          );
+        }
       } catch (e) {
         setError(String(e));
         toast(`拆分导入失败:${e}`, "error", 7000);
@@ -928,6 +943,13 @@ function MainApp() {
       if (stats.updated > 0) parts.push(`更新 ${stats.updated}`);
       if (stats.deleted > 0) parts.push(`移除 ${stats.deleted}`);
       toast(parts.join(" · "), "success");
+      if (stats.scan_warnings.length > 0) {
+        toast(
+          `重新关联已继续，但有 ${stats.scan_warnings.length} 项未能完整扫描：${stats.scan_warnings.slice(0, 3).join("；")}`,
+          "error",
+          12000,
+        );
+      }
       setError(null);
     } catch (e) {
       setError(`重新关联失败: ${e}`);
@@ -973,6 +995,13 @@ function MainApp() {
             /* 不阻塞 */
           }
         }
+      }
+      if (stats.scan_warnings.length > 0) {
+        toast(
+          `刷新已继续，但有 ${stats.scan_warnings.length} 项未能完整扫描：${stats.scan_warnings.slice(0, 3).join("；")}`,
+          "error",
+          12000,
+        );
       }
     } catch (e) {
       setError(`刷新源文件失败: ${e}`);
@@ -1039,12 +1068,12 @@ function MainApp() {
     setEditingDoc(null);
   }, []);
 
-  // macOS 键盘快捷键
-  //   Cmd+O 导入 / Cmd+, 设置 / Cmd+R 刷新当前案件源文件
+  // 跨平台键盘快捷键
+  //   macOS:Cmd+O / Cmd+, / Cmd+R；Windows/Linux:Ctrl+O / Ctrl+, / Ctrl+R
   // 必须在所有 early return 之前(React Hooks 规则:每次 render 调用相同顺序的 hooks)
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (!e.metaKey) return;
+      if (!e.metaKey && !e.ctrlKey) return;
       switch (e.key) {
         case "o":
         case "O":
@@ -1057,8 +1086,9 @@ function MainApp() {
           break;
         case "r":
         case "R":
+          // 无论当前是否选中案件,都阻止 WebView 把 Ctrl/Cmd+R 当成整页刷新。
+          e.preventDefault();
           if (selectedCase) {
-            e.preventDefault();
             void handleRefreshFiles();
           }
           break;
@@ -1173,7 +1203,7 @@ function MainApp() {
   const criminalBody =
     criminalCases.length === 0 && !loading ? (
       <HomeDropZone onImportPath={handleDropImport}>
-        <main className="flex h-full w-full flex-col items-center justify-center bg-background px-6">
+        <main className="app-shell app-page-enter flex h-full w-full flex-col items-center justify-center px-6">
           <div className="w-full max-w-md text-center">
             <h1 className="text-2xl font-semibold tracking-tight text-foreground">
               刑事案件
@@ -1221,7 +1251,7 @@ function MainApp() {
     );
 
   return (
-    <div className="flex h-full w-full flex-col bg-background">
+    <div className="app-shell flex h-full w-full flex-col">
       {/* 顶部三模块 tab(诉讼 / 非诉 / 工具)+ 左侧首页按钮 + 右侧 DeepSeek 余额 */}
       <ModuleTabs
         active={activeModule}
@@ -1262,7 +1292,7 @@ function MainApp() {
         {activeModule === "memory" && <MemoryModule />}
         {activeModule === "team" && <TeamModule />}
         {activeModule === "settings" && (
-          <div className="h-full overflow-auto bg-background">
+          <div className="app-page-enter h-full overflow-auto">
             <SettingsModal
               mode="page"
               initialTab={settingsInitialTab}
@@ -1278,7 +1308,7 @@ function MainApp() {
             activeModule === t.id && (
               <div
                 key={t.id}
-                className="h-full overflow-auto bg-background px-8 py-6"
+                className="app-page-enter h-full overflow-auto px-4 py-5 sm:px-6 xl:px-8 xl:py-6"
               >
                 <div className="mx-auto w-full max-w-5xl">{t.render()}</div>
               </div>

@@ -16,7 +16,7 @@
 //!
 //! 性能(R&D 实测,M3 Max):
 //! - MinerU precision:~15-30 秒/份(取决于页数 + 服务端排队)
-//! - 本机 MiniCPM-V vision:13-15 秒/份(关键字段 100% 命中,详见内部 R&D 记录)
+//! - 本机 MiniCPM-V vision:13-15 秒/份(内部基准测试)
 
 use std::path::{Path, PathBuf};
 
@@ -132,6 +132,32 @@ pub struct OcrContext {
     /// 轮询循环每拍 `send` 一次 [`OcrPollUpdate`],前端据此显示"排队 / 识别中(已 N 秒)"。
     /// `None` = 不上报(测试 / 本地模式 / 不关心进度的调用)。`#[derive(Default)]` 下默认 None。
     pub poll_tx: Option<tokio::sync::mpsc::UnboundedSender<OcrPollUpdate>>,
+}
+
+/// 把本地文件转换成流式 HTTP body。旧实现会先 `std::fs::read` 整份文件；8 路并发遇到
+/// 100~200MB PDF 时可能瞬间占用 0.8~1.6GB 内存。流式读取把每个上传的常驻缓冲压到 64KB。
+pub(crate) async fn streaming_file_body(path: &Path) -> Result<(reqwest::Body, u64), String> {
+    use tokio::io::AsyncReadExt;
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| format!("打开待上传文件失败: {}", error))?;
+    let length = file
+        .metadata()
+        .await
+        .map_err(|error| format!("读取待上传文件信息失败: {}", error))?
+        .len();
+    let stream = futures::stream::try_unfold(file, |mut file| async move {
+        let mut chunk = vec![0u8; 64 * 1024];
+        let read = file.read(&mut chunk).await?;
+        if read == 0 {
+            Ok::<_, std::io::Error>(None)
+        } else {
+            chunk.truncate(read);
+            Ok(Some((chunk, file)))
+        }
+    });
+    Ok((reqwest::Body::wrap_stream(stream), length))
 }
 
 /// 走 MinerU 精准 HTTP API(2026-05-25 V0.1.10 替代 CLI 子进程)。
@@ -408,7 +434,7 @@ const LOCAL_VISION_MAX_PAGES: u32 = 50;
 /// 4. 调 :8899/v1/chat/completions(MiniCPM-V 4.6 + mmproj)
 /// 5. 返回纯文本
 ///
-/// 2026-05-23 R&D 实测:M3 Max 13-15 秒/页,关键字段 100% 命中。
+/// 2026-05-23 R&D 实测:M3 Max 13-15 秒/页。
 fn run_local_vision(path: &Path) -> Result<String, String> {
     let ext = path
         .extension()

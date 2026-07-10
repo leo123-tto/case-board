@@ -15,8 +15,9 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { Loader2, Minus, Plus, Maximize2, ExternalLink, X, BookmarkPlus } from "lucide-react";
-import { readFile } from "@tauri-apps/plugin-fs";
 import "pdfjs-dist/web/pdf_viewer.css";
+
+import { readCaseFileBytes } from "@/lib/api";
 
 // pdfjs 类型不强约束(动态 import),用 any 保持松耦合。
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -94,7 +95,7 @@ export function PdfReaderView({
         const pdfjs = await import("pdfjs-dist");
         const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
         pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
-        const bytes = await readFile(sourcePath);
+        const bytes = await readCaseFileBytes(sourcePath);
         if (cancelled) return;
         const pdf = await pdfjs.getDocument({ data: bytes }).promise;
         if (cancelled) return;

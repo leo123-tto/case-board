@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
@@ -287,7 +287,8 @@ async fn connect_stdio(
     args: &[String],
     env: &BTreeMap<String, String>,
 ) -> Result<McpIo, String> {
-    let mut cmd = Command::new(command);
+    let expanded_command = shellexpand::tilde(command).into_owned();
+    let mut cmd = crate::proc_util::tokio_command(&expanded_command);
     cmd.args(args)
         .envs(env)
         .stdin(Stdio::piped())

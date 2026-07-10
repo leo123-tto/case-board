@@ -10,6 +10,16 @@ export function readTextFile(path: string): Promise<string> {
   return invoke<string>("read_text_file", { path });
 }
 
+type BinaryPayload = number[] | ArrayBuffer | Uint8Array;
+
+/** 读取案件预览需要的二进制文件。后端按案件源目录/转换缓存做范围校验。 */
+export async function readCaseFileBytes(path: string): Promise<Uint8Array> {
+  const bytes = await invoke<BinaryPayload>("read_case_file_bytes", { path });
+  if (bytes instanceof Uint8Array) return bytes;
+  if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+  return Uint8Array.from(bytes);
+}
+
 /**
  * 抽 .docx / .doc / .rtf / .odt 的纯文本,用于在 App 内即时预览 Word 文档(不启动 Word)。
  * .docx 走跨平台原生解析;.doc/.rtf/.odt 在 macOS 用 textutil 即时预览,其他平台暂不支持预览

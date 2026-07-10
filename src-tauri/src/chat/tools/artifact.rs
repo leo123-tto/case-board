@@ -24,7 +24,7 @@ use crate::chat::citations;
 use super::{require_str, Tool, ToolContext, ToolError, ToolResult};
 
 // V0.3 · doc_type 白名单已开放(任意文书类型可写),不再有枚举常量。
-// 民事起诉状 / 证据目录 / 法律意见书 / 律师函(函类)有固定结构,答辩状 / 代理词有建议结构,
+// 民事起诉状 / 证据目录 / 质证意见 / 法律意见书 / 律师函(函类)有固定结构,答辩状 / 代理词有建议结构,
 // 其余类型按通用结构(均见 descriptions/save_artifact.md);这是纯 prompt 约束,代码不再 gate 类型。
 
 /// 文件名安全化:剥掉路径分隔符 / 控制字符,限长,防穿越。
@@ -37,6 +37,18 @@ fn safe_stem(s: &str) -> String {
         })
         .collect();
     cleaned.trim().chars().take(40).collect::<String>()
+}
+
+/// 写进 HTML comment 元信息头前的单行清洗。
+/// HTML comment 不能包含 `--`;换行也会破坏导出时的 filing header 解析。
+fn safe_filing_metadata(s: &str) -> String {
+    s.replace("--", "—")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
 }
 
 pub struct SaveArtifact;
@@ -58,7 +70,7 @@ impl Tool for SaveArtifact {
             "properties": {
                 "doc_type": {
                     "type": "string",
-                    "description": "文书类型,按用户要写的材料如实填(如 民事起诉状 / 答辩状 / 代理词 / 催款律师函 / 证据目录 / 法律意见书 / 分析报告 等,不限)。民事起诉状 / 证据目录 / 法律意见书 / 律师函(函类)有固定结构,答辩状 / 代理词有建议结构(均见工具说明)"
+                    "description": "文书类型,按用户要写的材料如实填(如 民事起诉状 / 答辩状 / 质证意见 / 代理词 / 催款律师函 / 证据目录 / 法律意见书 / 分析报告 等,不限)。民事起诉状 / 证据目录 / 质证意见 / 法律意见书 / 律师函(函类)有固定结构,答辩状 / 代理词有建议结构(均见工具说明)"
                 },
                 "title": {
                     "type": "string",
@@ -125,18 +137,24 @@ pub(crate) async fn persist_filing(
 
     let body = format!(
         "<!-- filing · doc_type={} · title={} · ts={} -->\n\n{}",
-        doc_type,
-        title,
+        safe_filing_metadata(doc_type),
+        safe_filing_metadata(title),
         chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
         content_md
     );
+    if body.len() as u64 > ARTIFACT_MAX_BYTES {
+        return Err(format!(
+            "文书过大({:.1} MB),已拒绝写入;请拆成多份文书",
+            body.len() as f64 / 1024.0 / 1024.0
+        ));
+    }
     tokio::fs::write(&path, &body)
         .await
         .map_err(|e| format!("写文书失败:{}", e))?;
 
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let path_str = path.to_string_lossy().to_string();
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO documents \
          (id, case_id, source_path, filename, stage, category, is_ai_artifact, \
           mime_type, size_bytes, modified_at, extraction_status, \
@@ -153,8 +171,17 @@ pub(crate) async fn persist_filing(
     .bind(&path_str)
     .bind(&now)
     .execute(pool)
-    .await
-    .map_err(|e| format!("INSERT 文书失败:{}", e))?;
+    .await;
+    if let Err(db_err) = inserted {
+        // 文件和 DB 必须一起成功。否则用户会看到「生成失败」,磁盘上却残留一个
+        // 不受 CaseBoard 管理的半成品。
+        return match tokio::fs::remove_file(&path).await {
+            Ok(()) => Err(format!("登记文书失败:{db_err};已清理未登记文件")),
+            Err(cleanup_err) => Err(format!(
+                "登记文书失败:{db_err};未登记文件清理失败:{cleanup_err}"
+            )),
+        };
+    }
 
     Ok(doc_id)
 }
@@ -313,13 +340,30 @@ async fn apply_edit(
         .await
         .map_err(|e| ApplyErr::Hard(format!("写文书失败:{}", e)))?;
     let now_iso = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    sqlx::query("UPDATE documents SET size_bytes = ?, modified_at = ? WHERE id = ?")
+    let update = sqlx::query("UPDATE documents SET size_bytes = ?, modified_at = ? WHERE id = ?")
         .bind(new_raw.len() as i64)
         .bind(&now_iso)
         .bind(doc_id)
         .execute(pool)
-        .await
-        .map_err(|e| ApplyErr::Hard(format!("更新文书元信息失败:{}", e)))?;
+        .await;
+    let update_error = match update {
+        Ok(done) if done.rows_affected() == 1 => None,
+        Ok(done) => Some(format!(
+            "更新文书元信息失败:预期更新 1 行,实际更新 {} 行",
+            done.rows_affected()
+        )),
+        Err(err) => Some(format!("更新文书元信息失败:{err}")),
+    };
+    if let Some(update_error) = update_error {
+        // 内容写回成功但 DB 元信息失败时,把文件恢复到修改前,避免「磁盘内容已变、
+        // 看板仍显示旧状态」的半成功。
+        return match tokio::fs::write(&source_path, &raw).await {
+            Ok(()) => Err(ApplyErr::Hard(format!("{update_error};已恢复修改前内容"))),
+            Err(rollback_err) => Err(ApplyErr::Hard(format!(
+                "{update_error};恢复修改前内容失败:{rollback_err}"
+            ))),
+        };
+    }
 
     // 4. 改动处上下文(给 AI 续改用)
     let snippet = surrounding_snippet(&new_body, s, s + replace.len(), 40);

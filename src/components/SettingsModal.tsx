@@ -666,7 +666,7 @@ export function SettingsModal({
   const body = (
     <>
         {/* 标题栏 */}
-        <header className="flex items-center justify-between gap-4 border-b border-border bg-card/95 px-5 py-3.5 backdrop-blur">
+        <header className="app-subheader flex items-center justify-between gap-4 border-b px-4 py-3.5 sm:px-5">
           <div>
             <h2
               className={cn(
@@ -677,10 +677,24 @@ export function SettingsModal({
               设置
             </h2>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              填你自己的 token。每个用户填自己的,工具不内置任何人的 key。
+              配置模型、知识库、数据源和可选功能。
             </p>
           </div>
-          {!isPage && (
+          {isPage ? (
+            <Button
+              size="sm"
+              onClick={handleSave}
+              disabled={saving || !settings || !dirty}
+              title="保存本页全部设置"
+            >
+              {saving ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Save className="size-3.5" />
+              )}
+              保存
+            </Button>
+          ) : (
             <Button
               variant="ghost"
               size="icon"
@@ -693,7 +707,7 @@ export function SettingsModal({
         </header>
 
         {/* 内容区 */}
-        <div className="flex-1 overflow-auto px-5 py-5">
+        <div className="flex-1 overflow-auto px-4 py-5 sm:px-5">
           {loading && (
             <div className="flex items-center justify-center py-8">
               <Loader2 className="size-5 animate-spin text-muted-foreground" />
@@ -702,7 +716,11 @@ export function SettingsModal({
           {!loading && settings && (
             <>
             {/* 2026-06-16 · 标签页导航:按类型归拢散乱配置 */}
-            <div className="mb-5 flex flex-wrap gap-1.5 border-b border-border pb-3">
+            <div
+              className="mb-6 flex flex-wrap gap-1.5 border-b border-border pb-3"
+              role="tablist"
+              aria-label="设置分类"
+            >
               {SETTINGS_TABS.map((t) => {
                 const Icon = t.icon;
                 const active = tab === t.id;
@@ -711,11 +729,13 @@ export function SettingsModal({
                     key={t.id}
                     type="button"
                     onClick={() => setTab(t.id)}
+                    role="tab"
+                    aria-selected={active}
                     className={cn(
-                      "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
+                      "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-[transform,background-color,color,box-shadow] duration-150 active:scale-[0.97]",
                       active
-                        ? "bg-sky-50 text-sky-700 ring-1 ring-sky-200"
-                        : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                        ? "bg-brand-soft text-brand shadow-sm ring-1 ring-brand/15"
+                        : "text-muted-foreground hover:bg-accent/80 hover:text-foreground",
                     )}
                   >
                     <Icon className="size-4" />
@@ -730,7 +750,7 @@ export function SettingsModal({
                 // 窗口恒 ≥1024(minWidth),lg 断点始终生效 → 默认就是两列。
                 // modal 模式:保持单列堆叠,窄弹窗里两列会挤。
                 isPage
-                  ? "grid grid-cols-1 lg:grid-cols-2 gap-x-5 gap-y-5 items-start"
+                  ? "grid grid-cols-1 items-start gap-x-6 gap-y-6 lg:grid-cols-2"
                   : "space-y-6",
               )}
             >
@@ -1502,7 +1522,12 @@ export function SettingsModal({
         </div>
 
         {/* 底部按钮栏 */}
-        <footer className="flex items-center justify-between gap-4 border-t border-border bg-card/95 px-5 py-3 backdrop-blur">
+        <footer
+          className={cn(
+            "app-subheader flex items-center gap-4 border-t px-4 py-3 sm:px-5",
+            isPage ? "justify-start" : "justify-between",
+          )}
+        >
           <span
             className={cn(
               "text-caption",
@@ -1512,39 +1537,39 @@ export function SettingsModal({
             )}
           >
             {saved
-              ? "✓ 已保存 · 下次导入案件时生效(已在跑的任务不切换后端)"
+              ? "已保存 · 下次导入案件时生效(已在跑的任务不切换后端)"
               : settings === null
                 ? ""
                 : dirty
-                  ? "● 有未保存改动 · 别忘了点保存"
+                  ? "有未保存改动 · 别忘了点保存"
                   : "改完点保存"}
           </span>
-          <div className="flex gap-2">
-            {!isPage && (
+          {!isPage && (
+            <div className="flex gap-2">
               <Button variant="outline" size="sm" onClick={handleClose}>
                 取消
               </Button>
-            )}
-            <Button
-              size="sm"
-              onClick={handleSave}
-              disabled={saving || !settings || (isPage && !dirty)}
-            >
-              {saving ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <Save className="size-3.5" />
-              )}
-              保存
-            </Button>
-          </div>
+              <Button
+                size="sm"
+                onClick={handleSave}
+                disabled={saving || !settings}
+              >
+                {saving ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Save className="size-3.5" />
+                )}
+                保存
+              </Button>
+            </div>
+          )}
         </footer>
     </>
   );
 
   if (isPage) {
     return (
-      <div className="mx-auto flex h-full w-full max-w-5xl flex-col overflow-hidden">
+      <div className="app-page-enter mx-auto flex h-full w-full max-w-6xl flex-col overflow-hidden">
         {body}
       </div>
     );
@@ -1569,10 +1594,10 @@ export function SettingsModal({
 /* ------------------------------------------------------------------ */
 
 const inputCls = cn(
-  "h-9 w-full rounded-md border border-border bg-background px-3 text-sm",
+  "h-9 w-full rounded-md border border-border bg-card/85 px-3 text-sm",
   "placeholder:text-muted-foreground/60",
   "transition-[border-color,box-shadow]",
-  "focus:outline-none focus:border-foreground focus:ring-1 focus:ring-foreground/20",
+  "focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/15",
 );
 
 /**
@@ -1620,13 +1645,17 @@ function Section({
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
           <h3 className="text-sm font-semibold text-foreground">{title}</h3>
-          {desc && <p className="mt-0.5 text-xs text-muted-foreground">{desc}</p>}
+          {desc && (
+            <p className="mt-0.5 line-clamp-1 text-xs text-muted-foreground">
+              {desc}
+            </p>
+          )}
         </div>
         {link && (
           <button
             type="button"
             onClick={() => openUrl(link.href).catch((e) => console.warn("openUrl failed", e))}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-sky-200 bg-sky-50 px-2.5 py-1 text-xs font-medium text-sky-700 transition-colors hover:border-sky-300 hover:bg-sky-100"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-brand/15 bg-brand-soft/60 px-2.5 py-1 text-xs font-medium text-brand transition-[transform,background-color,border-color] hover:border-brand/25 hover:bg-brand-soft active:scale-[0.97]"
             title={link.href}
           >
             <ExternalLink className="size-3.5" />
@@ -1637,7 +1666,7 @@ function Section({
       {/* 默认自然高度(配对相近高度卡 + items-start 不留空);fill=true 时撑满行高(同排等高) */}
       <div
         className={cn(
-          "space-y-3 rounded-lg border border-border bg-background/50 p-4",
+          "surface-card space-y-3 bg-card/74 p-4",
           fill && "flex-1",
         )}
       >
@@ -1692,7 +1721,7 @@ function FeatureFlagsCard({
   return (
     <Section
       title="功能开关"
-      desc="这些可选模块默认关闭,想用哪个再开。只影响这台机器的界面,不动案件数据。"
+      desc="可选模块默认关闭，仅影响本机界面。"
     >
       <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
         <SettingsSwitchRow
@@ -1726,7 +1755,7 @@ function SettingsSwitchRow({
   onChange: () => void;
 }) {
   return (
-    <div className="flex min-h-[76px] items-center justify-between gap-3 rounded-md border border-border bg-background/50 p-3">
+    <div className="flex min-h-[76px] items-center justify-between gap-3 rounded-lg border border-border bg-card/70 p-3 transition-colors hover:border-brand/15 hover:bg-card">
       <div className="min-w-0">
         <p className="text-sm font-medium text-foreground">{title}</p>
         <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>
@@ -1738,8 +1767,8 @@ function SettingsSwitchRow({
         aria-label={title}
         onClick={onChange}
         className={cn(
-          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
-          on ? "bg-sky-600" : "bg-muted",
+          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-[transform,background-color,box-shadow] active:scale-[0.96]",
+          on ? "bg-brand shadow-[0_0_0_3px_var(--brand-soft)]" : "bg-muted",
         )}
       >
         <span
@@ -1789,7 +1818,7 @@ function FontScaleCard() {
   return (
     <Section
       title="界面字号"
-      desc="觉得字小就调大 —— 整个界面(文字 + 间距)等比缩放。只影响这台机器,随时可调。"
+      desc="整体缩放文字与间距，仅影响本机。"
     >
       <div className="space-y-3">
         <div className="flex items-center justify-between">
@@ -1803,7 +1832,7 @@ function FontScaleCard() {
           step={FONT_SCALE.STEP}
           value={scale}
           onChange={(e) => setScale(parseFloat(e.target.value))}
-          className="w-full accent-sky-600"
+          className="w-full accent-[var(--brand)]"
           aria-label="界面字号缩放"
         />
         <div className="flex flex-wrap items-center gap-1.5">
@@ -1815,7 +1844,7 @@ function FontScaleCard() {
               className={cn(
                 "rounded-md border px-2.5 py-1 text-xs font-medium transition-colors",
                 Math.abs(scale - p.v) < 0.001
-                  ? "border-sky-300 bg-sky-50 text-sky-700"
+                  ? "border-brand/30 bg-brand-soft text-brand"
                   : "border-border text-muted-foreground hover:bg-accent hover:text-foreground",
               )}
             >
@@ -2299,9 +2328,6 @@ function McpServerRow({
 // V0.2 D7 · 本地知识库三态卡 + 元典积分卡
 // =============================================================================
 
-/** macOS Documents/Desktop 权限被拒时,这个 URL 直接打开系统设置 → 文件与文件夹 */
-const MACOS_PRIVACY_FILES_URL =
-  "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders";
 const DEFAULT_KB_PATH = "~/Documents/知识库";
 
 function LocalKbCard({
@@ -2601,16 +2627,17 @@ function LocalKbCard({
               </span>
             </div>
             <p className="text-label text-muted-foreground">
-              请到 系统设置 → 隐私与安全 → 文件与文件夹 → CaseBoard → 勾选"文稿"。
+              请检查该目录的系统访问权限、网盘同步状态或安全软件限制；也可以重新选择一个可读写目录。
             </p>
             <div className="flex flex-wrap gap-1.5">
               <Button
                 type="button"
                 size="sm"
-                onClick={() => openUrl(MACOS_PRIVACY_FILES_URL).catch(() => {})}
+                onClick={handleChoosePath}
+                disabled={busy}
               >
-                <ExternalLink className="size-3.5" />
-                打开系统设置
+                <FolderOpen className="size-3.5" />
+                重新选择目录
               </Button>
               <Button
                 type="button"

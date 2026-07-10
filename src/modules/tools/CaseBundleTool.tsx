@@ -263,6 +263,18 @@ export function CaseBundleTool() {
             {report.filledFields.length > 0 && (
               <p className="text-muted-foreground">补充字段:{report.filledFields.join("、")}</p>
             )}
+            {report.skipReasons.length > 0 && (
+              <details className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-amber-900">
+                <summary className="cursor-pointer font-medium">
+                  查看 {report.skipReasons.length} 条跳过原因
+                </summary>
+                <ul className="mt-1 list-disc space-y-1 pl-5">
+                  {report.skipReasons.map((reason, index) => (
+                    <li key={`${index}:${reason}`}>{reason}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
             <p className="text-muted-foreground">
               合并的材料正在后台抽取,完成后建议在案件详情点「重新分析」生成统一画像。
             </p>

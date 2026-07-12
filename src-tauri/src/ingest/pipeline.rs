@@ -10,7 +10,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
@@ -44,6 +45,94 @@ const SUBMIT_MIN_INTERVAL_MS: u64 = 1400;
 /// 全应用同一时间只跑一个案件级抽取管线。案内仍按 8→4→1 并发，所以百份材料不会退化成
 /// 单文件串行；这里防止用户在多个案件连续点击刷新/重试后形成 N×8 并发、进度事件互相覆盖。
 static EXTRACTION_PIPELINE_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+#[derive(Default)]
+struct ExtractionCancel {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ExtractionCancel {
+    fn cancel(&self) {
+        self.cancelled.store(true, AtomicOrdering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(AtomicOrdering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+static EXTRACTION_CANCEL_REGISTRY: OnceLock<
+    std::sync::Mutex<HashMap<String, Vec<Weak<ExtractionCancel>>>>,
+> = OnceLock::new();
+
+fn extraction_cancel_registry(
+) -> &'static std::sync::Mutex<HashMap<String, Vec<Weak<ExtractionCancel>>>> {
+    EXTRACTION_CANCEL_REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+struct ExtractionRegistration {
+    case_id: String,
+    signal: Arc<ExtractionCancel>,
+}
+
+impl ExtractionRegistration {
+    fn new(case_id: &str) -> Self {
+        let signal = Arc::new(ExtractionCancel::default());
+        if let Ok(mut registry) = extraction_cancel_registry().lock() {
+            let entries = registry.entry(case_id.to_string()).or_default();
+            entries.retain(|entry| entry.strong_count() > 0);
+            entries.push(Arc::downgrade(&signal));
+        }
+        Self {
+            case_id: case_id.to_string(),
+            signal,
+        }
+    }
+}
+
+impl Drop for ExtractionRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = extraction_cancel_registry().lock() {
+            if let Some(entries) = registry.get_mut(&self.case_id) {
+                let own_signal = Arc::as_ptr(&self.signal);
+                entries.retain(|entry| entry.as_ptr() != own_signal && entry.strong_count() > 0);
+                if entries.is_empty() {
+                    registry.remove(&self.case_id);
+                }
+            }
+        }
+    }
+}
+
+/// 删除案件前取消同案所有运行中或排队中的抽取任务。
+pub fn cancel_case_extraction(case_id: &str) -> usize {
+    let Ok(mut registry) = extraction_cancel_registry().lock() else {
+        return 0;
+    };
+    let Some(entries) = registry.remove(case_id) else {
+        return 0;
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| entry.upgrade())
+        .map(|signal| {
+            signal.cancel();
+            1usize
+        })
+        .sum()
+}
 
 /// 真正跨案件、跨重试轮次共享的 MinerU 提交节流器。
 static GLOBAL_SUBMIT_THROTTLE: OnceLock<SubmitThrottle> = OnceLock::new();
@@ -277,8 +366,18 @@ pub fn spawn_extraction(
     documents: Vec<Document>,
     run_analysis: bool,
 ) {
+    let registration = ExtractionRegistration::new(&case_id);
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = run_extraction(&app, &pool, &case_id, &documents, run_analysis).await {
+        if let Err(e) = run_extraction(
+            &app,
+            &pool,
+            &case_id,
+            &documents,
+            run_analysis,
+            &registration.signal,
+        )
+        .await
+        {
             crate::dlog!("[pipeline] case {} 抽取 fatal error: {}", case_id, e);
         }
     });
@@ -298,9 +397,26 @@ pub fn spawn_extraction_batch(
     jobs: Vec<(String, Vec<Document>)>,
     run_analysis: bool,
 ) {
+    // 入队前同步注册全部案件，确保删除一个尚未轮到的案件也能取消其排队任务。
+    let jobs: Vec<_> = jobs
+        .into_iter()
+        .map(|(case_id, documents)| {
+            let registration = ExtractionRegistration::new(&case_id);
+            (case_id, documents, registration)
+        })
+        .collect();
     tauri::async_runtime::spawn(async move {
-        for (case_id, documents) in jobs {
-            if let Err(e) = run_extraction(&app, &pool, &case_id, &documents, run_analysis).await {
+        for (case_id, documents, registration) in jobs {
+            if let Err(e) = run_extraction(
+                &app,
+                &pool,
+                &case_id,
+                &documents,
+                run_analysis,
+                &registration.signal,
+            )
+            .await
+            {
                 crate::dlog!("[pipeline] case {} 批量抽取 fatal error: {}", case_id, e);
             }
         }
@@ -353,11 +469,17 @@ async fn run_extraction(
     case_id: &str,
     documents: &[Document],
     run_analysis: bool,
+    cancel: &Arc<ExtractionCancel>,
 ) -> Result<(), String> {
-    let _pipeline_permit = EXTRACTION_PIPELINE_SLOT
-        .acquire()
-        .await
-        .expect("extraction pipeline semaphore must stay open");
+    let _pipeline_permit = tokio::select! {
+        permit = EXTRACTION_PIPELINE_SLOT.acquire() => {
+            permit.expect("extraction pipeline semaphore must stay open")
+        }
+        _ = cancel.cancelled() => return finish_cancelled(pool, case_id).await,
+    };
+    if cancel.is_cancelled() {
+        return finish_cancelled(pool, case_id).await;
+    }
 
     // 等待全局槽位期间，前一个任务可能已处理了同一批文档。重新读当前状态，并只保留调用方
     // 原本提交的 doc id，避免用旧快照重复 OCR；单文档重抽也不会误带本案其它 pending 材料。
@@ -486,6 +608,9 @@ async fn run_extraction(
     let mut queue: Vec<Document> = pending;
 
     for (round_idx, &concurrency) in ROUND_CONCURRENCY.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return finish_cancelled(pool, case_id).await;
+        }
         if queue.is_empty() {
             break;
         }
@@ -500,7 +625,7 @@ async fn run_extraction(
             queue.len(),
         );
 
-        let round_results: Vec<(Document, ProcessOutcome)> =
+        let round_results: Vec<(Document, Option<ProcessOutcome>)> =
             stream::iter(queue.into_iter().enumerate())
                 .map(|(index, doc)| {
                     let app = app.clone();
@@ -513,6 +638,7 @@ async fn run_extraction(
                     let completed = Arc::clone(&completed);
                     let throttle = global_submit_throttle();
                     let batch_abort = Arc::clone(&batch_abort);
+                    let cancel = Arc::clone(cancel);
                     let filename = doc.filename.clone();
                     let doc_id = doc.id.clone();
                     async move {
@@ -520,7 +646,9 @@ async fn run_extraction(
                             .lock()
                             .ok()
                             .and_then(|guard| guard.clone());
-                        let processed = if let Some(error) = abort_error {
+                        let processed = if cancel.is_cancelled() {
+                            None
+                        } else if let Some(error) = abort_error {
                             let persist_result = sqlx::query(
                                 "UPDATE documents SET extraction_status = 'failed', last_error = ? WHERE id = ?",
                             )
@@ -529,31 +657,34 @@ async fn run_extraction(
                             .execute(&pool)
                             .await;
                             match persist_result {
-                                Ok(_) => ProcessOutcome::failed(error, FailureDisposition::Terminal),
+                                Ok(_) => Some(ProcessOutcome::failed(error, FailureDisposition::Terminal)),
                                 Err(persist_error) => {
-                                    persistence_failure("批量故障状态", persist_error)
+                                    Some(persistence_failure("批量故障状态", persist_error))
                                 }
                             }
                         } else {
-                            process_one_doc(
-                                &app,
-                                &pool,
-                                &case_id_owned,
-                                &llm_config,
-                                &ocr_ctx,
-                                &ocr_provider,
-                                &llm_provider,
-                                index + 1,
-                                total,
-                                doc.clone(),
-                                round_num,
-                                is_final,
-                                throttle,
-                            )
-                            .await
+                            tokio::select! {
+                                _ = cancel.cancelled() => None,
+                                result = process_one_doc(
+                                    &app,
+                                    &pool,
+                                    &case_id_owned,
+                                    &llm_config,
+                                    &ocr_ctx,
+                                    &ocr_provider,
+                                    &llm_provider,
+                                    index + 1,
+                                    total,
+                                    doc.clone(),
+                                    round_num,
+                                    is_final,
+                                    throttle,
+                                ) => Some(result),
+                            }
                         };
 
-                        if processed.disposition == FailureDisposition::AbortBatch {
+                        if processed.as_ref().is_some_and(|result| result.disposition == FailureDisposition::AbortBatch) {
+                            let processed = processed.as_ref().expect("checked Some");
                             if let DocOutcome::Failed { error } = &processed.outcome {
                                 // 持久化故障本身可能已恢复（如瞬时 SQLite busy）；再尽力把当前文档
                                 // 从 processing 收口为 failed，避免只能等下次启动恢复。
@@ -574,10 +705,13 @@ async fn run_extraction(
                         }
 
                         // 只有最终结果(成功 / skipped / 第 3 轮失败)才递增 completed_count + emit DocFinished
-                        let is_terminal = !matches!(processed.outcome, DocOutcome::Failed { .. })
-                            || is_final
-                            || !processed.is_retryable();
+                        let is_terminal = processed.as_ref().is_some_and(|result| {
+                            !matches!(result.outcome, DocOutcome::Failed { .. })
+                                || is_final
+                                || !result.is_retryable()
+                        });
                         if is_terminal {
+                            let processed = processed.as_ref().expect("terminal result must exist");
                             let done_so_far = completed.fetch_add(1, Ordering::SeqCst) + 1;
                             let _ = app.emit(
                                 "extraction_progress",
@@ -603,6 +737,9 @@ async fn run_extraction(
         // 非最终轮的失败 → 进下一轮 queue
         let mut next_queue: Vec<Document> = Vec::new();
         for (doc, processed) in round_results {
+            let Some(processed) = processed else {
+                return finish_cancelled(pool, case_id).await;
+            };
             match &processed.outcome {
                 DocOutcome::Failed { .. } if !is_final && processed.is_retryable() => {
                     next_queue.push(doc);
@@ -664,8 +801,10 @@ async fn run_extraction(
                 case_id: case_id.to_string(),
             },
         );
-        let report =
-            crate::ingest::global_pipeline::run_global_extract(pool, case_id, &llm_config).await;
+        let report = tokio::select! {
+            _ = cancel.cancelled() => return finish_cancelled(pool, case_id).await,
+            report = crate::ingest::global_pipeline::run_global_extract(pool, case_id, &llm_config) => report,
+        };
         crate::dlog!(
             "[global_extract] case={} docs={} table_ok={} report_ok={} elapsed={}ms{}",
             case_id,
@@ -714,6 +853,20 @@ async fn run_extraction(
         },
     );
 
+    Ok(())
+}
+
+async fn finish_cancelled(pool: &SqlitePool, case_id: &str) -> Result<(), String> {
+    // 若删除 DB 失败，避免残留永久 processing；若删除已成功，本 UPDATE 自然影响 0 行。
+    sqlx::query(
+        "UPDATE documents SET extraction_status = 'pending' \
+         WHERE case_id = ? AND extraction_status = 'processing'",
+    )
+    .bind(case_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("取消抽取后恢复材料状态失败: {}", error))?;
+    crate::dlog!("[pipeline] case={} 抽取任务已取消", case_id);
     Ok(())
 }
 
@@ -775,13 +928,19 @@ async fn process_one_doc(
         return persistence_failure("标记处理中", error);
     }
 
+    // 第一轮正文提取成功但 LLM 失败时已落盘；后续轮次只重试 LLM，避免重复 OCR 和额度消耗。
+    let cached_retry_text = (round_num > 1)
+        .then(|| read_retry_text(case_id, &doc.id))
+        .flatten();
+
     // 2026-06-14:云端 OCR 单文档轮询进度 → 前端"排队 / 识别中(已 N 秒)"子状态。
     // 建一个单文档级回传通道 + 转发任务:OCR 轮询循环每拍 send 一次 OcrPollUpdate,
     // 转发任务补上 doc 上下文后 emit DocOcrStatus(**不动主进度条百分比**,前端单独渲染)。
     // tx 随 doc_ocr_ctx 在本函数末尾 drop,转发任务届时自然结束(rx 收到 None)。
     // 仅在可能走云端 OCR(cloud_enabled 或去水印强制后端)时才建,本地/跳过文档不浪费。
     let mut doc_ocr_ctx = ocr_ctx.clone();
-    if ocr_ctx.cloud_enabled || doc.ocr_backend_override.is_some() {
+    if cached_retry_text.is_none() && (ocr_ctx.cloud_enabled || doc.ocr_backend_override.is_some())
+    {
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::ingest::ocr::OcrPollUpdate>();
         doc_ocr_ctx.poll_tx = Some(tx);
@@ -820,7 +979,7 @@ async fn process_one_doc(
     let result = if let Some(backend) = doc.ocr_backend_override.clone() {
         // 2026-06-13:用户对该文档点了「去水印重识别」→ 强制走该 OCR 后端(PP-OCRv6+去水印),
         // 绕过归档短路与文本层、不回退;让带水印的工商调档件也能完整抽。
-        if ocr_ctx.cloud_enabled && might_hit_mineru(&doc.filename) {
+        if cached_retry_text.is_none() && ocr_ctx.cloud_enabled && might_hit_mineru(&doc.filename) {
             throttle.acquire().await;
         }
         doc_ocr_ctx.force_backend = Some(backend);
@@ -830,6 +989,7 @@ async fn process_one_doc(
             Path::new(&doc.source_path),
             &doc.filename,
             doc.category.as_deref(),
+            cached_retry_text.clone(),
         )
         .await
     } else if doc.is_ai_artifact {
@@ -864,7 +1024,7 @@ async fn process_one_doc(
         //    走完整 extract_one(字段 + 文本)。PDF/扫描件会触发云端 OCR(作者主动选择:
         //    分析价值 > OCR 成本;扫描件直抽失败才 OCR 的既有链路保留,不浪费)。
         // 节流闸门 —— 仅云端 OCR + PDF/图片才需要(避开 MinerU 50 文件/分钟限流)
-        if ocr_ctx.cloud_enabled && might_hit_mineru(&doc.filename) {
+        if cached_retry_text.is_none() && ocr_ctx.cloud_enabled && might_hit_mineru(&doc.filename) {
             throttle.acquire().await;
         }
         extract_one(
@@ -873,6 +1033,7 @@ async fn process_one_doc(
             Path::new(&doc.source_path),
             &doc.filename,
             doc.category.as_deref(),
+            cached_retry_text,
         )
         .await
     };
@@ -960,6 +1121,9 @@ async fn process_one_doc(
                     return persistence_failure("写入部分抽取状态", error);
                 }
             } else {
+                if let Err(error) = persist_retry_text(pool, case_id, &doc.id, &text_md).await {
+                    return persistence_failure("缓存部分抽取正文", error);
+                }
                 if let Err(error) =
                     sqlx::query("UPDATE documents SET extraction_status = 'pending' WHERE id = ?")
                         .bind(&doc.id)
@@ -1075,6 +1239,13 @@ async fn process_one_doc(
             } else {
                 // 中间轮失败 → 回退 pending 状态,等下一轮 caller 再喂进来
                 // (不写 last_error,因为下一轮可能成功;只在最终失败才落 error)
+                if let Some(text) = text_md.as_deref() {
+                    if let Err(persist_error) =
+                        persist_retry_text(pool, case_id, &doc.id, text).await
+                    {
+                        return persistence_failure("缓存失败材料正文", persist_error);
+                    }
+                }
                 if let Err(persist_error) =
                     sqlx::query("UPDATE documents SET extraction_status = 'pending' WHERE id = ?")
                         .bind(&doc.id)
@@ -1109,6 +1280,36 @@ fn write_extracted_md(case_id: &str, doc_id: &str, text: &str) -> Result<String,
     let path = dir.join(format!("{}.md", doc_id));
     std::fs::write(&path, text).map_err(|e| format!("写 {} 失败: {}", path.display(), e))?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+async fn persist_retry_text(
+    pool: &SqlitePool,
+    case_id: &str,
+    doc_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let path = write_extracted_md(case_id, doc_id, text)?;
+    let hash = crate::db::documents::stable_text_hash(text);
+    sqlx::query(
+        "UPDATE documents SET extracted_text_path = ?, extracted_text_hash = ? WHERE id = ?",
+    )
+    .bind(path)
+    .bind(hash)
+    .bind(doc_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("登记重试正文失败: {}", error))?;
+    Ok(())
+}
+
+fn read_retry_text(case_id: &str, doc_id: &str) -> Option<String> {
+    std::fs::read_to_string(
+        extracts_dir_for_case(case_id)
+            .ok()?
+            .join(format!("{}.md", doc_id)),
+    )
+    .ok()
+    .filter(|text| !text.trim().is_empty())
 }
 
 /// 判断这个文档类别是不是"律所规范 / 程序 / 身份归档类" —— 抽文本归档,但**不进 LLM 上下文**。

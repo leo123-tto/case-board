@@ -14,6 +14,7 @@ pub enum LlmProviderKind {
     MiniMaxNative,
     GlmCompat,
     MimoCompat,
+    KimiCompat,
     CustomCompat,
     LocalOpenAiCompat,
     UnknownOpenAiCompat,
@@ -88,6 +89,17 @@ impl ProviderCapability {
                 supports_tool_choice_required: false,
                 output_token_param: OutputTokenParam::MaxTokens,
             },
+            LlmProviderKind::KimiCompat => Self {
+                kind,
+                supports_tools: true,
+                supports_strict_tools: false,
+                requires_reasoning_replay_for_tool_calls: true,
+                supports_prompt_cache_usage: false,
+                supports_json_object_response_format: true,
+                supports_stream_usage: false,
+                supports_tool_choice_required: false,
+                output_token_param: OutputTokenParam::MaxTokens,
+            },
             LlmProviderKind::CustomCompat | LlmProviderKind::UnknownOpenAiCompat => Self {
                 kind,
                 supports_tools: false,
@@ -112,6 +124,15 @@ impl ProviderCapability {
             },
         }
     }
+
+    /// Kimi Coding Plan 只接受 temperature=1；其他 provider 完整保留调用方参数。
+    pub fn normalize_temperature(&self, requested: f32) -> f32 {
+        if self.kind == LlmProviderKind::KimiCompat {
+            1.0
+        } else {
+            requested
+        }
+    }
 }
 
 pub fn infer_provider_kind(backend: &str, endpoint: &str, model: &str) -> LlmProviderKind {
@@ -124,6 +145,7 @@ pub fn infer_provider_kind(backend: &str, endpoint: &str, model: &str) -> LlmPro
         "minimax" => return LlmProviderKind::MiniMaxNative,
         "glm" => return LlmProviderKind::GlmCompat,
         "mimo" => return LlmProviderKind::MimoCompat,
+        "kimi" => return LlmProviderKind::KimiCompat,
         "custom" => return LlmProviderKind::CustomCompat,
         _ => {}
     }
@@ -136,6 +158,8 @@ pub fn infer_provider_kind(backend: &str, endpoint: &str, model: &str) -> LlmPro
         LlmProviderKind::GlmCompat
     } else if endpoint_l.contains("xiaomimimo") || model_l.contains("mimo") {
         LlmProviderKind::MimoCompat
+    } else if endpoint_l.contains("api.kimi.com/coding") || model_l.contains("kimi-for-coding") {
+        LlmProviderKind::KimiCompat
     } else if endpoint_l.contains("127.0.0.1") || endpoint_l.contains("localhost") {
         LlmProviderKind::LocalOpenAiCompat
     } else {

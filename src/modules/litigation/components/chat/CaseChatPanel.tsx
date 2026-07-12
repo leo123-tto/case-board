@@ -17,7 +17,9 @@
  */
 
 import {
+  lazy,
   memo,
+  Suspense,
   type ComponentProps,
   type MouseEvent as ReactMouseEvent,
   useCallback,
@@ -39,6 +41,7 @@ import {
   ExternalLink,
   FilePenLine,
   FileText,
+  GitBranch,
   ListChecks,
   Loader2,
   Microscope,
@@ -68,10 +71,12 @@ import {
   clearChatHistory,
   createCaseMemory,
   disableCaseMemory,
+  getCaseVisualWorkspace,
   getCaseWithDocs,
   ignoreMemoryCandidate,
   listChatHistory,
   listCaseMemories,
+  listCaseVisualSummaries,
   listGlobalMemories,
   listMemoryCandidates,
   openUrl,
@@ -87,12 +92,19 @@ import type {
   ToolCallRecord,
 } from "@/lib/types";
 import { confirmDialog } from "@/lib/dialog";
+import type {
+  VisualWorkspace,
+  VisualWorkspaceSummary,
+} from "../visualization/types";
 
 import { AskUserCard } from "./AskUserCard";
 import { AttachmentChips } from "./AttachmentChips";
 import { AttachmentPicker } from "./AttachmentPicker";
 import { CitationsCard } from "./CitationsCard";
 import { ToolCallTrace } from "./ToolCallTrace";
+import VisualizationPreviewCard, {
+  indexVisualSummariesByMessageId,
+} from "../visualization/VisualizationPreviewCard";
 import {
   clearRun,
   finishRun,
@@ -102,6 +114,10 @@ import {
   subscribeRun,
   type ChatSegment,
 } from "./chatRunRegistry";
+
+const CaseVisualizationWorkspace = lazy(
+  () => import("../visualization/CaseVisualizationWorkspace"),
+);
 /** localStorage key:chat 面板折叠状态。同 key 被 FeedbackButton 读取以避让。 */
 export const CHAT_PANEL_COLLAPSED_KEY = "caseboard.chat-panel.collapsed";
 /** localStorage value 含义:"1"=折叠,"0"=展开。默认展开。 */
@@ -308,6 +324,9 @@ export function CaseChatPanel({
   const [poppedOut, setPoppedOut] = useState(false);
   const [history, setHistory] = useState<ChatMessage[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [visualSummaries, setVisualSummaries] = useState<VisualWorkspaceSummary[]>([]);
+  const [openedVisualWorkspace, setOpenedVisualWorkspace] = useState<VisualWorkspace | null>(null);
+  const [visualWorkspaceOpening, setVisualWorkspaceOpening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [restorePulse, setRestorePulse] = useState(false);
   const [input, setInput] = useState("");
@@ -353,6 +372,31 @@ export function CaseChatPanel({
     if (!caseId) return;
     const rows = await listChatHistory(caseId);
     setHistory(rows);
+  }, [caseId]);
+
+  const refreshVisualSummaries = useCallback(async () => {
+    if (!caseId) return;
+    setVisualSummaries(await listCaseVisualSummaries(caseId));
+  }, [caseId]);
+
+  const visualSummaryByMessageId = useMemo(
+    () => indexVisualSummariesByMessageId(visualSummaries),
+    [visualSummaries],
+  );
+
+  const openLatestVisualWorkspace = useCallback(async () => {
+    if (!caseId) return;
+    setVisualWorkspaceOpening(true);
+    setError(null);
+    try {
+      const workspace = await getCaseVisualWorkspace(caseId);
+      if (!workspace) throw new Error("该案件的可视化工作区已不存在");
+      setOpenedVisualWorkspace(workspace);
+    } catch (reason) {
+      setError(formatError(reason));
+    } finally {
+      setVisualWorkspaceOpening(false);
+    }
   }, [caseId]);
 
   const refreshMemories = useCallback(async () => {
@@ -491,6 +535,8 @@ export function CaseChatPanel({
     // V0.3 · 切案件清掉上一个案件遗留的选项卡片
     setPendingAsk(null);
     setPendingAskTaskType(null);
+    setVisualSummaries([]);
+    setOpenedVisualWorkspace(null);
     if (!caseId || collapsed) return;
     let abort = false;
     setHistoryLoading(true);
@@ -516,6 +562,17 @@ export function CaseChatPanel({
       abort = true;
     };
   }, [caseId, collapsed]);
+
+  useEffect(() => {
+    if (!caseId || collapsed) return;
+    let active = true;
+    refreshVisualSummaries().catch((reason) => {
+      if (active) setError(`读取案情可视化失败：${formatError(reason)}`);
+    });
+    return () => {
+      active = false;
+    };
+  }, [caseId, collapsed, refreshVisualSummaries]);
 
   useEffect(() => {
     if (!caseId || collapsed || !memoryOpen) return;
@@ -548,6 +605,7 @@ export function CaseChatPanel({
     const refreshVisibleHistory = () => {
       if (document.visibilityState === "hidden") return;
       void refreshHistory().catch(() => {});
+      void refreshVisualSummaries().catch(() => {});
     };
     window.addEventListener("focus", refreshVisibleHistory);
     document.addEventListener("visibilitychange", refreshVisibleHistory);
@@ -556,7 +614,7 @@ export function CaseChatPanel({
       window.removeEventListener("focus", refreshVisibleHistory);
       document.removeEventListener("visibilitychange", refreshVisibleHistory);
     };
-  }, [caseId, collapsed, refreshHistory]);
+  }, [caseId, collapsed, refreshHistory, refreshVisualSummaries]);
 
   // 2026-05-31 · 订阅模块级 run registry:面板(重新)挂载时重连进行中的运行,
   // 运行结束时刷新历史并清除 registry。解决「流式中切走再回来 → 输出消失 + 重复点击出两份」。
@@ -570,12 +628,13 @@ export function CaseChatPanel({
         refreshHistory()
           .catch(() => {})
           .finally(() => clearRun(caseId));
+        void refreshVisualSummaries().catch(() => {});
       }
     });
     // 挂载即重渲染一次,显示可能已在进行的运行
     forceRerender((n) => n + 1);
     return unsub;
-  }, [caseId, refreshHistory]);
+  }, [caseId, refreshHistory, refreshVisualSummaries]);
 
   const disabled = !caseId || isStreaming;
 
@@ -651,6 +710,12 @@ export function CaseChatPanel({
         (t) => t.tool === "edit_artifact" && t.success,
       );
       if (calledEditArtifact) onArtifactEdited?.();
+      const calledVisualTool = result.tool_calls?.some(
+        (tool) =>
+          (tool.tool === "save_case_visualization" || tool.tool === "propose_case_visual_update")
+          && tool.success,
+      );
+      if (calledVisualTool) await refreshVisualSummaries();
     } catch (e) {
       const msg = formatError(e);
       setError(msg);
@@ -839,6 +904,20 @@ export function CaseChatPanel({
           >
             <Brain className="size-3.5" />
           </button>
+          {visualSummaries.length > 0 && (
+            <button
+              type="button"
+              onClick={() => void openLatestVisualWorkspace()}
+              disabled={visualWorkspaceOpening}
+              className="icon-action size-7 disabled:cursor-not-allowed disabled:opacity-30"
+              title="打开案情可视化工作台"
+              aria-label={visualWorkspaceOpening ? "正在打开案情可视化" : "打开案情可视化工作台"}
+            >
+              {visualWorkspaceOpening
+                ? <Loader2 className="size-3.5 animate-spin" />
+                : <GitBranch className="size-3.5" />}
+            </button>
+          )}
           <button
             type="button"
             onClick={clearAll}
@@ -926,7 +1005,12 @@ export function CaseChatPanel({
         )}
 
         {history.map((msg) => (
-          <MessageBubble key={msg.id} msg={msg} />
+          <MessageBubble
+            key={msg.id}
+            msg={msg}
+            visualSummary={visualSummaryByMessageId.get(msg.id)}
+            onOpenVisual={setOpenedVisualWorkspace}
+          />
         ))}
 
         {/* 流式中的 assistant 消息(来自模块级 registry,切走再回来也能恢复) */}
@@ -1369,6 +1453,26 @@ export function CaseChatPanel({
           setPickerOpen(false);
         }}
       />
+      {openedVisualWorkspace && caseId && (
+        <Suspense
+          fallback={
+            <div className="fixed inset-0 z-[140] flex items-center justify-center bg-background text-sm text-muted-foreground">
+              <Loader2 className="mr-2 size-4 animate-spin" />
+              正在准备案情工作台
+            </div>
+          }
+        >
+          <CaseVisualizationWorkspace
+            caseId={caseId}
+            initialWorkspace={openedVisualWorkspace}
+            onClose={() => setOpenedVisualWorkspace(null)}
+            onSaved={(workspace) => {
+              setOpenedVisualWorkspace(workspace);
+              void refreshVisualSummaries().catch(() => {});
+            }}
+          />
+        </Suspense>
+      )}
         </>
       )}
     </aside>
@@ -1379,7 +1483,15 @@ export function CaseChatPanel({
 // 子组件
 // =============================================================================
 
-const MessageBubble = memo(function MessageBubble({ msg }: { msg: ChatMessage }) {
+const MessageBubble = memo(function MessageBubble({
+  msg,
+  visualSummary,
+  onOpenVisual,
+}: {
+  msg: ChatMessage;
+  visualSummary?: VisualWorkspaceSummary;
+  onOpenVisual: (workspace: VisualWorkspace) => void;
+}) {
   // V0.2 D6-D7 · history 重放时把 citations_json parse 出来给 CitationsCard
   const citations = useMemo<Citation[]>(() => {
     if (!msg.citations_json) return [];
@@ -1432,6 +1544,13 @@ const MessageBubble = memo(function MessageBubble({ msg }: { msg: ChatMessage })
             </div>
           )}
         </div>
+        {visualSummary && (
+          <VisualizationPreviewCard
+            caseId={msg.case_id}
+            summary={visualSummary}
+            onOpen={onOpenVisual}
+          />
+        )}
         {/* meta */}
         <div className="mt-0.5 flex items-center gap-2 text-caption text-muted-foreground/60">
           {msg.model && <span>{msg.model}</span>}

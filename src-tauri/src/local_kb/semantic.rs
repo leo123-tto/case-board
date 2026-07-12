@@ -474,6 +474,15 @@ async fn load_index_for_root(kb_root: &Path) -> (KbIndex, String) {
     let current_root = canonical_root(kb_root);
     let mut existing = load_index().await;
     if existing.kb_root != current_root {
+        // 旧索引没有 kb_root 字段。若抽样路径仍明确属于当前根，原向量可安全复用，
+        // 只补根标识，不花 embedding 额度重建 5 万个切片。
+        if existing.kb_root.is_empty() && legacy_index_matches_root(&existing, kb_root) {
+            existing.kb_root = current_root.clone();
+            if let Err(e) = save_index(&existing).await {
+                crate::dlog!("[kb-semantic] 旧索引补 kb_root 失败: {}", e);
+            }
+            return (existing, current_root);
+        }
         if !existing.files.is_empty() {
             crate::dlog!(
                 "[kb-semantic] KB 根切换:{} → {},清空旧索引 {} 个文件,全量重建",
@@ -487,6 +496,19 @@ async fn load_index_for_root(kb_root: &Path) -> (KbIndex, String) {
         existing.kb_root = current_root.clone();
     }
     (existing, current_root)
+}
+
+/// 旧格式索引迁移安全阈值：最多抽样 64 个相对路径，至少 80% 在当前根真实存在。
+fn legacy_index_matches_root(index: &KbIndex, kb_root: &Path) -> bool {
+    if index.files.is_empty() {
+        return false;
+    }
+    let sample = index.files.iter().take(64).collect::<Vec<_>>();
+    let existing = sample
+        .iter()
+        .filter(|file| kb_root.join(&file.rel_path).is_file())
+        .count();
+    existing * 5 >= sample.len() * 4
 }
 
 /// 内存缓存:索引可能上百 MB,每次检索都从磁盘读+parse 会卡几秒。
@@ -895,14 +917,28 @@ pub async fn build_or_update_index(
 /// **不在这里建索引**(核心法索引可能几分钟,不能卡 chat 工具调用):索引由「重建向量索引」
 /// 显式构建。索引不存在 / 空 / 跟当前 embedding 模型签名不符 → 返回空,工具层回退关键词。
 pub async fn semantic_search(
-    _kb_root: &Path,
+    kb_root: &Path,
     query: &str,
     top_n: usize,
     endpoint: &str,
     model: &str,
     key: &str,
 ) -> Result<Vec<KbHit>, String> {
-    let index = load_index_cached().await;
+    let mut index = load_index_cached().await;
+    let current_root = canonical_root(kb_root);
+    if index.kb_root != current_root {
+        if index.kb_root.is_empty() && legacy_index_matches_root(&index, kb_root) {
+            // 兼容当前机器已有的无根标识索引：补标识并原地保存，不重做 embedding。
+            let mut migrated = (*index).clone();
+            migrated.kb_root = current_root.clone();
+            save_index(&migrated).await?;
+            invalidate_cache().await;
+            index = Arc::new(migrated);
+        } else {
+            // 根不一致时绝不返回旧库命中；调用层会回退 BM25，并提示用户重建索引。
+            return Ok(vec![]);
+        }
+    }
     let cur_sig = crate::embedding::index::signature(endpoint, model);
     if index.files.is_empty() || index.signature != cur_sig {
         // 没建索引 / 换了 embedding 模型(向量维度/语义变了)→ 当未命中,提示重建

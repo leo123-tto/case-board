@@ -21,7 +21,7 @@ search_cases_normal — 普通裁判文书库关键词检索(覆盖范围最广,
 
 注意事项:
 - **先查作者整理过的全库**:找类案可先用 `search_local_kb` 看作者整理过的判例 / 类案笔记(0 积分),本地没有再调本工具外查
-- 优先用本地缓存(案例不过期,命中即返回 0 积分;miss 1 积分)
+- 优先用本地缓存(案例不过期,命中即返回 0 积分；miss 调普通案例检索为 10 积分)
 - 返回字段每条带 `{id, ah(案号), title, court, cause(案由), judge_date, content(摘要), score}`
 - 命中后挑最相关 1-2 条用 `get_case_detail` 拿全文(全文里有完整裁判要旨 / 当事人 / 事实)
 - `<CITATIONS>` 标 `type: "case"`,title 写「<court> · <ah>」,source 写元典 id

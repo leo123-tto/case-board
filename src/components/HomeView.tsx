@@ -67,8 +67,9 @@ import { parseJsonArray } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { CalendarBoard } from "./CalendarBoard";
+import { DashboardAssistantCard } from "./DashboardAssistantCard";
 import { countOpenCaseRows, isOpenCaseStatus } from "./homeCaseCounts";
-import { HomeCompanionStrip, type DailyBrief } from "./HomeCompanionStrip";
+import type { DailyBrief } from "./HomeCompanionStrip";
 import {
   loadHearingDisplayDetail,
   type HearingDisplayDetail,
@@ -616,49 +617,38 @@ export function HomeView({
       <div className="flex-1 overflow-auto">
         <div className="app-page-enter mx-auto max-w-6xl px-4 py-6 sm:px-6 xl:px-8 xl:py-8">
           <div className="mb-10 grid grid-cols-1 gap-6 md:grid-cols-2">
-            <div className="relative overflow-hidden rounded-xl border border-brand/10 bg-brand-soft/55 p-5 shadow-[inset_0_1px_0_oklch(1_0_0/0.72)] md:pr-44">
-              <Button
-                onClick={onImport}
-                variant="outline"
-                className="absolute right-5 top-5 hidden md:inline-flex"
-              >
-                <FolderOpen className="size-3.5" />
-                导入案件
-              </Button>
-              <p className="font-mono text-caption uppercase tracking-wider text-brand">
-                OVERVIEW · {monthLabel}
-              </p>
-              <h1 className="mt-2 text-3xl font-semibold tracking-tight text-foreground xl:text-4xl">
-                {greeting}
-              </h1>
-              <p className="mt-2 text-sm text-muted-foreground">
-                你正在办 {openCaseCount} 个案件,扫一眼今天的进度。
-              </p>
-              {homeCompanionOn && (
-                <HomeCompanionStrip
-                  displayName={userDisplayName}
-                  activeCaseCount={activeCases.length}
-                  reminderSummaries={assistantReminderSummaries}
-                  dailyBrief={dailyBriefContext.brief}
-                  onDailyBriefAction={() => {
-                    if (dailyBriefContext.actionEvent) {
-                      openEvent(dailyBriefContext.actionEvent);
-                    } else if (dailyBriefContext.actionCaseId) {
-                      onPickCase(dailyBriefContext.actionCaseId);
-                    } else {
-                      onImport();
-                    }
-                  }}
-                />
-              )}
-              <Button
-                onClick={onImport}
-                className="mt-5 md:hidden"
-              >
-                <FolderOpen className="size-3.5" />
-                导入案件
-              </Button>
-            </div>
+            {homeCompanionOn ? (
+              <DashboardAssistantCard
+                greeting={greeting}
+                monthLabel={monthLabel}
+                openCaseCount={openCaseCount}
+                displayName={userDisplayName}
+                activeCaseCount={activeCases.length}
+                reminderSummaries={assistantReminderSummaries}
+                dailyBrief={dailyBriefContext.brief}
+                onDailyBriefAction={() => {
+                  if (dailyBriefContext.actionEvent) {
+                    openEvent(dailyBriefContext.actionEvent);
+                  } else if (dailyBriefContext.actionCaseId) {
+                    onPickCase(dailyBriefContext.actionCaseId);
+                  } else {
+                    onImport();
+                  }
+                }}
+              />
+            ) : (
+              <div className="overflow-hidden rounded-xl border border-brand/10 bg-brand-soft/55 p-5 shadow-[inset_0_1px_0_oklch(1_0_0/0.72)]">
+                <p className="font-mono text-caption uppercase tracking-wider text-brand">
+                  OVERVIEW · {monthLabel}
+                </p>
+                <h1 className="mt-2 text-3xl font-semibold tracking-tight text-foreground xl:text-4xl">
+                  {greeting}
+                </h1>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  你正在办 {openCaseCount} 个案件,扫一眼今天的进度。
+                </p>
+              </div>
+            )}
             <ImportantDates events={upcomingEvents} onPickCase={openEvent} />
           </div>
 
@@ -700,34 +690,40 @@ export function HomeView({
                     {visibleOpenCaseCount} / {cases.length} CASES
                   </span>
                 </div>
-                {filterBarOn && (
                 <div className="flex flex-wrap items-center gap-2">
-                  <IconToggle
-                    active={viewMode === "grid"}
-                    label="卡片视图"
-                    onClick={() => setViewMode("grid")}
-                  >
-                    <LayoutGrid className="size-3.5" />
-                  </IconToggle>
-                  <IconToggle
-                    active={viewMode === "list"}
-                    label="列表视图"
-                    onClick={() => setViewMode("list")}
-                  >
-                    <List className="size-3.5" />
-                  </IconToggle>
-                  <IconToggle
-                    active={selectMode}
-                    label="多选删除"
-                    onClick={() => {
-                      setSelectMode((on) => !on);
-                      setSelectedIds(new Set());
-                    }}
-                  >
-                    <CheckSquare className="size-3.5" />
-                  </IconToggle>
+                  <Button type="button" size="sm" onClick={onImport}>
+                    <FolderOpen className="size-3.5" />
+                    导入案件
+                  </Button>
+                  {filterBarOn && (
+                    <>
+                      <IconToggle
+                        active={viewMode === "grid"}
+                        label="卡片视图"
+                        onClick={() => setViewMode("grid")}
+                      >
+                        <LayoutGrid className="size-3.5" />
+                      </IconToggle>
+                      <IconToggle
+                        active={viewMode === "list"}
+                        label="列表视图"
+                        onClick={() => setViewMode("list")}
+                      >
+                        <List className="size-3.5" />
+                      </IconToggle>
+                      <IconToggle
+                        active={selectMode}
+                        label="多选删除"
+                        onClick={() => {
+                          setSelectMode((on) => !on);
+                          setSelectedIds(new Set());
+                        }}
+                      >
+                        <CheckSquare className="size-3.5" />
+                      </IconToggle>
+                    </>
+                  )}
                 </div>
-                )}
               </div>
 
               {filterBarOn && (
@@ -996,6 +992,7 @@ function SortableCaseCard(props: {
   selected: boolean;
   onToggleSelect: () => void;
 }) {
+  const [isStatusPickerOpen, setIsStatusPickerOpen] = useState(false);
   const {
     attributes,
     listeners,
@@ -1008,14 +1005,17 @@ function SortableCaseCard(props: {
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
-    zIndex: isDragging ? 10 : undefined,
+    // 卡片 hover 的 transform 会创建独立 stacking context。状态菜单展开时抬高
+    // 整个 grid item，避免后面的卡片在 hover 后覆盖菜单。
+    zIndex: isDragging ? 10 : isStatusPickerOpen ? 20 : undefined,
   };
   return (
-    <div ref={setNodeRef} style={style}>
+    <div ref={setNodeRef} style={style} className="relative">
       <CaseCard
         {...props}
         dragHandleProps={{ attributes, listeners }}
         isDragging={isDragging}
+        onStatusPickerOpenChange={setIsStatusPickerOpen}
       />
     </div>
   );
@@ -1031,6 +1031,7 @@ function CaseCard({
   onToggleSelect,
   dragHandleProps,
   isDragging,
+  onStatusPickerOpenChange,
 }: {
   row: CaseRow;
   onClick: () => void;
@@ -1044,6 +1045,7 @@ function CaseCard({
     listeners: ReturnType<typeof useSortable>["listeners"];
   };
   isDragging?: boolean;
+  onStatusPickerOpenChange?: (open: boolean) => void;
 }) {
   const { caseData, status, display } = row;
   const isClosed = status.id === "closed";
@@ -1102,6 +1104,7 @@ function CaseCard({
           status={status}
           isManual={caseData.workflow_status_locked === 1}
           onPick={onChangeStatus}
+          onOpenChange={onStatusPickerOpenChange}
         />
       </div>
 
@@ -1223,19 +1226,24 @@ function StatusPicker({
   status,
   isManual,
   onPick,
+  onOpenChange,
 }: {
   status: StatusDef;
   isManual: boolean;
   onPick: (s: StatusId | null) => void;
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
     if (!open) return;
-    const onClick = () => setOpen(false);
+    const onClick = () => {
+      setOpen(false);
+      onOpenChange?.(false);
+    };
     window.addEventListener("click", onClick);
     return () => window.removeEventListener("click", onClick);
-  }, [open]);
+  }, [onOpenChange, open]);
 
   return (
     <div
@@ -1247,7 +1255,9 @@ function StatusPicker({
         type="button"
         onClick={(e) => {
           e.stopPropagation();
-          setOpen((v) => !v);
+          const nextOpen = !open;
+          setOpen(nextOpen);
+          onOpenChange?.(nextOpen);
         }}
         className={cn(
           "inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-caption font-medium transition-opacity hover:opacity-80",
@@ -1268,6 +1278,7 @@ function StatusPicker({
                 e.stopPropagation();
                 onPick(s.id);
                 setOpen(false);
+                onOpenChange?.(false);
               }}
               className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs hover:bg-accent"
             >
@@ -1287,6 +1298,7 @@ function StatusPicker({
                   e.stopPropagation();
                   onPick(null);
                   setOpen(false);
+                  onOpenChange?.(false);
                 }}
                 className="block w-full px-3 py-1.5 text-left text-label text-muted-foreground hover:bg-accent hover:text-foreground"
               >
@@ -2495,11 +2507,11 @@ function toDateKey(d: Date): string {
 function getGreeting(name: string | null): string {
   const who = name && name.trim().length > 0 ? name.trim() : "律师";
   const h = new Date().getHours();
-  if (h < 6) return `深夜好,${who}`;
-  if (h < 12) return `上午好,${who}`;
-  if (h < 14) return `中午好,${who}`;
-  if (h < 18) return `下午好,${who}`;
-  return `晚上好,${who}`;
+  if (h < 6) return `深夜好，${who}`;
+  if (h < 12) return `上午好，${who}`;
+  if (h < 14) return `中午好，${who}`;
+  if (h < 18) return `下午好，${who}`;
+  return `晚上好，${who}`;
 }
 
 function EmptyCases({ onImport }: { onImport: () => void }) {

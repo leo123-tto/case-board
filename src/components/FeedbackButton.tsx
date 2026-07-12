@@ -34,6 +34,10 @@ import {
   uploadFeedbackReport,
 } from "@/lib/api";
 import { snapshotConsoleErrors } from "@/lib/console-tap";
+import {
+  OPEN_FEEDBACK_EVENT,
+  type OpenFeedbackDetail,
+} from "@/lib/feedbackLauncher";
 
 /**
  * 反馈入口按钮。
@@ -49,13 +53,32 @@ import { snapshotConsoleErrors } from "@/lib/console-tap";
  */
 export function FeedbackButton() {
   const [open, setOpen] = useState(false);
+  const [initialDescription, setInitialDescription] = useState("");
+
+  useEffect(() => {
+    const handleOpen = (event: Event) => {
+      const detail = (event as CustomEvent<OpenFeedbackDetail>).detail;
+      setInitialDescription(detail?.description ?? "");
+      setOpen(true);
+    };
+    window.addEventListener(OPEN_FEEDBACK_EVENT, handleOpen);
+    return () => window.removeEventListener(OPEN_FEEDBACK_EVENT, handleOpen);
+  }, []);
+
+  const close = () => {
+    setOpen(false);
+    setInitialDescription("");
+  };
 
   return (
     <>
       <Chip asChild size="lg" className="gap-1.5">
         <button
           type="button"
-          onClick={() => setOpen(true)}
+          onClick={() => {
+            setInitialDescription("");
+            setOpen(true);
+          }}
           title="反馈一个问题"
           aria-label="反馈"
         >
@@ -64,16 +87,27 @@ export function FeedbackButton() {
         </button>
       </Chip>
 
-      {open && <FeedbackModal onClose={() => setOpen(false)} />}
+      {open && (
+        <FeedbackModal
+          initialDescription={initialDescription}
+          onClose={close}
+        />
+      )}
     </>
   );
 }
 
 /* ============================ 弹窗主体 ============================ */
-function FeedbackModal({ onClose }: { onClose: () => void }) {
+function FeedbackModal({
+  initialDescription,
+  onClose,
+}: {
+  initialDescription: string;
+  onClose: () => void;
+}) {
   const [diag, setDiag] = useState<FeedbackDiagnostic | null>(null);
   const [diagErr, setDiagErr] = useState<string | null>(null);
-  const [description, setDescription] = useState("");
+  const [description, setDescription] = useState(initialDescription);
   const [showDiag, setShowDiag] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [uploading, setUploading] = useState(false);

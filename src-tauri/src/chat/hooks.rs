@@ -213,7 +213,13 @@ impl ChatHook for CreditsGuardHook {
         ctx: &HookContext<'_>,
     ) -> HookOutcome {
         // 只对**会消耗元典积分的工具**做熔断 — 本地工具(case_doc/kb)0 积分不查
-        if credits::estimate_credits_for(tool) == 0 {
+        let expected = credits::estimate_credits_for(tool);
+        if expected == 0 {
+            return HookOutcome::Continue;
+        }
+        // get_law_article 内部先走主库整部法规抽条。必须允许它执行到本地命中分支；
+        // 真正准备联网前由工具按实际 5/1 分再次检查额度，避免“额度为 0 时连本地也不让读”。
+        if tool == "get_law_article" {
             return HookOutcome::Continue;
         }
         let Some(limit) = ctx.settings.yuandian_monthly_credit_limit else {
@@ -221,10 +227,10 @@ impl ChatHook for CreditsGuardHook {
         };
         let remaining =
             credits::get_monthly_remaining(ctx.pool, &ctx.year_month, Some(limit)).await;
-        if remaining <= 0 {
+        if remaining < expected as i64 {
             return HookOutcome::Deny(format!(
-                "本月元典积分已用尽(上限 {})。请到设置 → 元典 → 月度上限上调,或下月再试。本次请用本地 KB 工具(search_local_kb / read_kb_file)代替。",
-                limit
+                "本月元典积分余额不足以执行本工具(剩余 {},预计最多 {} 分,月度上限 {})。请先用本地 KB 工具(search_local_kb / read_kb_file),或到设置调整上限。",
+                remaining.max(0), expected, limit
             ));
         }
         HookOutcome::Continue
@@ -232,7 +238,7 @@ impl ChatHook for CreditsGuardHook {
 
     async fn after_tool_call(
         &self,
-        tool: &str,
+        _tool: &str,
         result: &ToolResult,
         success: bool,
         ctx: &HookContext<'_>,
@@ -246,11 +252,11 @@ impl ChatHook for CreditsGuardHook {
             let _ = credits::record_kb_hit(ctx.pool, &ctx.year_month).await;
             return;
         }
-        let est = credits::estimate_credits_for(tool);
-        if est == 0 {
+        let actual = result.yuandian_credits_used;
+        if actual == 0 {
             return; // 本地工具,不进月度账
         }
-        let _ = credits::record_yuandian_call(ctx.pool, &ctx.year_month, est).await;
+        let _ = credits::record_yuandian_call(ctx.pool, &ctx.year_month, actual).await;
     }
 }
 

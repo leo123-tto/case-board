@@ -17,7 +17,7 @@ get_regulation_detail — 拿一部法规的整部全文(目录 + 各章节条�
 - refer_date: 可选,YYYY-MM-DD,定位时点版本(适用于修订过多次的法规)
 
 注意事项:
-- 优先用本地缓存(命中 0 积分;miss 1 积分,法规永久缓存)
+- 优先用本地缓存(命中 0 积分；miss 调整部法规详情为 5 积分，并自动收口主库)
 - 返回字段:`{id, fgmc, content, effect_level, publish_date, implement_date, valid, region, issuer}`
   - `content` 是整部法规全文,可能几千到上万字 — agent_loop 会自动落盘成 KB 文件,LLM 只看摘要 + 关键章节
 - 长法规(如民法典 1260 条)单次调用积分仍是 1,**不要在 LLM 里反复调同部法规**,本地缓存 + KB 写盘后下次直接复用

@@ -8,6 +8,7 @@
 //!   2. 文件大小上限 5MB
 //!   3. 二进制检测:open 后读头 512 字节,含 NUL 拒绝
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Serialize;
@@ -74,6 +75,10 @@ impl Default for SearchOptions {
 pub struct KbSearchHit {
     pub relative_path: String,
     pub scope: String,
+    pub title: String,
+    pub doc_type: String,
+    /// 轻量 BM25 分数（越高越相关）；叠加标题、法规名、精确条号结构加权。
+    pub score: f64,
     pub match_count: u32,
     /// 第一个命中位置周围 [-snippet_chars/2, +snippet_chars/2] 文本片段
     pub snippet: String,
@@ -98,20 +103,14 @@ pub fn search_kb_files(
         .canonicalize()
         .map_err(|_| KbError::NoPath(kb_root.to_path_buf()))?;
 
-    let pattern = if opts.case_sensitive {
-        regex::escape(keyword)
-    } else {
-        format!("(?i){}", regex::escape(keyword))
-    };
-    let re = regex::Regex::new(&pattern).map_err(|e| {
-        KbError::Json(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            e.to_string(),
-        )))
-    })?;
+    let query = LexicalQuery::new(keyword, opts.case_sensitive);
+    if query.terms.is_empty() {
+        return Ok(Vec::new());
+    }
 
     let scopes = opts.scopes.clone().unwrap_or_else(default_scopes);
-    let mut hits: Vec<KbSearchHit> = Vec::new();
+    let mut docs: Vec<SearchDoc> = Vec::new();
+    let mut seen_paths = HashSet::new();
 
     for scope in scopes {
         let target = if matches!(scope, KbScope::Root) {
@@ -123,8 +122,10 @@ pub fn search_kb_files(
             continue;
         }
         if scope.is_file() {
-            if let Some(hit) = try_match_file(&root_canonical, &target, &re, &opts, scope)? {
-                hits.push(hit);
+            if seen_paths.insert(target.clone()) {
+                if let Some(doc) = load_search_doc(&root_canonical, &target, &query, scope)? {
+                    docs.push(doc);
+                }
             }
             continue;
         }
@@ -149,16 +150,37 @@ pub fn search_kb_files(
             if !ext_ok {
                 continue;
             }
-            if let Some(hit) = try_match_file(&root_canonical, p, &re, &opts, scope)? {
-                hits.push(hit);
+            let path_buf = p.to_path_buf();
+            if seen_paths.insert(path_buf) {
+                if let Some(doc) = load_search_doc(&root_canonical, p, &query, scope)? {
+                    docs.push(doc);
+                }
             }
         }
     }
 
-    // 排序:命中次数高 → 修改时间新
+    let doc_count = docs.len().max(1) as f64;
+    let avg_doc_len = docs.iter().map(|d| d.doc_len as f64).sum::<f64>() / doc_count;
+    let mut doc_freq: HashMap<&str, usize> = HashMap::new();
+    for term in &query.terms {
+        let count = docs
+            .iter()
+            .filter(|d| d.search_text.contains(term.as_str()))
+            .count();
+        doc_freq.insert(term, count);
+    }
+
+    let mut hits: Vec<KbSearchHit> = docs
+        .into_iter()
+        .map(|doc| score_doc(doc, &query, &doc_freq, doc_count, avg_doc_len, &opts))
+        .filter(|hit| hit.score > 0.0)
+        .collect();
+
+    // 排序:BM25/结构分 → 修改时间新。标题/来源页/精确条号已进入 score，不再按词频蛮排。
     hits.sort_by(|a, b| {
-        b.match_count
-            .cmp(&a.match_count)
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then(b.modified_at.cmp(&a.modified_at))
     });
     hits.truncate(opts.max_results);
@@ -181,13 +203,23 @@ fn should_skip_root_search_path(root_canonical: &Path, path: &Path) -> bool {
     })
 }
 
-fn try_match_file(
+struct SearchDoc {
+    relative_path: String,
+    scope: KbScope,
+    title: String,
+    doc_type: String,
+    content: String,
+    search_text: String,
+    doc_len: usize,
+    modified_at: i64,
+}
+
+fn load_search_doc(
     root_canonical: &Path,
     path: &Path,
-    re: &regex::Regex,
-    opts: &SearchOptions,
+    query: &LexicalQuery,
     scope: KbScope,
-) -> Result<Option<KbSearchHit>, KbError> {
+) -> Result<Option<SearchDoc>, KbError> {
     let meta = std::fs::metadata(path)?;
     if meta.len() > MAX_FILE_SIZE {
         return Ok(None);
@@ -196,32 +228,317 @@ fn try_match_file(
         Ok(s) => s,
         Err(_) => return Ok(None), // 二进制或编码问题:跳过,不致命
     };
-    let mc = re.find_iter(&content).count();
-    if mc == 0 {
-        return Ok(None);
-    }
-    let first = re.find(&content).unwrap();
-    let half = opts.snippet_chars / 2;
-    let start = first.start().saturating_sub(half);
-    let end = (first.end() + half).min(content.len());
-    let snippet = safe_char_slice(&content, start, end);
     let relative = path
         .strip_prefix(root_canonical)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+    let title = extract_title(path, &content);
+    let search_text = if query.case_sensitive {
+        format!("{relative}\n{title}\n{content}")
+    } else {
+        format!("{relative}\n{title}\n{content}").to_lowercase()
+    };
+    if !query.terms.iter().any(|term| search_text.contains(term)) {
+        return Ok(None);
+    }
     let modified_at = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    Ok(Some(KbSearchHit {
+    let doc_type = doc_type_for(&relative);
+    Ok(Some(SearchDoc {
         relative_path: relative,
-        scope: format!("{:?}", scope),
-        match_count: mc as u32,
-        snippet,
+        scope,
+        title,
+        doc_type,
+        doc_len: content.chars().count().max(1),
+        content,
+        search_text,
         modified_at,
     }))
+}
+
+fn score_doc(
+    doc: SearchDoc,
+    query: &LexicalQuery,
+    doc_freq: &HashMap<&str, usize>,
+    doc_count: f64,
+    avg_doc_len: f64,
+    opts: &SearchOptions,
+) -> KbSearchHit {
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+    let title_cmp = if query.case_sensitive {
+        doc.title.clone()
+    } else {
+        doc.title.to_lowercase()
+    };
+    let path_cmp = if query.case_sensitive {
+        doc.relative_path.clone()
+    } else {
+        doc.relative_path.to_lowercase()
+    };
+    let content_cmp = if query.case_sensitive {
+        doc.content.clone()
+    } else {
+        doc.content.to_lowercase()
+    };
+    let mut score = 0.0;
+    let mut match_count = 0u32;
+    for term in &query.terms {
+        let body_tf = count_occurrences(&content_cmp, term);
+        let title_tf = count_occurrences(&title_cmp, term);
+        let path_tf = count_occurrences(&path_cmp, term);
+        let tf = body_tf + title_tf * 5 + path_tf * 3;
+        // 对外 match_count 保持“正文命中次数”语义；标题/路径只参与 score 加权。
+        match_count = match_count.saturating_add(body_tf as u32);
+        if tf == 0 {
+            continue;
+        }
+        let df = *doc_freq.get(term.as_str()).unwrap_or(&0) as f64;
+        let idf = (1.0 + (doc_count - df + 0.5) / (df + 0.5)).ln();
+        let len_norm = 1.0 - B + B * (doc.doc_len as f64 / avg_doc_len.max(1.0));
+        score += idf * ((tf as f64 * (K1 + 1.0)) / (tf as f64 + K1 * len_norm));
+    }
+
+    if !query.exact.is_empty() {
+        if title_cmp.contains(&query.exact) {
+            score += 24.0;
+        } else if content_cmp.contains(&query.exact) {
+            score += 8.0;
+        }
+    }
+    if let Some(law_hint) = query.law_hint.as_deref() {
+        if title_cmp.contains(law_hint) || path_cmp.contains(law_hint) {
+            score += 24.0;
+            if query
+                .article_markers
+                .iter()
+                .any(|marker| content_cmp.contains(marker))
+            {
+                score += 60.0;
+            }
+        }
+    }
+    score += match doc.doc_type.as_str() {
+        "topic" => 8.0,
+        "source" => 6.0,
+        "custom" => 2.0,
+        "raw" => 0.0,
+        "yuandian" => -1.0,
+        _ => 0.0,
+    };
+
+    let snippet = best_snippet(&doc.content, query, opts.snippet_chars);
+    KbSearchHit {
+        relative_path: doc.relative_path,
+        scope: format!("{:?}", doc.scope),
+        title: doc.title,
+        doc_type: doc.doc_type,
+        score: (score * 1000.0).round() / 1000.0,
+        match_count,
+        snippet,
+        modified_at: doc.modified_at,
+    }
+}
+
+#[derive(Debug)]
+struct LexicalQuery {
+    exact: String,
+    terms: Vec<String>,
+    law_hint: Option<String>,
+    article_markers: Vec<String>,
+    case_sensitive: bool,
+}
+
+impl LexicalQuery {
+    fn new(raw: &str, case_sensitive: bool) -> Self {
+        let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let exact = if case_sensitive {
+            normalized.clone()
+        } else {
+            normalized.to_lowercase()
+        };
+        let mut terms = tokenize(&exact);
+        let article_re = regex::Regex::new(r"第?\s*(\d{1,4})\s*条").expect("static regex");
+        let mut law_hint = None;
+        let mut article_markers = Vec::new();
+        if let Some(caps) = article_re.captures(&exact) {
+            if let Some(n) = caps.get(1).and_then(|m| m.as_str().parse::<u32>().ok()) {
+                article_markers.push(format!("第{n}条"));
+                if let Some(chinese) = arabic_to_chinese(n) {
+                    article_markers.push(format!("第{chinese}条"));
+                }
+                terms.push(n.to_string());
+            }
+            if let Some(m) = caps.get(0) {
+                let hint = exact[..m.start()]
+                    .trim_matches(|c: char| c.is_whitespace() || "《》“”\"'，,：:".contains(c))
+                    .to_string();
+                if !hint.is_empty() {
+                    terms.extend(tokenize(&hint));
+                    law_hint = Some(hint);
+                }
+            }
+        }
+        terms.extend(article_markers.iter().cloned());
+        terms.sort();
+        terms.dedup();
+        Self {
+            exact,
+            terms,
+            law_hint,
+            article_markers,
+            case_sensitive,
+        }
+    }
+}
+
+fn tokenize(text: &str) -> Vec<String> {
+    let mut groups = Vec::new();
+    let mut buf = String::new();
+    let mut cjk_mode = None;
+    let flush = |buf: &mut String, cjk: Option<bool>, out: &mut Vec<String>| {
+        if buf.is_empty() {
+            return;
+        }
+        if cjk == Some(true) {
+            let chars: Vec<char> = buf.chars().collect();
+            if chars.len() <= 8 {
+                out.push(buf.clone());
+            }
+            if chars.len() == 1 {
+                out.push(buf.clone());
+            } else {
+                for pair in chars.windows(2) {
+                    out.push(pair.iter().collect());
+                }
+            }
+        } else {
+            out.push(buf.to_lowercase());
+        }
+        buf.clear();
+    };
+    for c in text.chars() {
+        let is_cjk = ('\u{3400}'..='\u{9fff}').contains(&c);
+        let is_word = is_cjk || c.is_ascii_alphanumeric() || c == '_';
+        if !is_word {
+            flush(&mut buf, cjk_mode, &mut groups);
+            cjk_mode = None;
+            continue;
+        }
+        if cjk_mode.is_some_and(|mode| mode != is_cjk) {
+            flush(&mut buf, cjk_mode, &mut groups);
+        }
+        cjk_mode = Some(is_cjk);
+        buf.push(c);
+    }
+    flush(&mut buf, cjk_mode, &mut groups);
+    groups.retain(|t| !t.trim().is_empty() && !matches!(t.as_str(), "的" | "了" | "和" | "与"));
+    groups
+}
+
+fn arabic_to_chinese(n: u32) -> Option<String> {
+    if n == 0 || n > 9999 {
+        return None;
+    }
+    const DIGITS: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+    const UNITS: [&str; 4] = ["", "十", "百", "千"];
+    let mut out = String::new();
+    let mut zero_pending = false;
+    for pos in (0..4).rev() {
+        let divisor = 10u32.pow(pos);
+        let digit = (n / divisor) % 10;
+        if digit == 0 {
+            if !out.is_empty() && !n.is_multiple_of(divisor) {
+                zero_pending = true;
+            }
+            continue;
+        }
+        if zero_pending {
+            out.push('零');
+            zero_pending = false;
+        }
+        if !(digit == 1 && pos == 1 && out.is_empty()) {
+            out.push_str(DIGITS[digit as usize]);
+        }
+        out.push_str(UNITS[pos as usize]);
+    }
+    Some(out)
+}
+
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    haystack.match_indices(needle).count()
+}
+
+fn extract_title(path: &Path, content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut start = 0usize;
+    if lines.first().is_some_and(|l| l.trim() == "---") {
+        if let Some(end) = lines.iter().skip(1).position(|l| l.trim() == "---") {
+            for line in &lines[1..end + 1] {
+                let (key, value) = line.split_once(':').unwrap_or(("", ""));
+                if key.trim() == "title" && !value.trim().is_empty() {
+                    return value.trim().trim_matches(['\'', '"']).to_string();
+                }
+            }
+            start = end + 2;
+        }
+    }
+    lines
+        .iter()
+        .skip(start)
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty())
+        .map(|line| line.trim_start_matches('#').trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("未命名")
+                .to_string()
+        })
+}
+
+fn doc_type_for(relative: &str) -> String {
+    let rel = relative.replace('\\', "/");
+    if rel.starts_with("wiki/topics/") {
+        "topic"
+    } else if rel.starts_with("wiki/sources/") {
+        "source"
+    } else if rel.starts_with("raw/yuandian-cache/") {
+        "yuandian"
+    } else if rel.starts_with("raw/") || rel == "gap-log.md" {
+        "raw"
+    } else {
+        "custom"
+    }
+    .to_string()
+}
+
+fn best_snippet(content: &str, query: &LexicalQuery, snippet_chars: usize) -> String {
+    let cmp = if query.case_sensitive {
+        content.to_string()
+    } else {
+        content.to_lowercase()
+    };
+    let anchor = std::iter::once(query.exact.as_str())
+        .chain(query.article_markers.iter().map(String::as_str))
+        .chain(query.terms.iter().map(String::as_str))
+        .filter(|s| !s.is_empty())
+        .find_map(|needle| cmp.find(needle).map(|pos| (pos, needle.len())));
+    let Some((pos, len)) = anchor else {
+        return content.chars().take(snippet_chars).collect();
+    };
+    let half = snippet_chars / 2;
+    let start = pos.saturating_sub(half);
+    let end = (pos + len + half).min(content.len());
+    safe_char_slice(content, start, end)
 }
 
 /// 字节 offset → 安全的 char 边界 slice。content 是 UTF-8,任意 [start,end) 可能

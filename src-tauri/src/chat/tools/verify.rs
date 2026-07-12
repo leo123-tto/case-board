@@ -40,7 +40,7 @@ impl Tool for VerifyLegalCitations {
         let resp = yuandian::hall_detect(api_key, text).await?;
         Ok(ToolResult {
             content: serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into()),
-            yuandian_credits_used: 5,
+            yuandian_credits_used: crate::db::credits::credits_for_query_type("hall_detect"),
             kb_hit: false,
         })
     }

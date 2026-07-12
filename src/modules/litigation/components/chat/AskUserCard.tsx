@@ -24,34 +24,64 @@ interface Props {
 
 /** 一题的当前作答:选中的预设项 + 自由输入;自由输入非空时优先生效 */
 interface Answer {
-  picked: string | null;
+  picked: string[];
   text: string;
 }
 
-function effective(a: Answer): string {
+function effective(question: AskQuestion, answer: Answer): string {
+  const a = answer;
   const t = a.text.trim();
-  return t || a.picked || "";
+  if (t) return t;
+  const ordered = question.options.filter((option) => a.picked.includes(option));
+  return ordered.join("、");
+}
+
+function selectionBounds(question: AskQuestion): { min: number; max: number } {
+  const optionCount = question.options.length;
+  const min = Math.min(Math.max(question.min_selections ?? 1, 0), optionCount);
+  const max = Math.min(
+    Math.max(question.max_selections ?? optionCount, min),
+    optionCount,
+  );
+  return { min, max };
+}
+
+function answered(question: AskQuestion, answer: Answer): boolean {
+  if (answer.text.trim()) return true;
+  if (question.multiple) return answer.picked.length >= selectionBounds(question).min;
+  return answer.picked.length > 0;
 }
 
 /** 把所有「问→答」拼成回灌文本:单问省编号,多问编号 */
 function composeAnswerText(questions: AskQuestion[], answers: Answer[]): string {
-  const pairs = questions.map((q, i) => `${q.question} → ${effective(answers[i])}`);
+  const pairs = questions.map(
+    (q, i) => `${q.question} → ${effective(q, answers[i])}`,
+  );
   if (pairs.length === 1) return pairs[0];
   return pairs.map((p, i) => `${i + 1}. ${p}`).join("\n");
 }
 
 export function AskUserCard({ questions, disabled, onSubmit }: Props) {
   const [answers, setAnswers] = useState<Answer[]>(() =>
-    questions.map(() => ({ picked: null, text: "" })),
+    questions.map(() => ({ picked: [], text: "" })),
   );
 
   // 单问题 + 有选项 + 不需自由输入 → 一键提交
   const oneClick =
     questions.length === 1 &&
     questions[0].options.length > 0 &&
-    !questions[0].allow_input;
+    !questions[0].allow_input &&
+    !questions[0].multiple;
 
-  const allAnswered = answers.every((a) => effective(a) !== "");
+  const allAnswered = answers.every((answer, index) =>
+    answered(questions[index], answer),
+  );
+  const visualizationProposal =
+    questions.length === 1 &&
+    Boolean(questions[0].multiple) &&
+    /可视化|图表|图示|时间线|关系图|思维导图|证据矩阵/.test(
+      `${questions[0].question}${questions[0].options.join("")}`,
+    );
 
   function update(i: number, patch: Partial<Answer>) {
     setAnswers((cur) => cur.map((a, idx) => (idx === i ? { ...a, ...patch } : a)));
@@ -64,8 +94,23 @@ export function AskUserCard({ questions, disabled, onSubmit }: Props) {
       onSubmit(`${questions[i].question} → ${opt}`);
       return;
     }
-    // 再点同一项 = 取消选中(允许改主意)
-    update(i, { picked: answers[i].picked === opt ? null : opt });
+    setAnswers((current) =>
+      current.map((answer, index) => {
+        if (index !== i) return answer;
+        const selected = answer.picked.includes(opt);
+        if (questions[i].multiple) {
+          const { max } = selectionBounds(questions[i]);
+          if (!selected && answer.picked.length >= max) return answer;
+          return {
+            ...answer,
+            picked: selected
+              ? answer.picked.filter((item) => item !== opt)
+              : [...answer.picked, opt],
+          };
+        }
+        return { ...answer, picked: selected ? [] : [opt] };
+      }),
+    );
   }
 
   function submit() {
@@ -81,6 +126,7 @@ export function AskUserCard({ questions, disabled, onSubmit }: Props) {
       <div className="space-y-3">
         {questions.map((q, i) => {
           const showInput = q.allow_input || q.options.length === 0;
+          const bounds = selectionBounds(q);
           return (
             <div key={i}>
               <p className="mb-1.5 text-foreground">
@@ -97,11 +143,19 @@ export function AskUserCard({ questions, disabled, onSubmit }: Props) {
                     <button
                       key={opt}
                       type="button"
-                      disabled={disabled}
+                      aria-pressed={answers[i].picked.includes(opt)}
+                      disabled={
+                        disabled ||
+                        Boolean(
+                          q.multiple &&
+                            !answers[i].picked.includes(opt) &&
+                            answers[i].picked.length >= bounds.max,
+                        )
+                      }
                       onClick={() => pick(i, opt)}
                       className={cn(
                         "rounded-full border px-2.5 py-1 text-xs transition-colors disabled:opacity-40",
-                        answers[i].picked === opt
+                        answers[i].picked.includes(opt)
                           ? "border-sky-500 bg-sky-500 text-white"
                           : "border-border bg-background hover:border-sky-500/50 hover:bg-sky-500/10",
                       )}
@@ -130,20 +184,23 @@ export function AskUserCard({ questions, disabled, onSubmit }: Props) {
           );
         })}
       </div>
-      {/* 始终给一个「直接写」出口(确定性,不依赖模型在选项里加)—— 老板:多问搜集背景,
-          但用户随时可以让它别问了直接动手。点了就让模型基于现有信息起草、缺的留占位。 */}
+      {/* 起草追问保留「直接写」出口;可视化建议改成明确跳过,避免把图表选择误回灌成起草指令。 */}
       <div className="mt-3 flex items-center justify-between gap-2">
         <button
           type="button"
           disabled={disabled}
-          onClick={() =>
+          onClick={() => {
+            if (visualizationProposal) {
+              onSubmit(`${questions[0].question} → 暂不生成`);
+              return;
+            }
             onSubmit(
               "信息够了,请直接根据现有信息起草,缺的关键项留 [占位] 待我补充,不用再问了。",
-            )
-          }
+            );
+          }}
           className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline disabled:opacity-40"
         >
-          信息够了,直接写 →
+          {visualizationProposal ? "暂不生成" : "信息够了,直接写 →"}
         </button>
         {!oneClick && (
           <button

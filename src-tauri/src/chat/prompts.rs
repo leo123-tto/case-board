@@ -33,13 +33,13 @@ pub fn task_user_prompt(task: TaskType) -> Option<&'static str> {
              \n\
              【材料筛选】先调 `list_case_docs`,优先使用已整理标签:排除 importance=忽略 和 AI 产物;按 organized_category/party_side 选择与争议焦点相关的起诉材料、答辩材料、证据材料,不要把传票、开庭通知、法院文书当作实体依据。\n\
              \n\
-             【研究纪律】先把本次要解决的**研究问题**规范化成 1-3 条,再检索。`search_local_kb` / 二手资料只作线索,不能直接支撑结论;正文最终引用必须来自 `search_laws` / `get_law_article` / `law_vector_search` 拿到的一手权威资料。不要只找支持我方的依据,也要列出对方可能援引的**不利依据**。存在裁判或解释分歧时做**确定性分层**:较稳妥观点 / 有争议观点 / 待事实补强事项。\n\
+             【研究纪律】先把本次要解决的**研究问题**规范化成 1-3 条,再检索。本地主库里的整部法规全文、来源页和明确版本材料是第一顺位依据；普通笔记/案例摘要只作线索。不要只找支持我方的依据,也要列出对方可能援引的**不利依据**。存在裁判或解释分歧时做**确定性分层**:较稳妥观点 / 有争议观点 / 待事实补强事项。\n\
              \n\
              【第二步 · 查证(凡引用必先工具验证,不得编条号)】\n\
-             1. 先用 `search_local_kb` 查作者本地知识库已有整理(优先复用,省积分)\n\
-             2. 用 `search_laws` 定位到确切法条(拿到 fgmc / 条号 / fgid),再用 `get_law_article(fgid+ftnum)` 取**那一条**全文进上下文核对 —— **整部法规不要喂进上下文**(费 token)\n\
-             3. 关键词不准时用 `law_vector_search` 语义检索兜底;拿到 fgid + 条号后同样走 `get_law_article` 取单条\n\
-             4. 默认不要拉整部法规;确需看法规整体结构时才用 `get_regulation_detail`(默认只回元信息+预览,要某条仍走 get_law_article)\n\
+             1. 先用 `search_local_kb` 做本地 BM25 检索；强命中整部法规/来源页时用 `read_kb_file` 读取相关段落并停止外查\n\
+             2. `weak_hits=true` 或前排跑题时，用 `semantic_search_local_kb` 做本地语义补检；命中后仍只读相关段落\n\
+             3. 两种本地检索都不足时：已知法规名+条号直接 `get_law_article(fgmc+ftnum)`，一次拉整部法规、入主库并抽条；不知道法规名才用 `search_laws` / `law_vector_search` 定位后拉整部\n\
+             4. 整部法规只落本地，不要把整部正文喂进上下文；上下文只放相关条文，避免浪费 token\n\
              \n\
              【输出结构】\n\
              【引用硬约束】正文里每一条法条、司法解释、案例或本案材料来源都必须用 `[N]` 标号,末尾必须输出 `<CITATIONS>` JSON 块;JSON 里的 `ref` 与正文 `[N]` 一一对应。没有 `<CITATIONS>` 块等于本任务未完成。若某条依据经工具仍未核到精确出处,不要放进正式依据表,改放到「待人工核验」小节。\n\
@@ -57,7 +57,7 @@ pub fn task_user_prompt(task: TaskType) -> Option<&'static str> {
                - 二、争议焦点 2:...\n\
              - 末尾:需注意的程序性规定\n\
              - <CITATIONS> 块列出所有引用条款的精确出处\n\
-             **不得编条号** — 凡引用必先 `search_laws` 验证;调用工具失败仍写不出来时,明确说\"现有数据源未命中该条款\"。",
+             **不得编条号** — 凡引用必须由本地全文/来源页或元典工具真实命中；调用工具失败仍写不出来时,明确说\"现有数据源未命中该条款\"。",
         ),
         TaskType::SimulateOpposition => Some(
             "请做一次「模拟对抗」:站在**对方当事人**立场,推演对方最可能的抗辩/进攻,再给我方应对。\n\
@@ -99,11 +99,10 @@ pub fn task_user_prompt(task: TaskType) -> Option<&'static str> {
              【材料筛选】先调 `list_case_docs`,只读与案由、诉请/抗辩、核心证据有关的材料;已标忽略、程序/法院文书、参考材料不作事实基础。用 evidence_attitude 识别我方风险点和不利证据。\n\
              \n\
              【第二步 · 检索(凡引用必先工具验证)】\n\
-             1. 先用 `search_local_kb` 查作者本地是否已整理过类案(优先复用,省积分)\n\
-             2. `search_cases_authority` 拿权威/指导/公报案例(引用价值最高)\n\
-             3. `search_cases_normal` 拿普通案例补充\n\
-             4. 关键词不准时用 `case_vector_search` 语义检索兜底\n\
-             5. 命中后挑 **5-6 个**最相关的用 `get_case_detail` 拿全文核对裁判要旨\n\
+             1. 先用 `search_local_kb` 做本地 BM25；强命中后用 `read_kb_file` 读全文，够用就停止外查\n\
+             2. `weak_hits=true` 或描述型问题再用 `semantic_search_local_kb` 做本地语义补检\n\
+             3. 本地仍不足时，先用 `search_cases_authority` 找权威案例；权威库不足再用 `search_cases_normal`，关键词确实不准才用 `case_vector_search`\n\
+             4. 最终精选 **3-5 个**最相关类案：本地命中用 `read_kb_file`，元典命中才用 `get_case_detail`。元典详情每案 5 分，默认最多取 3 个远端全文，除非用户明确要求穷尽检索\n\
              \n\
              【地域优先(无服务端地域过滤,自己筛)】\n\
              - 检索工具**当前只接关键词,没有地域参数**;不要假设能按省市过滤。\n\
@@ -113,7 +112,7 @@ pub fn task_user_prompt(task: TaskType) -> Option<&'static str> {
              \n\
              【输出结构】\n\
              - 一、检索概述:用了哪些关键词、命中多少、最终精选几条、地域分布\n\
-             - 二、类案逐条(5-6 个,同市/同省/同级法院排在前面,外地高相关案例正常纳入):\n\
+             - 二、类案逐条(3-5 个,同市/同省/同级法院排在前面,外地高相关案例正常纳入):\n\
                - 类案 N:<案号> · <法院>(<权威等级,若来自权威库>)\n\
                  - 案情简述:<2-3 句>\n\
                  - 裁判要旨:<法院核心说理>\n\

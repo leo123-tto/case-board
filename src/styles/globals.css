@@ -60,6 +60,45 @@
   --scrollbar-thumb: oklch(0.67 0.026 247 / 62%);
 }
 
+/* 可选主题：墨绿象牙。未设置 data-theme 时仍使用上面的现有默认主题。 */
+:root[data-theme="emerald_ivory"] {
+  --background: oklch(0.975 0.014 92);
+  --foreground: oklch(0.225 0.028 158);
+  --card: oklch(0.992 0.009 92);
+  --card-foreground: oklch(0.225 0.028 158);
+  --popover: oklch(0.992 0.009 92);
+  --popover-foreground: oklch(0.225 0.028 158);
+  --primary: oklch(0.35 0.085 158);
+  --primary-foreground: oklch(0.985 0.008 92);
+  --secondary: oklch(0.945 0.024 102);
+  --secondary-foreground: oklch(0.29 0.055 158);
+  --muted: oklch(0.95 0.018 96);
+  --muted-foreground: oklch(0.49 0.035 158);
+  --accent: oklch(0.925 0.042 145);
+  --accent-foreground: oklch(0.29 0.055 158);
+  --border: oklch(0.875 0.026 112);
+  --input: oklch(0.855 0.031 112);
+  --ring: oklch(0.51 0.11 158);
+  --sidebar: oklch(0.958 0.021 99);
+  --sidebar-foreground: oklch(0.225 0.028 158);
+  --sidebar-primary: oklch(0.35 0.085 158);
+  --sidebar-primary-foreground: oklch(0.985 0.008 92);
+  --sidebar-accent: oklch(0.925 0.042 145);
+  --sidebar-accent-foreground: oklch(0.29 0.055 158);
+  --sidebar-border: oklch(0.875 0.026 112);
+  --sidebar-ring: oklch(0.51 0.11 158);
+
+  --brand: oklch(0.4 0.105 158);
+  --brand-foreground: oklch(0.985 0.008 92);
+  --brand-soft: oklch(0.925 0.042 145);
+  --surface-raised: oklch(0.992 0.009 92 / 94%);
+  --surface-muted: oklch(0.95 0.018 96 / 84%);
+  --canvas-top: oklch(0.987 0.012 92);
+  --brand-wash: oklch(0.89 0.06 150 / 42%);
+  --shadow-color: oklch(0.25 0.055 158 / 13%);
+  --scrollbar-thumb: oklch(0.61 0.045 150 / 64%);
+}
+
 .dark {
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);

@@ -353,6 +353,72 @@ pub async fn update_user_overrides(
     Ok(())
 }
 
+/// 原子修改 user_overrides_json.fields 的一个字段，保留其它人工覆盖。
+/// 遇到损坏或非对象 JSON 时 fail-loud，绝不静默重置用户已有内容。
+pub async fn patch_user_override_field(
+    pool: &SqlitePool,
+    id: &str,
+    path: &str,
+    value: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let result = async {
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT user_overrides_json FROM cases WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or(sqlx::Error::RowNotFound)?;
+        let mut overrides = match current.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => serde_json::from_str::<serde_json::Value>(raw).map_err(|e| {
+                sqlx::Error::Protocol(format!("user_overrides_json 已损坏，拒绝覆盖: {}", e))
+            })?,
+            None => serde_json::json!({}),
+        };
+        let root = overrides.as_object_mut().ok_or_else(|| {
+            sqlx::Error::Protocol("user_overrides_json 不是对象，拒绝覆盖".into())
+        })?;
+        let fields_value = root
+            .entry("fields")
+            .or_insert_with(|| serde_json::json!({}));
+        let fields = fields_value.as_object_mut().ok_or_else(|| {
+            sqlx::Error::Protocol("user_overrides_json.fields 不是对象，拒绝覆盖".into())
+        })?;
+        let trimmed = value.map(str::trim).unwrap_or_default();
+        fields.insert(
+            path.to_string(),
+            if trimmed.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(trimmed.to_string())
+            },
+        );
+        let next_json = serde_json::to_string(&overrides).map_err(|e| {
+            sqlx::Error::Protocol(format!("序列化 user_overrides_json 失败: {}", e))
+        })?;
+        sqlx::query(
+            "UPDATE cases SET user_overrides_json = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(next_json)
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(error)
+        }
+    }
+}
+
 /// 显式重置「我方代理立场」:同时清掉首次 AI 识别值和人工 override,
 /// 但保留 user_overrides_json 里的其它字段/隐藏卡片/排序。
 pub async fn reset_our_side(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {

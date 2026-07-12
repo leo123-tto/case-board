@@ -8,6 +8,20 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import {
+  parseProposal,
+  parseWorkspace,
+  parseWorkspaceSummaries,
+} from "@/modules/litigation/components/visualization/validate";
+import type {
+  CaseGraph,
+  CaseGraphPatch,
+  JsonValue,
+  VisualExportResult,
+  VisualProposal,
+  VisualWorkspace,
+  VisualWorkspaceSummary,
+} from "@/modules/litigation/components/visualization/types";
 import type {
   CaseLog,
   ElementDocumentType,
@@ -36,6 +50,87 @@ import type {
 
 export * from "./api/cases";
 export * from "./api/files";
+
+/* ------------------------------------------------------------------ */
+/* AI 案情可视化工作台                                                */
+/* ------------------------------------------------------------------ */
+
+export async function listCaseVisualSummaries(
+  caseId: string,
+): Promise<VisualWorkspaceSummary[]> {
+  return parseWorkspaceSummaries(
+    await invoke("list_case_visual_summaries", { caseId }),
+  );
+}
+
+export async function getCaseVisualWorkspace(
+  caseId: string,
+): Promise<VisualWorkspace | null> {
+  const value = await invoke("get_case_visual_workspace", { caseId });
+  return value === null ? null : parseWorkspace(value);
+}
+
+export async function saveCaseVisualUserRevision(input: {
+  caseId: string;
+  workspaceId: string;
+  expectedRevision: number;
+  graph: CaseGraph;
+  layout: Record<string, JsonValue>;
+  summary: string;
+}): Promise<VisualWorkspace> {
+  return parseWorkspace(await invoke("save_case_visual_user_revision", input));
+}
+
+export async function listCaseVisualProposals(
+  caseId: string,
+  workspaceId: string,
+): Promise<VisualProposal[]> {
+  const value = await invoke<unknown[]>("list_case_visual_proposals", {
+    caseId,
+    workspaceId,
+  });
+  return value.map(parseProposal);
+}
+
+export async function resolveCaseVisualProposal(input: {
+  caseId: string;
+  workspaceId: string;
+  proposalId: string;
+  action: "accept" | "reject";
+  acceptedPatch?: CaseGraphPatch;
+}): Promise<VisualWorkspace> {
+  return parseWorkspace(
+    await invoke("resolve_case_visual_proposal", {
+      ...input,
+      acceptedPatch: input.acceptedPatch ?? null,
+    }),
+  );
+}
+
+export async function restoreCaseVisualRevision(input: {
+  caseId: string;
+  workspaceId: string;
+  revision: number;
+}): Promise<VisualWorkspace> {
+  return parseWorkspace(await invoke("restore_case_visual_revision", input));
+}
+
+export function exportCaseVisual(input: {
+  caseId: string;
+  workspaceId: string;
+  format: "json" | "markdown";
+}): Promise<VisualExportResult> {
+  return invoke("export_case_visual", input);
+}
+
+export function writeCaseVisualExport(input: {
+  savePath: string;
+  format: "png" | "pdf" | "markdown" | "json";
+  mimeType: "image/png" | "application/pdf" | "text/markdown" | "application/json";
+  dataBase64: string;
+}): Promise<string> {
+  return invoke("write_case_visual_export", input);
+}
 
 /* ------------------------------------------------------------------ */
 /* 用户设置                                                            */
@@ -91,8 +186,7 @@ export function verifyOpenAICompatKey(
   });
 }
 
-/** 2026-05-25 V0.1.8:在线验证元典(open.chineselaw.com)API key。
- *  消耗 1 次企业搜索配额(用 name=test top_k=1 探测,代价最小)。*/
+/** 在线验证元典 API key。走免费 MCP 余额工具，不消耗法律业务接口积分。 */
 export function verifyYuandianKey(apiKey: string): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_yuandian_key", { apiKey });
 }
@@ -145,6 +239,55 @@ export function testMcpServer(
   config: import("./types").McpServerConfig
 ): Promise<import("./types").McpTestReport> {
   return invoke("test_mcp_server", { config });
+}
+
+/* ------------------------------------------------------------------ */
+/* 个人设备工作区同步（Mac / Windows 局域网对等）                    */
+/* ------------------------------------------------------------------ */
+
+export function deviceSyncStatus(): Promise<import("./types").DeviceSyncStatus> {
+  return invoke("device_sync_status");
+}
+
+export function deviceSyncDefaultName(): Promise<string> {
+  return invoke("device_sync_default_name");
+}
+
+export function deviceSyncSetEnabled(
+  enabled: boolean,
+): Promise<import("./types").DeviceSyncStatus> {
+  return invoke("device_sync_set_enabled", { enabled });
+}
+
+export function deviceSyncCreate(
+  groupName: string,
+  deviceName: string,
+): Promise<import("./types").DeviceSyncStatus> {
+  return invoke("device_sync_create", { groupName, deviceName });
+}
+
+export function deviceSyncDiscover(): Promise<import("./types").DiscoveredDeviceGroup[]> {
+  return invoke("device_sync_discover");
+}
+
+export function deviceSyncJoin(
+  groupId: string,
+  pairingCode: string,
+  deviceName: string,
+): Promise<import("./types").DeviceSyncStatus> {
+  return invoke("device_sync_join", { groupId, pairingCode, deviceName });
+}
+
+export function deviceSyncRefreshCode(): Promise<string> {
+  return invoke("device_sync_refresh_code");
+}
+
+export function deviceSyncNow(): Promise<import("./types").DeviceSyncReport> {
+  return invoke("device_sync_now");
+}
+
+export function deviceSyncForget(): Promise<void> {
+  return invoke("device_sync_forget");
 }
 
 /* ------------------------------------------------------------------ */
@@ -401,6 +544,30 @@ export function generateHomeGreeting(
   input: HomeGreetingInput,
 ): Promise<HomeGreetingResponse> {
   return invoke<HomeGreetingResponse>("generate_home_greeting", { input });
+}
+
+export interface DashboardAssistantMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface DashboardAssistantInput {
+  messages: DashboardAssistantMessage[];
+  active_case_count: number;
+}
+
+export interface DashboardAssistantResponse {
+  reply: string;
+  action: "none" | "open_feedback" | string;
+  feedback_draft: string | null;
+  source: "ai" | "fallback" | string;
+  error: string | null;
+}
+
+export function chatDashboardAssistant(
+  input: DashboardAssistantInput,
+): Promise<DashboardAssistantResponse> {
+  return invoke<DashboardAssistantResponse>("chat_dashboard_assistant", { input });
 }
 
 export function listMemoryCandidates(caseId: string | null): Promise<MemoryCandidate[]> {
@@ -1284,6 +1451,12 @@ export interface AskQuestion {
   options: string[];
   /** 是否允许自由输入(无选项时前端也强制可输入) */
   allow_input: boolean;
+  /** 是否允许同时选择多个选项;省略或 false 保持旧的一点即选行为 */
+  multiple?: boolean;
+  /** 多选时至少选择几项 */
+  min_selections?: number;
+  /** 多选时最多选择几项 */
+  max_selections?: number;
 }
 
 export type ChatStreamEvent =
@@ -1431,6 +1604,15 @@ export interface KbInitResult {
   reused_existing: boolean;
 }
 
+export interface KbMigrationResult {
+  source: string;
+  target: string;
+  files_copied: number;
+  dirs_copied: number;
+  bytes_copied: number;
+  source_preserved: boolean;
+}
+
 /** 导出结果。 */
 export interface KbExportResult {
   output_path: string;
@@ -1467,6 +1649,11 @@ export function detectKbStatus(): Promise<KbStatus> {
 /** 在指定路径建空 KB(已有则只补缺失子目录),自动写回 settings 启用。 */
 export function createLocalKb(path: string): Promise<KbInitResult> {
   return invoke<KbInitResult>("create_local_kb", { path });
+}
+
+/** 安全复制当前 KB 到新目录；校验成功后才切换设置，源目录始终保留。 */
+export function migrateLocalKb(targetPath: string): Promise<KbMigrationResult> {
+  return invoke<KbMigrationResult>("migrate_local_kb", { targetPath });
 }
 
 /** 从 zip 导入资料包合并进当前 KB。 */
@@ -1591,6 +1778,35 @@ export interface CreditsOverview {
 /** 取元典积分账总览(当月 + 上月 + 累计)。 */
 export function getYuandianCreditsOverview(): Promise<CreditsOverview> {
   return invoke<CreditsOverview>("get_yuandian_credits_overview");
+}
+
+/** 元典 MCP 官方余额与相邻快照区间的本机积分账对账结果。 */
+export interface YuandianBalance {
+  point_balance: number;
+  count_balance: number;
+  fetched_at: string;
+  cached: boolean;
+  previous_point_balance: number | null;
+  previous_fetched_at: string | null;
+  official_spent_since_previous: number | null;
+  local_recorded_since_previous: number | null;
+  local_api_calls_since_previous: number | null;
+  difference: number | null;
+  balance_increased_since_previous: number | null;
+  comparison_status:
+    | "baseline"
+    | "matched"
+    | "difference"
+    | "recharged"
+    | "local_reset";
+  refresh_error: string | null;
+}
+
+/** refresh=true 查免费 MCP 余额并留快照；false 只读本机缓存。 */
+export function getYuandianBalance(
+  refresh: boolean,
+): Promise<YuandianBalance | null> {
+  return invoke<YuandianBalance | null>("get_yuandian_balance", { refresh });
 }
 
 /** 验证 embedding 配置(embed 探针词),成功返回向量维度。给设置页验证按钮。

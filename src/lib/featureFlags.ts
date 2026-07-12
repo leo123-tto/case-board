@@ -52,9 +52,9 @@ export const FEATURE_FLAGS: FeatureFlagMeta[] = [
   },
   {
     name: "home_companion",
-    title: "首页问候与案卷小助手",
+    title: "首页看板助手",
     description:
-      "在首页空白处显示轻量天气、问候和案卷小助手。默认开启;首屏先用缓存/兜底文案,天气和 AI 后台刷新。",
+      "在首页显示问候、天气、案件简报和产品答疑聊天；还可以整理反馈草稿并打开反馈窗口。",
     defaultValue: true,
     location: "settings",
   },

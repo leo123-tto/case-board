@@ -13,6 +13,7 @@
 
 use crate::db::cases::Case;
 use crate::db::documents::Document;
+use serde_json::Value;
 
 // =============================================================================
 // 公开类型
@@ -93,32 +94,67 @@ const PER_DOC_LIGHT_CHAR_LIMIT: usize = 600;
 ///
 /// V0.2 D4-D5 起,`chat::constitution::build_system_prompt` 也复用本函数 — 因此 `pub(crate)`。
 pub(crate) fn case_snapshot_md(case: &Case) -> String {
+    let override_value = case
+        .user_overrides_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    let fields = override_value
+        .as_ref()
+        .and_then(|value| value.get("fields"))
+        .and_then(Value::as_object);
     let mut s = String::with_capacity(2048);
 
     // 基本信息
     s.push_str("【基本信息】\n");
     push_kv(&mut s, "案件名称", Some(&case.name));
-    push_kv(&mut s, "案件类型", Some(&case.case_type));
+    push_kv(
+        &mut s,
+        "案件类型",
+        override_str(fields, "case_type", Some(&case.case_type)),
+    );
+    push_kv(
+        &mut s,
+        "案件阶段",
+        override_str(fields, "case_stage", case.stage.as_deref()),
+    );
     push_kv(
         &mut s,
         "案号",
-        case.agg_case_no.as_deref().or(case.case_no.as_deref()),
+        override_str(
+            fields,
+            "agg_case_no",
+            case.agg_case_no.as_deref().or(case.case_no.as_deref()),
+        ),
     );
     push_kv(
         &mut s,
         "法院",
-        case.agg_court.as_deref().or(case.court.as_deref()),
+        override_str(
+            fields,
+            "agg_court",
+            case.agg_court.as_deref().or(case.court.as_deref()),
+        ),
     );
     push_kv(
         &mut s,
         "案由",
-        case.agg_cause.as_deref().or(case.cause.as_deref()),
+        override_str(
+            fields,
+            "agg_cause",
+            case.agg_cause.as_deref().or(case.cause.as_deref()),
+        ),
     );
-    push_kv(&mut s, "立案日", case.agg_filed_at.as_deref());
+    push_kv(
+        &mut s,
+        "立案日",
+        override_str(fields, "agg_filed_at", case.agg_filed_at.as_deref()),
+    );
     push_kv(
         &mut s,
         "诉讼请求金额",
-        case.agg_claim_amount.map(format_amount).as_deref(),
+        override_number(fields, "agg_claim_amount", case.agg_claim_amount)
+            .map(format_amount)
+            .as_deref(),
     );
     // D9-1:DB 存英文 StatusId,喂 LLM 时还原中文 label(更可读,且不依赖 agg_status_text)。
     push_kv(
@@ -128,9 +164,21 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
             .as_deref()
             .map(crate::ingest::global_pipeline::workflow_status_en_to_zh),
     );
-    push_kv(&mut s, "LLM 状态描述", case.agg_status_text.as_deref());
-    push_kv(&mut s, "案件总状态", Some(&case.case_status));
-    push_kv(&mut s, "一句话摘要", case.case_summary.as_deref());
+    push_kv(
+        &mut s,
+        "LLM 状态描述",
+        override_str(fields, "agg_status_text", case.agg_status_text.as_deref()),
+    );
+    push_kv(
+        &mut s,
+        "案件总状态",
+        override_str(fields, "case_status", Some(&case.case_status)),
+    );
+    push_kv(
+        &mut s,
+        "一句话摘要",
+        override_str(fields, "case_summary", case.case_summary.as_deref()),
+    );
 
     // 当事人
     s.push_str("\n【当事人】\n");
@@ -142,7 +190,13 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let user_side = crate::db::cases::user_override_our_side(case.user_overrides_json.as_deref());
-    match user_side.as_deref().or(llm_side) {
+    let side_was_overridden = fields.is_some_and(|fields| fields.contains_key("agg_our_side"));
+    let effective_side = if side_was_overridden {
+        user_side.as_deref()
+    } else {
+        user_side.as_deref().or(llm_side)
+    };
+    match effective_side {
         Some(side) => {
             // 律师改过立场、但 LLM 值(及每个当事人 is_our_side 标记)还没经「重新分析」同步时,
             // 二者会冲突 → 明确以案件级确认值为准,消除 AI 站反风险(advisor 命门:override 未重抽窗口)。
@@ -224,7 +278,7 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
         );
     }
 
-    if let Some(reso) = &case.agg_resolution {
+    if let Some(reso) = override_str(fields, "agg_resolution", case.agg_resolution.as_deref()) {
         if !reso.trim().is_empty() {
             s.push_str("\n【处理结果】\n");
             s.push_str(reso);
@@ -232,7 +286,53 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
         }
     }
 
+    if let Some(fields) = fields.filter(|fields| !fields.is_empty()) {
+        s.push_str("\n【人工确认的覆盖字段】\n");
+        for (path, value) in fields {
+            let shown = match value {
+                Value::Null => "（已清空）".to_string(),
+                Value::String(value) => value.clone(),
+                other => other.to_string(),
+            };
+            s.push_str(&format!("- {}: {}\n", path, shown));
+        }
+    }
+
     s
+}
+
+fn override_str<'a>(
+    fields: Option<&'a serde_json::Map<String, Value>>,
+    path: &str,
+    fallback: Option<&'a str>,
+) -> Option<&'a str> {
+    match fields.and_then(|fields| fields.get(path)) {
+        Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        _ => fallback,
+    }
+}
+
+fn override_number(
+    fields: Option<&serde_json::Map<String, Value>>,
+    path: &str,
+    fallback: Option<f64>,
+) -> Option<f64> {
+    match fields.and_then(|fields| fields.get(path)) {
+        Some(Value::Null) => None,
+        Some(Value::Number(value)) => value.as_f64(),
+        Some(Value::String(value)) => {
+            let cleaned: String = value
+                .chars()
+                .filter(|c| !matches!(c, '¥' | '￥' | '$' | '元' | ',' | '，' | ' ' | '　'))
+                .collect();
+            cleaned
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+        }
+        _ => fallback,
+    }
 }
 
 fn push_kv(s: &mut String, label: &str, val: Option<&str>) {

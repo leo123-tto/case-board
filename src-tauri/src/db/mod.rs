@@ -23,6 +23,7 @@ pub mod calendar_events;
 pub mod case_instances;
 pub mod case_logs;
 pub mod case_memories;
+pub mod case_visuals;
 pub mod cases;
 pub mod chat;
 pub mod chat_tasks;

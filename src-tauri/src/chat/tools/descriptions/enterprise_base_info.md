@@ -24,6 +24,6 @@ enterprise_base_info — 详细工商档案(股东出资比例 + 十大股东 + 
   - **top10holder / top10circulate**:仅上市公司有,非上市公司为空
   - **members**:核心成员 `[{name, position, type}]` — 看监事 / 高管 / 实控人
   - **branches**:分支机构 `[{name, region, status}]` — 看其他主体线索
-- **本工具 1 积分**
+- **本工具 10 积分**
 - LLM 引用具体出资 / 股东 / 成员时,**必须**完整复述名字 + 数字,不要四舍五入(法律精度)
 - `<CITATIONS>` 标 `type: "enterprise"`,title 写企业名 + 「(主体档案)」

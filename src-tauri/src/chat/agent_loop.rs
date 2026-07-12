@@ -116,6 +116,15 @@ pub struct AskQuestion {
     /// 是否允许自由输入(选项穷尽不了时为 true;无选项时前端强制可输入)
     #[serde(default)]
     pub allow_input: bool,
+    /// 是否允许同时选择多个预设项。false 时完全保持旧交互。
+    #[serde(default)]
+    pub multiple: bool,
+    /// 多选下限；None 时前端默认至少 1 项。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_selections: Option<usize>,
+    /// 多选上限；None 时前端默认不超过选项总数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_selections: Option<usize>,
 }
 
 /// 从 `ask_user` 工具调用的 args 防御式解析出问题列表。
@@ -167,10 +176,35 @@ fn parse_ask_user_args(args: &Value) -> Vec<AskQuestion> {
                 .get("allow_input")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let multiple = item
+                .get("multiple")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                && !options.is_empty();
+            let (min_selections, max_selections) = if multiple {
+                let option_count = options.len();
+                let min = item
+                    .get("min_selections")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| usize::try_from(v).ok())
+                    .map(|value| value.min(option_count));
+                let max = item
+                    .get("max_selections")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| usize::try_from(v).ok())
+                    .map(|value| value.min(option_count));
+                let max = max.map(|value| value.max(min.unwrap_or(0)));
+                (min, max)
+            } else {
+                (None, None)
+            };
             Some(AskQuestion {
                 question: q.to_string(),
                 options,
                 allow_input,
+                multiple,
+                min_selections,
+                max_selections,
             })
         })
         .collect()
@@ -220,7 +254,8 @@ struct ApiRequest<'a> {
     model: &'a str,
     messages: &'a [ApiMessage],
     stream: bool,
-    stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     temperature: f32,
     #[serde(flatten)]
     token_budget: ApiTokenBudget,
@@ -876,10 +911,10 @@ async fn stream_one_request(
         model: &config.model,
         messages,
         stream: true,
-        stream_options: StreamOptions {
+        stream_options: capability.supports_stream_usage.then_some(StreamOptions {
             include_usage: true,
-        },
-        temperature: req.temperature,
+        }),
+        temperature: capability.normalize_temperature(req.temperature),
         token_budget: ApiTokenBudget::from_capability(req.max_tokens, &capability),
         tools: tool_schemas,
         tool_choice,

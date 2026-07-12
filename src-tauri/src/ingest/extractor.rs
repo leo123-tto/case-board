@@ -400,6 +400,7 @@ pub async fn extract_one(
     path: &Path,
     filename: &str,
     category: Option<&str>,
+    cached_text: Option<String>,
 ) -> ExtractResult {
     let kind = text_extraction_kind(filename);
 
@@ -424,7 +425,9 @@ pub async fn extract_one(
     let t0 = Instant::now();
     // 2026-06-13:去水印重识别(force_backend=ppocrv6)时强制走 OCR —— 用户明确要 OCR 去水印,
     // 不要因为带水印 PDF 恰好有可抽文本层就跳过 OCR(那层往往也被水印污染)。
-    let text_extract_result = if ocr_ctx.force_backend.is_some() {
+    let text_extract_result = if let Some(text) = cached_text {
+        Ok((text, "retry-cache"))
+    } else if ocr_ctx.force_backend.is_some() {
         Err("__NEEDS_OCR__".to_string())
     } else {
         extract_text(path, kind)

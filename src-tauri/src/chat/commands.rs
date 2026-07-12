@@ -137,6 +137,57 @@ pub struct CaseChatInput {
     pub editing_doc_id: Option<String>,
 }
 
+fn visualization_consent_from_message(message: &str) -> bool {
+    let text = message.trim();
+    if text.is_empty()
+        || [
+            "暂不生成",
+            "不要画",
+            "不用画",
+            "不需要图",
+            "无需生成",
+            "先不生成",
+            "先别画",
+        ]
+        .iter()
+        .any(|word| text.contains(word))
+    {
+        return false;
+    }
+    let mentions_visual = [
+        "可视化",
+        "图表",
+        "时间线",
+        "关系图",
+        "思维导图",
+        "证据矩阵",
+        "柱状图",
+        "折线图",
+        "热力图",
+        "数据条表格",
+    ]
+    .iter()
+    .any(|word| text.contains(word));
+    if !mentions_visual {
+        return false;
+    }
+    if text.contains('→') {
+        return true;
+    }
+    [
+        "画",
+        "生成",
+        "制作",
+        "做个",
+        "做一",
+        "出图",
+        "展示一下",
+        "可视化一下",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+}
+
 /// `case_chat` 主入口。返回时流式已经完成(或取消 / 错误)。
 pub async fn case_chat_impl(
     app: AppHandle,
@@ -347,6 +398,8 @@ pub async fn case_chat_impl(
         local_kb: local_kb.as_ref(),
         // reextract_document 工具需要 AppHandle 触发后台抽取并 emit 进度事件
         app: Some(app.clone()),
+        message_id: Some(&input.message_id),
+        visualization_consent: visualization_consent_from_message(&input.user_message),
     };
     // V0.2 D6.5 · 给 citations.parse_with_doc_filenames 用,校验 type=doc 的 quote 是否在文档里
     let mut case_doc_paths_for_citation_check: Vec<(String, String)> = Vec::new();

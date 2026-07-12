@@ -8,7 +8,8 @@
 //! 「我的待办镜像」:维护一份滴答某清单(默认收件箱)的本地镜像,完整双向、带完成状态,
 //! 在设置页管理、首页展示;**不碰** 案件待办(case_todos)。**cutoff**:首次同步建基线,
 //! 只拉取之后新建的远端任务,手机历史积压不会一锅端。
-//! 存储:`<app_data_dir>/ticktick_sync.json`(本地运行态,不进 git,符合密钥铁律)。
+//! 存储:`<app_data_dir>/ticktick_sync.json`(不进 git)；个人空间启用时作为加密记录同步，
+//! 后台自动拉取只由主力设备执行，副设备仍可手动同步。
 
 pub mod client;
 pub mod state;
@@ -23,7 +24,7 @@ use tauri::AppHandle;
 use tokio::sync::Mutex;
 
 /// 全局串行化:自动同步后台任务、各 dispatch 调用都读改写同一个 JSON 文件,加锁防竞争。
-fn state_lock() -> &'static Mutex<()> {
+pub(crate) fn state_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -78,6 +79,9 @@ pub fn sync_on_focus(app: AppHandle) {
 
 /// 自动同步一拍:仅在已连接 + 开了自动同步 + 选了清单时跑,失败静默(错误进 last_error)。
 async fn auto_sync_tick(app: &AppHandle) {
+    if !crate::device_sync::is_automation_owner() {
+        return;
+    }
     let go = {
         let _g = state_lock().lock().await;
         match state::load(app) {

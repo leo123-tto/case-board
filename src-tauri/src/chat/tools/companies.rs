@@ -2,7 +2,7 @@
 //!
 //! 精简版 — 砍了 14 个被聚合 Top 20 覆盖的细分接口(详 § 5.4)。
 //! `enterprise_aggregation_summary` 是核心入口,5 积分一次拿全维度。
-//! 其他 5 个 1 积分,聚合 Top 20 不够时再调。
+//! 接口按官方目录分别为 1 / 5 / 10 积分；聚合 Top 20 不够时再调明细，避免无目的翻页。
 
 use async_trait::async_trait;
 use serde_json::{json, Value};

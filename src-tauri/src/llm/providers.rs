@@ -33,6 +33,13 @@ pub static MIMO: CompatPreset = CompatPreset {
     default_model: "mimo-v2.5",
 };
 
+pub static KIMI: CompatPreset = CompatPreset {
+    id: "kimi",
+    label: "Kimi Coding Plan",
+    default_endpoint: "https://api.kimi.com/coding/v1/chat/completions",
+    default_model: "kimi-for-coding",
+};
+
 pub static CUSTOM: CompatPreset = CompatPreset {
     id: "custom",
     label: "自定义(OpenAI 兼容)",
@@ -45,6 +52,7 @@ pub fn compat_preset(id: &str) -> Option<&'static CompatPreset> {
     match id.trim() {
         "glm" => Some(&GLM),
         "mimo" => Some(&MIMO),
+        "kimi" => Some(&KIMI),
         "custom" => Some(&CUSTOM),
         _ => None,
     }

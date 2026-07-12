@@ -1,4 +1,4 @@
-import { FileText, Loader2 } from "lucide-react";
+import { FileText, Loader2, X } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
 /* 状态视图                                                            */
@@ -13,10 +13,28 @@ export function LoadingState() {
   );
 }
 
-export function ErrorState({ message }: { message: string }) {
+export function ErrorState({
+  message,
+  onDismiss,
+}: {
+  message: string;
+  onDismiss?: () => void;
+}) {
   return (
     <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-4">
-      <p className="text-sm font-medium text-destructive">出错了</p>
+      <div className="flex items-start justify-between gap-3">
+        <p className="text-sm font-medium text-destructive">出错了</p>
+        {onDismiss && (
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+            aria-label="关闭错误提示"
+          >
+            <X className="size-4" />
+          </button>
+        )}
+      </div>
       <p className="mt-1 font-mono text-xs text-muted-foreground">{message}</p>
     </div>
   );

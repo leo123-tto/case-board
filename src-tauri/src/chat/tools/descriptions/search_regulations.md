@@ -22,7 +22,7 @@ search_regulations — 检索法规(整部),返回法规元信息列表(法规�
 - top_k: 可选,默认 20
 
 注意事项:
-- 优先用本地缓存(命中 0 积分;miss 1 积分)
+- 优先用本地缓存(命中 0 积分；miss 调法规关键词检索为 10 积分)
 - 返回字段:`[{id, fgmc, effect_level, publish_date, implement_date, valid, region, content?}]`
   - `content` 仅在 keyword 命中正文时返回高亮片段
 - 看到列表后通常下一步是 `get_regulation_detail` 拿挑中的那部法规全文

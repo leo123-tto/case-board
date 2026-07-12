@@ -1107,6 +1107,12 @@ function MainApp() {
     setSelectedId(caseId);
     setView("detail");
   };
+  const pickCaseFromHome = (caseId: string) => {
+    const target = cases.find((item) => item.id === caseId);
+    void setActiveModuleSafe(target && isCriminalCase(target) ? "criminal" : "litigation");
+    setSelectedId(caseId);
+    setView("detail");
+  };
   const handleCaseStatusChanged = useCallback(
     (caseId: string, status: string | null) => {
       const patch = {
@@ -1124,6 +1130,8 @@ function MainApp() {
   );
   const openHomeEvent = (event: UpcomingEvent) => {
     if (!event.caseId) return;
+    const target = cases.find((item) => item.id === event.caseId);
+    void setActiveModuleSafe(target && isCriminalCase(target) ? "criminal" : "litigation");
     setSelectedId(event.caseId);
     setView("detail");
     if (event.sourceDoc) {
@@ -1146,6 +1154,7 @@ function MainApp() {
     documents,
     loading,
     error,
+    onDismissError: () => setError(null),
     onSwitchCase: setSelectedId,
     onGoHome: goHome,
     onOpenDoc: handleOpenDoc,
@@ -1167,10 +1176,10 @@ function MainApp() {
     onArtifactCreated: handleArtifactCreated,
   };
 
-  // 诉讼模块整体渲染:从未导入任何案件→EmptyState / 选中民事案件→CaseView / 否则→HomeView。
+  // 诉讼模块整体渲染:从未导入任何案件→EmptyState / 选中民事案件→CaseView / 否则→全案件 HomeView。
   // 首页两态(EmptyState / HomeView)都包一层 HomeDropZone:拖案件文件夹进来即导入。
   // EmptyState 判据用全量 cases(不是 civilCases):否则只有刑事案件时诉讼 tab 会误显「还没有案件」。
-  // 有案件但 civilCases 为空时,落到下面的 HomeView 分支(空的民事案件网格)。
+  // 首页是全局入口:民事、刑事、行政等全部案件都要显示。点击刑事案件时再切到刑事详情。
   const litigationBody =
     cases.length === 0 && !loading ? (
       <HomeDropZone onImportPath={handleDropImport}>
@@ -1186,9 +1195,9 @@ function MainApp() {
     ) : (
       <HomeDropZone onImportPath={handleDropImport}>
         <HomeView
-          cases={civilCases}
+          cases={cases}
           userDisplayName={userDisplayName}
-          onPickCase={pickCase}
+          onPickCase={pickCaseFromHome}
           onOpenEvent={openHomeEvent}
           onImport={handleImport}
           onDeleteCase={handleDeleteCaseById}

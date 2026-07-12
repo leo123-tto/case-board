@@ -138,6 +138,12 @@ pub struct Settings {
     pub mimo_llm_api_key: Option<String>,
     pub mimo_llm_verified_at: Option<String>,
 
+    /// Kimi Coding Plan 独立配置，避免切换服务商时覆盖 DeepSeek 或其他兼容模型。
+    pub kimi_llm_endpoint: Option<String>,
+    pub kimi_llm_model: Option<String>,
+    pub kimi_llm_api_key: Option<String>,
+    pub kimi_llm_verified_at: Option<String>,
+
     /// 自定义 OpenAI 兼容模型独立配置。
     pub custom_llm_endpoint: Option<String>,
     pub custom_llm_model: Option<String>,
@@ -233,7 +239,7 @@ pub struct Settings {
     /// 本地 KB 总开关(为 false 时即使 local_kb_root 有值也不启用,给用户临时停用的能力)
     pub local_kb_enabled: Option<bool>,
 
-    /// 元典积分月度上限(整数,单位:1 次普通查询 = 1 积分;聚合查询 = 5)。
+    /// 元典积分月度上限(整数；官方接口目录价为 1 / 5 / 10 / 50 分每次)。
     /// `None` = 不限制。超出阈值时,chat 自动降级到 KB Stale 命中,不再发起在线调用。
     pub yuandian_monthly_credit_limit: Option<u32>,
 
@@ -260,6 +266,13 @@ pub struct Settings {
     /// 2026-06-10 团队版 Phase 1(LAN 接力同步,详 docs/提案-团队版-2026-06-10.md §6)。
     /// None = 未加入团队,团队功能整体关闭零开销。secret/配对码跟 API key 同级:只存本机不进 git。
     pub team: Option<crate::team::TeamIdentity>,
+
+    /// 同一用户的 Mac / Windows 设备间同步个人工作空间。
+    /// 业务状态、派生 Markdown 和可移植设置进入加密协议；副设备源文件只单向归集主力设备，
+    /// 本机绝对路径永不进入协议。
+    /// 默认关闭；身份和高熵密钥只由 device_sync_* commands 改，普通设置保存不得覆写。
+    pub device_sync_enabled: bool,
+    pub device_sync: Option<crate::device_sync::DeviceSyncIdentity>,
 }
 
 impl Settings {
@@ -283,6 +296,7 @@ impl Settings {
             Some("minimax") => "minimax",
             Some("glm") => "glm",
             Some("mimo") => "mimo",
+            Some("kimi") => "kimi",
             Some("custom") => "custom",
             _ => "deepseek",
         }
@@ -292,7 +306,7 @@ impl Settings {
     pub fn cloud_llm_is_compat(&self) -> bool {
         matches!(
             self.effective_cloud_llm_backend(),
-            "glm" | "mimo" | "custom"
+            "glm" | "mimo" | "kimi" | "custom"
         )
     }
 
@@ -309,6 +323,7 @@ impl Settings {
         let current = match self.effective_cloud_llm_backend() {
             "glm" => Self::clean_string(&self.glm_llm_endpoint),
             "mimo" => Self::clean_string(&self.mimo_llm_endpoint),
+            "kimi" => Self::clean_string(&self.kimi_llm_endpoint),
             "custom" => Self::clean_string(&self.custom_llm_endpoint),
             _ => None,
         };
@@ -320,6 +335,7 @@ impl Settings {
         let current = match self.effective_cloud_llm_backend() {
             "glm" => Self::clean_string(&self.glm_llm_model),
             "mimo" => Self::clean_string(&self.mimo_llm_model),
+            "kimi" => Self::clean_string(&self.kimi_llm_model),
             "custom" => Self::clean_string(&self.custom_llm_model),
             _ => None,
         };
@@ -331,6 +347,7 @@ impl Settings {
         let current = match self.effective_cloud_llm_backend() {
             "glm" => Self::clean_string(&self.glm_llm_api_key),
             "mimo" => Self::clean_string(&self.mimo_llm_api_key),
+            "kimi" => Self::clean_string(&self.kimi_llm_api_key),
             "custom" => Self::clean_string(&self.custom_llm_api_key),
             _ => None,
         };
@@ -368,6 +385,12 @@ impl Settings {
                 &mut self.mimo_llm_model,
                 &mut self.mimo_llm_api_key,
                 &mut self.mimo_llm_verified_at,
+            ),
+            "kimi" => (
+                &mut self.kimi_llm_endpoint,
+                &mut self.kimi_llm_model,
+                &mut self.kimi_llm_api_key,
+                &mut self.kimi_llm_verified_at,
             ),
             "custom" => (
                 &mut self.custom_llm_endpoint,

@@ -48,7 +48,13 @@ impl Tool for SearchLocalKb {
         // KB 未启用 → 静默降级返回空(description 已说明这条)
         let Some(kb) = ctx.local_kb else {
             return Ok(ToolResult {
-                content: "[]".into(),
+                content: serde_json::to_string_pretty(&json!({
+                    "query": keyword,
+                    "weak_hits": true,
+                    "results": [],
+                    "reason": "本地知识库未启用"
+                }))
+                .unwrap_or_else(|_| "{}".into()),
                 yuandian_credits_used: 0,
                 kb_hit: false,
             });
@@ -61,11 +67,28 @@ impl Tool for SearchLocalKb {
             case_sensitive: false,
         };
         let hits = search_kb_files(&kb.root, keyword, opts)?;
-        let content = serde_json::to_string_pretty(&hits).unwrap_or_else(|_| "[]".into());
+        // 跟新版 legal-kb `search-kb` 对齐：weak_hits 只作快速分流信号。
+        // 0 结果，或前 3 条全是 raw / 元典缓存且没有高置信精确结构命中时视为弱命中；
+        // agent 仍需结合 title / score / snippet 判断是否真的足够回答。
+        let top = hits.iter().take(3).collect::<Vec<_>>();
+        let structurally_strong = hits.first().is_some_and(|h| h.score >= 40.0);
+        let weak_hits = hits.is_empty()
+            || (!structurally_strong
+                && !top.is_empty()
+                && top
+                    .iter()
+                    .all(|h| matches!(h.doc_type.as_str(), "raw" | "yuandian")));
+        let content = serde_json::to_string_pretty(&json!({
+            "query": keyword,
+            "kb_root": kb.root,
+            "weak_hits": weak_hits,
+            "results": hits,
+        }))
+        .unwrap_or_else(|_| "{}".into());
         Ok(ToolResult {
             content,
             yuandian_credits_used: 0,
-            kb_hit: !hits.is_empty(),
+            kb_hit: !weak_hits,
         })
     }
 }

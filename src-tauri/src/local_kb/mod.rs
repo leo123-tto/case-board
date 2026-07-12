@@ -13,6 +13,7 @@
 pub mod cache;
 pub mod experience;
 pub mod hash;
+pub mod ingest;
 pub mod init;
 pub mod search;
 pub mod semantic;
@@ -41,6 +42,17 @@ pub enum KbError {
     Io(#[from] std::io::Error),
     #[error("JSON 错误:{0}")]
     Json(#[from] serde_json::Error),
+    #[error("知识库迁移目标无效:{0}")]
+    InvalidMigrationTarget(String),
+    #[error(
+        "知识库迁移校验失败:文件 {actual_files}/{expected_files},字节 {actual_bytes}/{expected_bytes}"
+    )]
+    MigrationVerificationFailed {
+        expected_files: u64,
+        actual_files: u64,
+        expected_bytes: u64,
+        actual_bytes: u64,
+    },
 }
 
 impl serde::Serialize for KbError {

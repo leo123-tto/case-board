@@ -40,7 +40,9 @@ pub mod reextract;
 pub mod save_kb;
 pub mod semantic;
 pub mod semantic_kb;
+pub mod snapshot;
 pub mod verify;
+pub mod visualization;
 pub mod web;
 
 use async_trait::async_trait;
@@ -66,6 +68,10 @@ pub struct ToolContext<'a> {
     /// (如 `reextract_document` 走 `spawn_extraction`)。chat command 构造时传
     /// `Some(app.clone())`;单测 / 无 GUI 上下文传 `None`(此类工具会优雅报错)。
     pub app: Option<tauri::AppHandle>,
+    /// 当前 assistant 消息 id。可视化工作区据此回链到生成它的聊天消息。
+    pub message_id: Option<&'a str>,
+    /// 本轮原始用户消息是否已明确授权生成或更新可视化。
+    pub visualization_consent: bool,
 }
 
 /// tool 执行结果。
@@ -112,6 +118,8 @@ pub enum ToolError {
     Io(#[from] std::io::Error),
     #[error("内部错误:{0}")]
     Runtime(String),
+    #[error("可视化错误:{0}")]
+    Visualization(#[from] crate::db::case_visuals::VisualError),
 }
 
 impl serde::Serialize for ToolError {
@@ -198,10 +206,16 @@ impl ToolRegistry {
             Box::new(artifact::EditArtifact),
             // 交互工具 1(V0.3):选项式追问(agent_loop 拦截,不进 parallel 派发)
             Box::new(ask_user::AskUser),
+            // 案情可视化 3:读取现状 + 首次创建 + 更新提案
+            Box::new(visualization::GetCaseVisualization),
+            Box::new(visualization::SaveCaseVisualization),
+            Box::new(visualization::ProposeCaseVisualUpdate),
             // 文档维护 1(V0.3):触发后台重抽某文档(mutating,会重跑 OCR/LLM 烧积分)
             Box::new(reextract::ReextractDocument),
             // 入库工具 1(P2):把企业调查报告写进本地 KB raw/companies/(mutating)
             Box::new(save_kb::SaveCompanyReport),
+            // 用户确认后由 AI 助手纠正案件画像；写 user_overrides，重抽不覆盖。
+            Box::new(snapshot::UpdateCaseSnapshotField),
             // 通用联网工具 2:公开网页搜索 / 读取。只读,作为本地 KB + 元典之外的兜底。
             Box::new(web::WebSearch),
             Box::new(web::WebFetch),
@@ -368,7 +382,8 @@ fn slim_search_for_llm(query_type: &str, resp: &Value) -> Option<Value> {
 // =============================================================================
 // 案例检索瘦身(2026-06-02 · 真机:case_vector_search 单次 138KB / 45 案 × 656 字正文塞进主上下文;
 // get_case_detail 的 content 还带个 llm_content 重复正文)。案例响应结构跟法条不同:
-//   - case_vector_search 的案在 `extra.wenshu`;ptal/qwal/case_details 在 `data.lst`。
+//   - case_vector_search 的案在 `extra.wenshu`;ptal/qwal 在 `data.lst`;
+//     当前 case_details 在 `data` 数组(兼容旧缓存 `data.lst`)。
 // 列表/向量检索:每案只留定位+短摘要(LLM 据此挑案,要全文 get_case_detail 取);
 // get_case_detail:留 content(本就为取全文而调),只砍重复 llm_content + 噪音。
 // 缓存(sidecar / .md)仍存完整,瘦身只作用于**返回给 LLM 的内容**。
@@ -397,9 +412,11 @@ const CASE_CONTENT_CHARS: usize = 160;
 fn locate_cases<'a>(query_type: &str, resp: &'a Value) -> Option<(&'a Vec<Value>, bool)> {
     let arr = match query_type {
         "case_vector_search" => resp.get("extra")?.get("wenshu")?.as_array()?,
-        "rh_ptal_search" | "rh_qwal_search" | "rh_case_details" => {
-            resp.get("data")?.get("lst")?.as_array()?
-        }
+        "rh_ptal_search" | "rh_qwal_search" => resp.get("data")?.get("lst")?.as_array()?,
+        "rh_case_details" => resp
+            .get("data")?
+            .as_array()
+            .or_else(|| resp.get("data")?.get("lst")?.as_array())?,
         _ => return None,
     };
     Some((arr, CASE_LIST_TYPES.contains(&query_type)))
@@ -476,7 +493,7 @@ struct DetailDoc {
 
 /// 把详情类响应渲染成可读全文 MD 的素材。**按响应形状分支**(关键:三类形状不同):
 /// - `rh_fg_detail` / `rh_ft_detail`:`data` 是对象,正文在 `data.content`;
-/// - `rh_case_details`:是 `get_case_detail` 用 search top_k=1 顶替的实现,正文在 `data.lst[0].content`。
+/// - `rh_case_details`:当前官方响应是 `data[0].content`，兼容旧缓存 `data.lst[0].content`。
 ///
 /// 取不到正文 → `None`(调用方据此退回只写 sidecar,绝不写空壳 MD)。
 fn render_detail_md(query_type: &str, resp: &Value) -> Option<DetailDoc> {
@@ -521,9 +538,10 @@ fn render_detail_md(query_type: &str, resp: &Value) -> Option<DetailDoc> {
             })
         }
         "rh_case_details" => {
-            let first = resp
-                .pointer("/data/lst")
-                .and_then(|v| v.as_array())?
+            let data = resp.get("data")?;
+            let first = data
+                .as_array()
+                .or_else(|| data.get("lst").and_then(Value::as_array))?
                 .first()?;
             let content = first.get("content").and_then(|v| v.as_str()).unwrap_or("");
             if content.trim().is_empty() {
@@ -564,6 +582,21 @@ pub(crate) fn persist_detail(
         ) {
             crate::dlog!("local_kb save_detail failed: {}", e);
         }
+        // 新 legal-kb 闭环：法规全文不能只停在 API cache。整部法规详情成功后，
+        // 同步生成 raw/notes 全文 + wiki/sources 来源页 + 最小 index/log，之后
+        // `search_local_kb` 可在主库直接命中，不必再次调用元典。
+        if query_type == "rh_fg_detail" {
+            match crate::local_kb::ingest::ingest_regulation_detail(kb, resp) {
+                Ok(Some(result)) => crate::dlog!(
+                    "元典法规已收口主库: raw={} source={} articles={}",
+                    result.raw_path.display(),
+                    result.source_path.display(),
+                    result.article_count
+                ),
+                Ok(None) => crate::dlog!("元典法规缺名称/正文，未提升到主库"),
+                Err(e) => crate::dlog!("元典法规提升主库失败: {}", e),
+            }
+        }
     } else {
         crate::dlog!("详情渲染不出正文,退回只写 sidecar: {}", query_type);
     }
@@ -594,18 +627,33 @@ pub(crate) fn response_is_empty(query_type: &str, resp: &Value) -> bool {
                 .map(|s| s.trim().is_empty())
                 .unwrap_or(false),
         },
-        // 详情·案例(search 顶替):看 data.lst 是否有案
-        "rh_case_details" => resp
-            .pointer("/data/lst")
-            .and_then(|v| v.as_array())
-            .map(|a| a.is_empty())
-            .unwrap_or(true),
+        // 案例详情当前官方形状为 data 数组；兼容旧版 data.lst 缓存。
+        "rh_case_details" => match resp.get("data") {
+            None | Some(Value::Null) => true,
+            Some(Value::Array(a)) => a.is_empty(),
+            Some(Value::Object(o)) => o
+                .get("lst")
+                .and_then(Value::as_array)
+                .map(|a| a.is_empty())
+                .unwrap_or(true),
+            Some(_) => true,
+        },
         // 顶层 data 数组型搜索(ft/fg/ptal/qwal):空数组 = 空结果
-        "rh_ft_search" | "rh_fg_search" | "rh_ptal_search" | "rh_qwal_search" => resp
-            .get("data")
-            .and_then(|v| v.as_array())
-            .map(|a| a.is_empty())
-            .unwrap_or(false),
+        "rh_ft_search" | "rh_fg_search" => match resp.get("data") {
+            None | Some(Value::Null) => true,
+            Some(Value::Array(a)) => a.is_empty(),
+            Some(_) => false,
+        },
+        "rh_ptal_search" | "rh_qwal_search" => match resp.get("data") {
+            None | Some(Value::Null) => true,
+            Some(Value::Array(a)) => a.is_empty(),
+            Some(Value::Object(o)) => o
+                .get("lst")
+                .and_then(Value::as_array)
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            Some(_) => false,
+        },
         // 语义检索(嵌套形状不一)/ 企业类等 → 保守当非空照存
         _ => false,
     }
@@ -627,9 +675,14 @@ pub(crate) fn try_kb_hit(
     let raw = kb.load_raw_response(query_type, cache_params)?;
     // 缓存里存的是完整响应;喂 LLM 前对搜索类瘦身(与未命中路径 save_and_wrap 同一函数 →
     // 命中/未命中喂给 LLM 的字节一致,前缀缓存照样命中)。解析失败则原样返回(兜底)。
-    let content = serde_json::from_str::<Value>(&raw)
-        .map(|v| content_for_llm(query_type, &v))
-        .unwrap_or(raw);
+    let parsed = serde_json::from_str::<Value>(&raw).ok()?;
+    // 旧版本曾把 HTTP 200 内的 code=401/404/500/501 业务错误写进永久缓存。
+    // 命中时再次校验，失败外壳一律当 miss，绝不把它作为“本地权威结果”返回。
+    let validated = crate::yuandian::validate_business_response(parsed).ok()?;
+    if response_is_empty(query_type, &validated) {
+        return None;
+    }
+    let content = content_for_llm(query_type, &validated);
     Some(ToolResult {
         content,
         yuandian_credits_used: 0,

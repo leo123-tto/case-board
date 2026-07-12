@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use walkdir::WalkDir;
 
 use super::{
     opt_bool, opt_str, opt_u32, require_str, save_and_wrap, try_kb_hit, yuandian_key, Tool,
@@ -43,7 +44,12 @@ impl Tool for SearchLaws {
         let region = opt_str(args, "region").map(String::from);
         let top_k = opt_u32(args, "top_k");
 
-        let cache_params = json!({"keyword": keyword, "top_k": top_k.unwrap_or(20)});
+        let cache_params = json!({
+            "keyword": keyword,
+            "effect_level": effect_level.clone(),
+            "region": region.clone(),
+            "top_k": top_k.unwrap_or(20)
+        });
         if let Some(r) = try_kb_hit(ctx, "rh_ft_search", &cache_params) {
             return Ok(r);
         }
@@ -110,10 +116,42 @@ impl Tool for GetLawArticle {
                 "需要填 id / (fgmc + ftnum) / (fgid + ftnum) 之一".into(),
             ));
         }
-        // V0.2.2 · 法规全文路径(省积分):有 fgid + ftnum 时优先走「整部法规全文缓存 + 按条提取」。
-        // fgid 保证版本正确(按法规名拉会拉错修订版、条号错位致命);提取/拉取失败自动降级到下方单条接口。
+        // local-first 第一层：已知法规名+条号时，先在主库整部法规里精确抽条。
+        // refer_date 是历史时点查询，不能拿未核版本的当前本地副本冒充，故仅当前版本走此路。
+        if refer_date.is_none() {
+            if let (Some(kb), Some(fgmc), Some(ftnum)) =
+                (ctx.local_kb, fgmc.as_deref(), ftnum.as_deref())
+            {
+                if let Some(local) = find_local_law_article(&kb.root, fgmc, ftnum) {
+                    return Ok(ToolResult {
+                        content: serde_json::to_string_pretty(&json!({
+                            "fgmc": fgmc,
+                            "ftnum": ftnum,
+                            "content": local.article,
+                            "local_source": local.relative_path,
+                            "_note": "本地整部法规精确命中，未调用元典"
+                        }))
+                        .unwrap_or(local.article),
+                        yuandian_credits_used: 0,
+                        kb_hit: true,
+                    });
+                }
+            }
+        }
+
+        // 有 fgid 时按 ID 下载整部法规；没有 fgid 但法规名明确时直接按法规名下载整部。
+        // 当前官方计费：法规详情 5 分/次、法条详情 1 分/次。默认整部入库是长期复用策略；
+        // 若整部接口/抽条失败，再降级单条接口，绝不编造。
         if let (Some(fgid), Some(ftnum)) = (fgid.as_deref(), ftnum.as_deref()) {
-            if let Some(r) = try_fulltext_article(ctx, fgid, ftnum, refer_date.as_deref()).await? {
+            if let Some(r) =
+                try_fulltext_article(ctx, Some(fgid), None, ftnum, refer_date.as_deref()).await?
+            {
+                return Ok(r);
+            }
+        } else if let (Some(fgmc), Some(ftnum)) = (fgmc.as_deref(), ftnum.as_deref()) {
+            if let Some(r) =
+                try_fulltext_article(ctx, None, Some(fgmc), ftnum, refer_date.as_deref()).await?
+            {
                 return Ok(r);
             }
         }
@@ -124,11 +162,15 @@ impl Tool for GetLawArticle {
                 ftnum.as_deref().unwrap_or("")
             )
         });
-        let cache_params = json!({"key": cache_key});
+        let cache_params = json!({
+            "key": cache_key,
+            "refer_date": refer_date.as_deref().unwrap_or("")
+        });
         if let Some(r) = try_kb_hit(ctx, "rh_ft_detail", &cache_params) {
             return Ok(r);
         }
         let api_key = yuandian_key(ctx)?;
+        ensure_yuandian_budget(ctx, 1).await?;
         let params = yuandian::FtDetailParams {
             id,
             fgmc,
@@ -149,32 +191,52 @@ impl Tool for GetLawArticle {
 /// V0.2.2 · 法规全文路径:按 `fgid`(法规 ID,保证版本正确)拿整部法规全文,从中按条号提取单条。
 ///
 /// 返回:
-/// - `Ok(Some(单条 ToolResult))` —— 成功提取(本地命中 0 积分 / 拉全文 1 积分,该法规后续条 0 积分)。
+/// - `Ok(Some(单条 ToolResult))` —— 成功提取(本地命中 0 积分 / 拉全文 5 积分,该法规后续条 0 积分)。
 /// - `Ok(None)` —— 无 key / 拉全文失败 / 全文无此条号 → 调用方应**降级到单条接口**(不得编造)。
 ///
 /// 安全网:版本由 `fgid` 保证(绝不按法规名拉,会拉错修订版);提取不到 → None 降级。
 async fn try_fulltext_article(
     ctx: &ToolContext<'_>,
-    fgid: &str,
+    fgid: Option<&str>,
+    fgmc: Option<&str>,
     ftnum: &str,
     refer_date: Option<&str>,
 ) -> Result<Option<ToolResult>, ToolError> {
-    let fg_params = json!({ "key": fgid });
-    // 1) 本地法规全文缓存(直接读 sidecar,按 fgid)
-    let cached: Option<Value> = ctx
-        .local_kb
-        .and_then(|kb| kb.load_raw_response("rh_fg_detail", &fg_params))
-        .and_then(|s| serde_json::from_str(&s).ok());
+    let regulation_key = fgid.or(fgmc).unwrap_or_default();
+    let fg_params = json!({
+        "key": regulation_key,
+        "refer_date": refer_date.unwrap_or("")
+    });
+    // 1) 本地法规全文缓存(按法规 ID/名称 + 时点版本)
+    let cached: Option<Value> = ctx.local_kb.and_then(|kb| {
+        let current = kb.load_raw_response("rh_fg_detail", &fg_params);
+        // 兼容 2026-07-11 前未把 refer_date 放进 key 的永久缓存：当前版本请求可直接复用，
+        // 避免升级后同一部法规再花 5 分；历史时点不能回退旧 key。
+        let body = current.or_else(|| {
+            refer_date
+                .is_none()
+                .then(|| kb.load_raw_response("rh_fg_detail", &json!({"key": regulation_key})))
+                .flatten()
+        });
+        body.and_then(|s| serde_json::from_str(&s).ok())
+    });
     let (resp, hit) = match cached {
-        Some(j) => (j, true),
+        Some(j) => {
+            // 旧缓存首次复用时顺手按新 legal-kb 模板收口主库，不调 API。
+            if let Some(kb) = ctx.local_kb {
+                let _ = crate::local_kb::ingest::ingest_regulation_detail(kb, &j);
+            }
+            (j, true)
+        }
         None => {
             // 2) 未命中 → 按 fgid 拉整部法规全文(版本正确),顺手缓存供后续 0 积分命中
             let Ok(api_key) = yuandian_key(ctx) else {
                 return Ok(None); // 无 key → 降级单条
             };
+            ensure_yuandian_budget(ctx, 5).await?;
             let params = yuandian::FgDetailParams {
-                id: Some(fgid.to_string()),
-                fgmc: None,
+                id: fgid.map(String::from),
+                fgmc: fgmc.map(String::from),
                 refer_date: refer_date.map(String::from),
             };
             match yuandian::fg_detail(api_key, &params).await {
@@ -207,20 +269,122 @@ async fn try_fulltext_article(
                 .pointer("/data/fgmc")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let resolved_fgid = resp
+                .pointer("/data/fgid")
+                .or_else(|| resp.pointer("/data/id"))
+                .and_then(|v| v.as_str())
+                .or(fgid)
+                .unwrap_or("");
             let wrapped = json!({
                 "fgmc": fgmc,
-                "fgid": fgid,
+                "fgid": resolved_fgid,
                 "ftnum": ftnum,
                 "content": article,
             });
             Ok(Some(ToolResult {
                 content: serde_json::to_string_pretty(&wrapped).unwrap_or(article),
-                yuandian_credits_used: if hit { 0 } else { 1 },
+                yuandian_credits_used: if hit { 0 } else { 5 },
                 kb_hit: hit,
             }))
         }
         None => Ok(None), // 全文里没这条号 → 降级单条,绝不编造
     }
+}
+
+async fn ensure_yuandian_budget(ctx: &ToolContext<'_>, cost: u32) -> Result<(), ToolError> {
+    let Some(limit) = ctx.settings.yuandian_monthly_credit_limit else {
+        return Ok(());
+    };
+    let month = crate::db::credits::current_year_month();
+    let remaining = crate::db::credits::get_monthly_remaining(ctx.pool, &month, Some(limit)).await;
+    if remaining < cost as i64 {
+        return Err(ToolError::Runtime(format!(
+            "本月元典积分余额不足：剩余 {}，本次联网预计 {} 分。已完成本地检索但未命中；请调整月度上限后再试。",
+            remaining.max(0),
+            cost
+        )));
+    }
+    Ok(())
+}
+
+struct LocalArticle {
+    article: String,
+    relative_path: String,
+}
+
+/// 在本地主库中定位整部法规并按条号抽取。按法规规范名匹配，优先现行有效、raw/notes
+/// 与元典法规全文；跳过废止归档、搜索片段和只有摘要的 source 页。
+fn find_local_law_article(
+    kb_root: &std::path::Path,
+    law_name: &str,
+    article_no: &str,
+) -> Option<LocalArticle> {
+    let root = kb_root.canonicalize().ok()?;
+    let wanted = crate::local_kb::semantic::normalize_law_name(law_name);
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut best: Option<(i32, LocalArticle)> = None;
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(&root) else {
+            continue;
+        };
+        let rel = relative.to_string_lossy().replace('\\', "/");
+        if rel.contains("_deprecated")
+            || rel.contains("00_ARCHIVE")
+            || rel.starts_with("wiki/sources/")
+            || (rel.starts_with("raw/yuandian-cache/SEARCH-") || rel.ends_with(".raw.json"))
+        {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("md" | "txt")
+        ) {
+            continue;
+        }
+        let normalized = crate::local_kb::semantic::normalize_law_name(file_name);
+        if normalized != wanted && !normalized.contains(&wanted) && !wanted.contains(&normalized) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Some(article) = super::law_fulltext::extract_article(&text, article_no) else {
+            continue;
+        };
+        let mut score = if normalized == wanted { 100 } else { 50 };
+        if text.contains("现行有效") {
+            score += 20;
+        }
+        if rel.starts_with("raw/notes/") {
+            score += 10;
+        } else if rel.starts_with("raw/yuandian-cache/法规-") {
+            score += 8;
+        }
+        let candidate = LocalArticle {
+            article,
+            relative_path: rel,
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((score, candidate));
+        }
+    }
+    best.map(|(_, article)| article)
 }
 
 pub struct SearchRegulations;
@@ -267,6 +431,11 @@ impl Tool for SearchRegulations {
         let cache_params = json!({
             "keyword": keyword.clone().unwrap_or_default(),
             "fgmc": fgmc.clone().unwrap_or_default(),
+            "effect_level": effect_level.clone(),
+            "region": region.clone(),
+            "valid_only": valid_only.unwrap_or(true),
+            "publish_date_start": publish_date_start.clone(),
+            "publish_date_end": publish_date_end.clone(),
             "top_k": top_k.unwrap_or(20),
         });
         if let Some(r) = try_kb_hit(ctx, "rh_fg_search", &cache_params) {
@@ -331,7 +500,11 @@ impl Tool for GetRegulationDetail {
         let cache_key = id
             .clone()
             .unwrap_or_else(|| fgmc.clone().unwrap_or_default());
-        let cache_params = json!({"key": cache_key});
+        let refer_date = opt_str(args, "refer_date").map(String::from);
+        let cache_params = json!({
+            "key": cache_key,
+            "refer_date": refer_date.as_deref().unwrap_or("")
+        });
         if let Some(mut r) = try_kb_hit(ctx, "rh_fg_detail", &cache_params) {
             if !full {
                 r.content = slim_regulation_for_llm(&r.content);
@@ -339,10 +512,11 @@ impl Tool for GetRegulationDetail {
             return Ok(r);
         }
         let api_key = yuandian_key(ctx)?;
+        ensure_yuandian_budget(ctx, 5).await?;
         let params = yuandian::FgDetailParams {
             id,
             fgmc,
-            refer_date: opt_str(args, "refer_date").map(String::from),
+            refer_date,
         };
         let resp = yuandian::fg_detail(api_key, &params).await?;
         // 整部仍缓存本地(供 get_law_article 按条提取);喂 LLM 默认精简。

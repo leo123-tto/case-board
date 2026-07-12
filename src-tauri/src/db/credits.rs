@@ -107,7 +107,7 @@ pub async fn get_monthly_remaining(pool: &SqlitePool, year_month: &str, limit: O
 }
 
 /// 在线元典调用成功后,记一笔。
-/// `credits` 是估算的本次调用费用(普通 1,聚合 5,详 § 5)— 由调用方根据 tool name 决定。
+/// `credits` 是工具结果回传的本次真实目录价；同一工具可能按路由走不同接口，不能只按工具名猜。
 pub async fn record_yuandian_call(
     pool: &SqlitePool,
     year_month: &str,
@@ -167,15 +167,15 @@ pub fn estimate_credits_for(tool: &str) -> u32 {
         | "enterprise_aggregation_summary"  // 企业聚合总览
         | "enterprise_base_info"            // 企业基本信息
         | "enterprise_writ_list"            // 企业涉诉文书列表
-        | "enterprise_annual_report" => 10, // 企业年报详情
+        | "enterprise_annual_report"
+        | "search_laws" => 10, // 法条关键词检索 2026-07 已从旧表 1 调整为 10
         // 5 积分:法规详情 / 案例详情 / 企业变更记录
         "get_regulation_detail"             // 法规详情
+        | "get_law_article"                 // 默认整部法规详情入库；单条降级实际 1 分，以 ToolResult 为准
         | "get_case_detail"                 // 案例详情
         | "enterprise_change_info" => 5,    // 企业变更记录列表
-        // 1 积分:法条关键词检索 / 法条详情 / 企业模糊检索
-        "search_laws"                       // 法条关键词检索
-        | "get_law_article"                 // 法条详情
-        | "enterprise_search" => 1,         // 企业检索
+        // 1 积分:企业模糊检索
+        "enterprise_search" => 1,           // 企业检索
         // 本地工具:0 积分(不应该走 record_yuandian_call,这里兜底)
         _ => 0,
     }
@@ -198,8 +198,9 @@ pub fn credits_for_query_type(query_type: &str) -> u32 {
         | "rh_enterpriseAnnualReport" => 10,
         // 5 积分:法规详情 / 案例详情 / 企业变更
         "rh_fg_detail" | "rh_case_details" | "rh_enterpriseChangeInfo" => 5,
-        // 1 积分:法条关键词 / 法条详情 / 企业模糊检索
-        "rh_ft_search" | "rh_ft_detail" | "rh_enterpriseSearch" => 1,
+        // 1 积分:法条详情 / 企业模糊检索；法条关键词现为 10
+        "rh_ft_detail" | "rh_enterpriseSearch" => 1,
+        "rh_ft_search" => 10,
         // 幻觉校验(若走 save_and_wrap)
         "hall_detect" => 50,
         _ => 0,
@@ -209,7 +210,7 @@ pub fn credits_for_query_type(query_type: &str) -> u32 {
 /// D2-1:按"已落盘的元典原始文件名"估算该次调用积分(执行模块 orchestrator / deep_dive 记账用)。
 ///
 /// 约定(见 yuandian::orchestrator::file_name):`{主体}_{端点}.json` = 一次**计费 API 调用**
-///(`*_aggregation.json` = 聚合摘要 5 积分,其余端点各 1 积分);`.md` = 自然人占位,无 API 调用 → 0。
+///(`*_aggregation.json` = 聚合摘要 10 积分,明细按 5/10 区分);`.md` = 自然人占位,无 API 调用 → 0。
 /// 这样 orchestrator/deep_dive 直接拿返回的 raw_files 列表逐个记账,无需把 pool 穿进底层查询函数。
 pub fn credits_for_raw_file(filename: &str) -> u32 {
     if !filename.ends_with(".json") {

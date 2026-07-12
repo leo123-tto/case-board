@@ -1,6 +1,6 @@
 [package]
 name = "caseboard"
-version = "0.4.7"
+version = "0.4.8"
 description = "案件看板 · CaseBoard"
 authors = ["CaseBoard Contributors"]
 edition = "2021"
@@ -48,6 +48,8 @@ pulldown-cmark = { version = "0.12", default-features = false, features = ["html
 mdns-sd = "0.13"
 sha2 = "0.10"
 hmac = "0.12"
+# 个人设备工作区同步：正文不能像团队登记快照一样只签名明传，跨 Mac/Windows 统一做 AEAD。
+chacha20poly1305 = "0.10"
 # MinerU HTTP API zip 结果解压(2026-05-25 V0.1.10 加,替代 npm 的 mineru-open-api CLI)
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # 2026-06-15 V0.3.18 fix:跨平台 .docx 文本抽取(替代 macOS textutil,Windows/Linux 也能跑)

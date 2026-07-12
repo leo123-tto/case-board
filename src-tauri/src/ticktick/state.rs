@@ -1,8 +1,8 @@
 //! 滴答清单(dida365 / TickTick)双向同步 —— 本地状态。
 //!
 //! **公开功能**。**不建任何 SQLite migration、不碰 settings.rs**:API 口令 / 同步台账 / cutoff
-//! 全落一个本地 JSON 文件 `<app_data_dir>/ticktick_sync.json`(本地运行态,不进 git,
-//! 避开 migration checksum 红线;凭证是用户在滴答设置里生成的「API 口令」,符合密钥铁律)。
+//! 全落一个本地 JSON 文件 `<app_data_dir>/ticktick_sync.json`(不进 git,避开 migration
+//! checksum 红线)。启用个人空间后，该文件作为端到端加密逻辑记录同步；同步账本不保存口令。
 //!
 //! 鉴权走「API 口令」(dida365 设置 → 账户与安全 → API 口令,dp_ 前缀的个人访问令牌),
 //! 直接当 Bearer token 打 `/open/v1/` 接口 —— 免注册开发者应用、免 OAuth 授权、免刷新。

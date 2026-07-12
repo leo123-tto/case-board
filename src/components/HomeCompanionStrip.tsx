@@ -291,9 +291,9 @@ export function HomeCompanionStrip({
           <span className="min-w-0 text-sm leading-snug text-foreground">{greeting.text}</span>
           <span
             className="shrink-0 text-[11px] text-muted-foreground/70"
-            title={greeting.source === "ai" ? "案件助手 · AI 生成" : "案件助手 · 本地兜底"}
+            title={greeting.source === "ai" ? "看板助手 · AI 生成" : "看板助手 · 本地兜底"}
           >
-            案件助手
+            看板助手
           </span>
         </div>
         <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
@@ -314,7 +314,7 @@ export function HomeCompanionStrip({
               title={
                 weather.error ??
                 (!weatherFeedsGreeting && weather.value
-                  ? "天气缓存已过期,不会用于案件助手问候"
+                  ? "天气缓存已过期,不会用于看板助手问候"
                   : undefined)
               }
             >
@@ -324,12 +324,12 @@ export function HomeCompanionStrip({
           <button
             type="button"
             className="inline-flex size-5 items-center justify-center rounded border border-transparent text-muted-foreground/70 transition hover:border-border hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-            title="刷新案件助手"
+            title="刷新看板助手"
             onClick={handleManualRefresh}
             disabled={weatherBusy || greetingRefreshing}
           >
             <RefreshCw className={weatherBusy || greetingRefreshing ? "size-3 animate-spin" : "size-3"} />
-            <span className="sr-only">刷新案件助手</span>
+            <span className="sr-only">刷新看板助手</span>
           </button>
           {showLocationSettingsAction && (
             <button
@@ -391,12 +391,12 @@ function pickCompanionPose({
   weatherBusy: boolean;
   greetingRefreshing: boolean;
 }): { src: string; label: string } {
-  if (weatherBusy || greetingRefreshing) return { src: poseWriting, label: "案件助手正在更新" };
-  if (mode === "urgent") return { src: poseChecklist, label: "案件助手提醒重点事项" };
-  if (mode === "caseload") return { src: poseFiles, label: "案件助手整理案件" };
-  if (mode === "briefcase") return { src: poseBriefcase, label: "案件助手准备出门" };
-  if (mode === "writing") return { src: poseWriting, label: "案件助手记录事项" };
-  return { src: poseNeutral, label: "案件助手值守" };
+  if (weatherBusy || greetingRefreshing) return { src: poseWriting, label: "看板助手正在更新" };
+  if (mode === "urgent") return { src: poseChecklist, label: "看板助手提醒重点事项" };
+  if (mode === "caseload") return { src: poseFiles, label: "看板助手整理案件" };
+  if (mode === "briefcase") return { src: poseBriefcase, label: "看板助手准备出门" };
+  if (mode === "writing") return { src: poseWriting, label: "看板助手记录事项" };
+  return { src: poseNeutral, label: "看板助手值守" };
 }
 
 function companionModeLabel(mode: CompanionMode): string {

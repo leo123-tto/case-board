@@ -85,23 +85,32 @@ fn missing_tool_requirement_warnings(
         TaskType::FreeChat => Vec::new(),
         TaskType::CompileLegalBasis => require_any(
             tool_calls,
-            "缺少法律依据核验: 本任务应至少成功调用 search_laws / get_law_article / law_vector_search 中的一项。",
-            &["search_laws", "get_law_article", "law_vector_search"],
+            "缺少法律依据核验: 本任务应至少成功调用本地知识库全文工具或元典法规工具中的一项。",
+            &[
+                "search_local_kb",
+                "semantic_search_local_kb",
+                "read_kb_file",
+                "search_laws",
+                "get_law_article",
+                "law_vector_search",
+            ],
         ),
         TaskType::FindSimilarCases => {
             let mut warnings = require_any(
                 tool_calls,
-                "缺少类案检索: 本任务应至少成功调用 search_cases_authority / search_cases_normal / case_vector_search 中的一项。",
+                "缺少类案检索: 本任务应至少成功调用本地知识库或元典类案检索工具中的一项。",
                 &[
+                    "search_local_kb",
+                    "semantic_search_local_kb",
                     "search_cases_authority",
                     "search_cases_normal",
                     "case_vector_search",
                 ],
             );
-            warnings.extend(require_tool(
+            warnings.extend(require_any(
                 tool_calls,
-                "缺少类案详情核验: 精选类案应成功调用 get_case_detail 后再评价支持度。",
-                "get_case_detail",
+                "缺少类案详情核验: 精选类案应读取本地全文或调用元典案例详情后再评价支持度。",
+                &["read_kb_file", "get_case_detail"],
             ));
             warnings
         }
@@ -131,6 +140,9 @@ fn missing_tool_requirement_warnings(
                     "search_laws",
                     "get_law_article",
                     "law_vector_search",
+                    "search_local_kb",
+                    "semantic_search_local_kb",
+                    "read_kb_file",
                     "search_cases_authority",
                     "search_cases_normal",
                     "case_vector_search",
@@ -146,8 +158,15 @@ fn missing_tool_requirement_warnings(
             );
             warnings.extend(require_any(
                 tool_calls,
-                "缺少法条核验: 深度分析引用法条前应至少成功调用 search_laws / get_law_article / law_vector_search 中的一项。",
-                &["search_laws", "get_law_article", "law_vector_search"],
+                "缺少法条核验: 深度分析引用法条前应至少成功调用本地知识库全文工具或元典法规工具中的一项。",
+                &[
+                    "search_local_kb",
+                    "semantic_search_local_kb",
+                    "read_kb_file",
+                    "search_laws",
+                    "get_law_article",
+                    "law_vector_search",
+                ],
             ));
             warnings
         }

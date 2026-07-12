@@ -54,7 +54,14 @@ impl TaskContract {
             TaskType::CompileLegalBasis => Self {
                 task,
                 name: "法律依据清单",
-                required_tools: &["search_laws", "get_law_article", "law_vector_search"],
+                required_tools: &[
+                    "search_local_kb",
+                    "read_kb_file",
+                    "semantic_search_local_kb",
+                    "search_laws",
+                    "get_law_article",
+                    "law_vector_search",
+                ],
                 citation_policy: CitationPolicy::RequiredForLegalConclusion,
                 ask_user_policy: AskUserPolicy::Optional,
                 artifact_policy: ArtifactPolicy::Optional,
@@ -69,6 +76,9 @@ impl TaskContract {
                 task,
                 name: "类案检索",
                 required_tools: &[
+                    "search_local_kb",
+                    "semantic_search_local_kb",
+                    "read_kb_file",
                     "search_cases_authority",
                     "search_cases_normal",
                     "case_vector_search",
@@ -78,7 +88,7 @@ impl TaskContract {
                 ask_user_policy: AskUserPolicy::Optional,
                 artifact_policy: ArtifactPolicy::Optional,
                 success_criteria: &[
-                    "至少对精选类案取详情后再评价支持度,不得只根据标题或摘要下结论",
+                    "至少读取精选类案的本地全文或元典详情后再评价支持度,不得只根据标题或摘要下结论",
                     "类案支持度必须锚定我方代理立场,说明支持、不利或中性的理由",
                     "地域相似性只是排序因素,不能替代核心要件相似性分析",
                 ],
@@ -102,6 +112,9 @@ impl TaskContract {
                 required_tools: &[
                     "list_case_docs",
                     "read_case_doc",
+                    "search_local_kb",
+                    "semantic_search_local_kb",
+                    "read_kb_file",
                     "search_laws",
                     "get_law_article",
                     "search_cases_normal",
@@ -121,6 +134,9 @@ impl TaskContract {
                 required_tools: &[
                     "list_case_docs",
                     "read_case_doc",
+                    "search_local_kb",
+                    "semantic_search_local_kb",
+                    "read_kb_file",
                     "search_laws",
                     "get_law_article",
                     "ask_user",
@@ -141,6 +157,9 @@ impl TaskContract {
                 required_tools: &[
                     "list_case_docs",
                     "read_case_doc",
+                    "search_local_kb",
+                    "semantic_search_local_kb",
+                    "read_kb_file",
                     "search_laws",
                     "get_law_article",
                     "ask_user",
@@ -187,6 +206,9 @@ impl TaskContract {
         out.push_str(&format!("- 引用要求: {}\n", citation));
         out.push_str(&format!("- 追问要求: {}\n", ask_user));
         out.push_str(&format!("- 成果形态: {}\n", artifact));
+        out.push_str(
+            "- 可视化工具: get_case_visualization 可读取现状；save_case_visualization / propose_case_visual_update 写入前须先取得用户同意\n",
+        );
         out.push_str("- 成功标准:\n");
         for item in self.success_criteria {
             out.push_str(&format!("  - {}\n", item));

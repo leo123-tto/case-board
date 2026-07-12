@@ -22,6 +22,7 @@ import {
   BookText,
   SlidersHorizontal,
   User,
+  Palette,
 } from "lucide-react";
 import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
 import { confirmDialog } from "@/lib/dialog";
@@ -31,13 +32,16 @@ import { Button } from "@/components/ui/button";
 import { HoverHint } from "@/components/HoverHint";
 import { GroupQrCode } from "@/components/GroupQrCode";
 import { KbSemanticIndexCard } from "@/components/KbSemanticIndexCard";
+import { DeviceSyncCard } from "@/components/DeviceSyncCard";
 import {
   createLocalKb,
   detectKbStatus,
   exportKbToZip,
   getSettings,
+  getYuandianBalance,
   getYuandianCreditsOverview,
   importKbFromZip,
+  migrateLocalKb,
   pruneYuandianCache,
   openInDefaultApp,
   openUrl,
@@ -55,6 +59,7 @@ import {
   type KbImportResult,
   type KbStatus,
   type CreditsOverview,
+  type YuandianBalance,
 } from "@/lib/api";
 import type { Settings, McpServerConfig } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -65,9 +70,15 @@ import {
   type FeatureFlagName,
 } from "@/lib/featureFlags";
 import { FONT_SCALE, useFontScale } from "@/lib/uiScale";
+import {
+  THEMES,
+  getThemePreference,
+  setThemePreference,
+  type ThemeId,
+} from "@/lib/theme";
 
 type VerifyStatus = "idle" | "verifying" | "ok" | "fail";
-type CompatBackend = "glm" | "mimo" | "custom";
+type CompatBackend = "glm" | "mimo" | "kimi" | "custom";
 type CompatSettingKey =
   | "glm_llm_endpoint"
   | "glm_llm_model"
@@ -77,6 +88,10 @@ type CompatSettingKey =
   | "mimo_llm_model"
   | "mimo_llm_api_key"
   | "mimo_llm_verified_at"
+  | "kimi_llm_endpoint"
+  | "kimi_llm_model"
+  | "kimi_llm_api_key"
+  | "kimi_llm_verified_at"
   | "custom_llm_endpoint"
   | "custom_llm_model"
   | "custom_llm_api_key"
@@ -89,6 +104,7 @@ const CLOUD_BACKEND_OPTIONS = [
   { id: "minimax", label: "MiniMax(M 系列)" },
   { id: "glm", label: "智谱 GLM(OpenAI 兼容)" },
   { id: "mimo", label: "小米 MiMo(OpenAI 兼容)" },
+  { id: "kimi", label: "Kimi Coding Plan(OpenAI 兼容)" },
   { id: "custom", label: "自定义(OpenAI 兼容)" },
 ] as const;
 
@@ -107,6 +123,12 @@ const COMPAT_PRESETS: Record<
     label: "小米 MiMo",
     endpoint: "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
     model: "mimo-v2.5",
+  },
+  kimi: {
+    label: "Kimi Coding Plan",
+    endpoint: "https://api.kimi.com/coding/v1/chat/completions",
+    model: "kimi-for-coding",
+    applyUrl: "https://www.kimi.com/code/console",
   },
   custom: { label: "自定义(OpenAI 兼容)", endpoint: "", model: "" },
 };
@@ -132,6 +154,12 @@ const COMPAT_FIELD_KEYS: Record<
     apiKey: "mimo_llm_api_key",
     verifiedAt: "mimo_llm_verified_at",
   },
+  kimi: {
+    endpoint: "kimi_llm_endpoint",
+    model: "kimi_llm_model",
+    apiKey: "kimi_llm_api_key",
+    verifiedAt: "kimi_llm_verified_at",
+  },
   custom: {
     endpoint: "custom_llm_endpoint",
     model: "custom_llm_model",
@@ -141,7 +169,7 @@ const COMPAT_FIELD_KEYS: Record<
 };
 
 function isCompatBackend(value: string | null | undefined): value is CompatBackend {
-  return value === "glm" || value === "mimo" || value === "custom";
+  return value === "glm" || value === "mimo" || value === "kimi" || value === "custom";
 }
 
 function compatValue(
@@ -188,6 +216,7 @@ function setStringSetting(
 
 /** 设置页底部标签页(按类型归拢散乱配置;详见 docs/设置页重构-分类方案-2026-06-16.md) */
 export type SettingsTab =
+  | "theme" // 主题:界面配色，独立于功能开关
   | "brain" // 大脑:对话大模型
   | "models" // 功能模型:OCR / Embedding 等调云端 API 的工具型模型
   | "kb" // 知识库:本地法律知识库 + 语义索引
@@ -197,6 +226,7 @@ export type SettingsTab =
 
 const SETTINGS_TABS: { id: SettingsTab; label: string; icon: typeof Brain }[] = [
   { id: "general", label: "通用", icon: User },
+  { id: "theme", label: "主题", icon: Palette },
   { id: "brain", label: "大脑", icon: Brain },
   { id: "models", label: "功能模型", icon: Wrench },
   { id: "kb", label: "知识库", icon: BookText },
@@ -327,6 +357,7 @@ export function SettingsModal({
     settings?.compat_llm_verified_at,
     settings?.glm_llm_verified_at,
     settings?.mimo_llm_verified_at,
+    settings?.kimi_llm_verified_at,
     settings?.custom_llm_verified_at,
     settings?.yuandian_verified_at,
   ]);
@@ -756,6 +787,11 @@ export function SettingsModal({
             >
               {/* ── 通用:界面字号(放最前,字小问题最常见)── */}
               {tab === "general" && <FontScaleCard />}
+
+              {tab === "theme" && <ThemeCard />}
+
+              {/* 默认关闭；打开后才展示配对/同步操作。Mac 与 Windows 共用同一套 LAN 协议。 */}
+              {tab === "general" && <DeviceSyncCard />}
 
               {/* ── 通用:个人信息 ── */}
               {tab === "general" && (
@@ -1252,8 +1288,8 @@ export function SettingsModal({
                   </Section>
                   )}
 
-                  {/* ── 通用 OpenAI 兼容后端(GLM / MiMo / 自定义)── */}
-                  {["glm", "mimo", "custom"].includes(
+                  {/* ── 通用 OpenAI 兼容后端(GLM / MiMo / Kimi / 自定义)── */}
+                  {["glm", "mimo", "kimi", "custom"].includes(
                     settings.cloud_llm_backend ?? "",
                   ) &&
                     (() => {
@@ -1339,22 +1375,39 @@ export function SettingsModal({
                           </Field>
                           <Field
                             label="模型名"
-                            hint="具体型号,以服务商控制台为准(如 glm-4.6 / mimo-v2.5)"
+                            hint={
+                              cur === "kimi"
+                                ? "标准版适合日常使用；高速版需要对应会员档位"
+                                : "具体型号,以服务商控制台为准(如 glm-4.6 / mimo-v2.5)"
+                            }
                           >
-                            <input
-                              type="text"
-                              value={model}
-                              onChange={(e) => {
-                                updateField(
-                                  keys.model,
-                                  e.target.value || null,
-                                );
-                                onConfigChange();
-                              }}
-                              placeholder="如 glm-4.6"
-                              className={inputCls}
-                              autoComplete="off"
-                            />
+                            {cur === "kimi" ? (
+                              <select
+                                value={model || preset.model}
+                                onChange={(e) => {
+                                  updateField(keys.model, e.target.value);
+                                  onConfigChange();
+                                }}
+                                className={inputCls}
+                              >
+                                <option value="kimi-for-coding">Kimi for Coding(标准版)</option>
+                                <option value="kimi-for-coding-highspeed">
+                                  Kimi for Coding HighSpeed(高速版)
+                                </option>
+                              </select>
+                            ) : (
+                              <input
+                                type="text"
+                                value={model}
+                                onChange={(e) => {
+                                  updateField(keys.model, e.target.value || null);
+                                  onConfigChange();
+                                }}
+                                placeholder="如 glm-4.6"
+                                className={inputCls}
+                                autoComplete="off"
+                              />
+                            )}
                           </Field>
                           <Field
                             label="接口地址"
@@ -1454,6 +1507,7 @@ export function SettingsModal({
               {/* ── 数据源:元典积分账(本月统计)── */}
               {tab === "datasource" && (
               <YuandianCreditsCard
+                hasApiKey={!!settings.yuandian_api_key?.trim()}
                 monthlyLimit={settings.yuandian_monthly_credit_limit ?? null}
                 onLimitChange={(n) =>
                   updateField("yuandian_monthly_credit_limit", n)
@@ -1511,12 +1565,11 @@ export function SettingsModal({
             </>
           )}
 
-          {/* 作者署名(不写具体律所名 —— 其他律所用户会担心数据流向某家律所;
-              保留"执业律师"身份作为信任背书,见产品定位"护城河=律师身份") */}
+          {/* 开源版仅展示项目署名，不在应用设置中嵌入个人或律所身份。 */}
           <div className="mt-2 border-t border-border pt-5 text-center">
-            <p className="text-sm font-medium text-foreground">刘成 律师</p>
+            <p className="text-sm font-medium text-foreground">CaseBoard 项目</p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              一线执业律师 · 个人开发
+              开源社区维护
             </p>
           </div>
         </div>
@@ -1862,6 +1915,73 @@ function FontScaleCard() {
         <p className="rounded-md bg-muted/40 px-3 py-2 text-xs text-foreground">
           示例:这行字会随缩放即时变大变小,调到看着舒服为止。
         </p>
+      </div>
+    </Section>
+  );
+}
+
+function ThemeCard() {
+  const [theme, setTheme] = useState<ThemeId>(() => getThemePreference());
+
+  function chooseTheme(next: ThemeId) {
+    setTheme(next);
+    setThemePreference(next);
+  }
+
+  return (
+    <Section
+      title="界面主题"
+      desc="仅改变本机界面配色，不影响案件数据。默认主题保持不变，后续可继续增加其他主题。"
+      fill
+    >
+      <div className="grid gap-3 sm:grid-cols-2">
+        {THEMES.map((item) => {
+          const active = item.id === theme;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => chooseTheme(item.id)}
+              aria-pressed={active}
+              className={cn(
+                "rounded-lg border p-3 text-left transition-colors",
+                active
+                  ? "border-brand/40 bg-brand-soft/70 ring-1 ring-brand/15"
+                  : "border-border bg-card hover:bg-accent/50",
+              )}
+            >
+              <span className="mb-3 flex gap-1.5" aria-hidden="true">
+                <span
+                  className={cn(
+                    "size-5 rounded-full border",
+                    item.id === "default"
+                      ? "border-slate-300 bg-slate-100"
+                      : "border-emerald-800 bg-[#f3f0e4]",
+                  )}
+                />
+                <span
+                  className={cn(
+                    "size-5 rounded-full",
+                    item.id === "default" ? "bg-slate-700" : "bg-emerald-900",
+                  )}
+                />
+                <span
+                  className={cn(
+                    "size-5 rounded-full",
+                    item.id === "default" ? "bg-slate-300" : "bg-emerald-200",
+                  )}
+                />
+              </span>
+              <span className="flex items-center justify-between gap-2">
+                <span className="text-sm font-semibold">{item.label}</span>
+                {active && <CheckCircle2 className="size-4 text-brand" />}
+              </span>
+              <span className="mt-1 block text-xs text-muted-foreground">
+                {item.description}
+              </span>
+            </button>
+          );
+        })}
       </div>
     </Section>
   );
@@ -2377,6 +2497,34 @@ function LocalKbCard({
     }
   }
 
+  async function handleMigrate() {
+    if (status?.state !== "bound") return;
+    setError(null);
+    try {
+      const picked = await dialogOpen({ directory: true, multiple: false });
+      if (typeof picked !== "string" || !picked.trim()) return;
+      const ok = await confirmDialog(
+        `将当前知识库完整复制到：\n${picked}\n\n复制完成并核对文件数、字节数后才会切换目录；原目录会保留，不会删除。目标目录必须为空。`,
+        { title: "一键迁移知识库", okLabel: "开始迁移" },
+      );
+      if (!ok) return;
+      setBusy(true);
+      setBusyMsg("正在复制并校验知识库…");
+      const result = await migrateLocalKb(picked);
+      onKbRootChange(result.target);
+      onKbEnabledChange(true);
+      setBusyMsg(
+        `迁移完成 · ${result.files_copied} 个文件 · ${formatBytes(result.bytes_copied)}；原目录已保留`,
+      );
+      await refresh();
+    } catch (e) {
+      setError(formatErr(e));
+    } finally {
+      setBusy(false);
+      window.setTimeout(() => setBusyMsg(""), 7000);
+    }
+  }
+
   async function handleCreate(path: string) {
     setBusy(true);
     setBusyMsg("创建中…");
@@ -2522,6 +2670,28 @@ function LocalKbCard({
                 <FolderOpen className="size-3.5" />
                 打开目录
               </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={handleChoosePath}
+                disabled={busy}
+              >
+                <FolderOpen className="size-3.5" />
+                更换目录
+              </Button>
+              <HoverHint hint="复制全部知识库资料到空目录，校验成功后自动切换；原目录保留，不会删除">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={handleMigrate}
+                  disabled={busy}
+                >
+                  <RefreshCw className="size-3.5" />
+                  一键迁移
+                </Button>
+              </HoverHint>
               <HoverHint hint="导入同事的元典缓存资料包,自动查重合并;只合并元典缓存,不碰你的笔记/案件/客户">
                 <Button
                   type="button"
@@ -2761,26 +2931,49 @@ function KbStatsRow({
 }
 
 function YuandianCreditsCard({
+  hasApiKey,
   monthlyLimit,
   onLimitChange,
 }: {
+  hasApiKey: boolean;
   monthlyLimit: number | null;
   onLimitChange: (n: number | null) => void;
 }) {
   const [overview, setOverview] = useState<CreditsOverview | null>(null);
+  const [balance, setBalance] = useState<YuandianBalance | null>(null);
   const [loading, setLoading] = useState(false);
+  const [balanceError, setBalanceError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    setBalanceError(null);
     try {
-      const o = await getYuandianCreditsOverview();
-      setOverview(o);
-    } catch {
-      // 静默 — 元典没用过时也可能是 0,无所谓
+      try {
+        setOverview(await getYuandianCreditsOverview());
+      } catch {
+        // 本机账从未使用或数据库暂不可用时保持空态。
+      }
+      if (hasApiKey) {
+        try {
+          const b = await getYuandianBalance(true);
+          setBalance(b);
+          if (b?.refresh_error) setBalanceError(b.refresh_error);
+        } catch (e) {
+          setBalanceError(formatErr(e));
+          // 余额失败不影响本机月账；尽力读最后一次缓存。
+          try {
+            setBalance(await getYuandianBalance(false));
+          } catch {
+            // 无缓存时保持空态。
+          }
+        }
+      } else {
+        setBalance(null);
+      }
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [hasApiKey]);
 
   useEffect(() => {
     refresh();
@@ -2793,17 +2986,42 @@ function YuandianCreditsCard({
   // 跨月归 0:当月没用过但历史有数据 → 补显示上月/累计,免得以为数据丢了
   const showHistory =
     (cur?.credits_used ?? 0) === 0 && (overview?.total_credits ?? 0) > 0;
+  const comparisonText = (() => {
+    if (!hasApiKey) return "配置并保存元典 API Key 后，可免费查询官方剩余积分。";
+    if (!balance) return loading ? "正在查询元典 MCP 官方余额…" : "尚未取得余额。";
+    const official = balance.official_spent_since_previous ?? 0;
+    const local = balance.local_recorded_since_previous ?? 0;
+    switch (balance.comparison_status) {
+      case "matched":
+        return `与上次快照相比，官方余额减少 ${official} 积分，本机记录 ${local} 积分，对账一致。`;
+      case "difference": {
+        const diff = balance.difference ?? 0;
+        return diff > 0
+          ? `本区间官方余额减少 ${official}，本机记录 ${local}，相差 ${diff} 积分；通常表示还有其他客户端调用，或存在尚未纳入本机账的接口。`
+          : `本区间官方余额减少 ${official}，本机记录 ${local}，本机多记 ${Math.abs(diff)} 积分；可能存在返还、计价变化或刷新时点差。`;
+      }
+      case "recharged":
+        return `余额较上次增加 ${balance.balance_increased_since_previous ?? 0} 积分，可能发生充值或赠送；本区间不比较消耗。`;
+      case "local_reset":
+        return "本机积分账曾被清理或重置，本区间不作差额判断。";
+      default:
+        return "已建立官方余额基线；下次刷新时开始对比余额减少量与本机记账。";
+    }
+  })();
+  const fetchedTime = balance
+    ? new Date(balance.fetched_at).toLocaleString("zh-CN", { hour12: false })
+    : null;
 
   return (
     <Section
       title="元典积分账"
-      desc="本月已用积分 / 本地 KB 帮你省了多少次外查"
+      desc="MCP 官方余额 + CaseBoard 本机消耗账 + 本地 KB 节省"
     >
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <Stat
           icon={<Coins className="size-4 text-amber-600" />}
-          label={`本月已用(${cur?.year_month ?? "—"})`}
-          value={cur?.credits_used ?? 0}
+          label="元典官方剩余"
+          value={balance ? balance.point_balance.toLocaleString("zh-CN") : "—"}
           suffix="积分"
           right={
             <Button
@@ -2811,12 +3029,18 @@ function YuandianCreditsCard({
               size="sm"
               variant="ghost"
               onClick={refresh}
-              disabled={loading}
-              title="刷新"
+              disabled={loading || !hasApiKey}
+              title="刷新官方余额和本机账"
             >
               <RefreshCw className={cn("size-3", loading && "animate-spin")} />
             </Button>
           }
+        />
+        <Stat
+          icon={<Database className="size-4 text-sky-600" />}
+          label={`本月已用(${cur?.year_month ?? "—"})`}
+          value={cur?.credits_used ?? 0}
+          suffix="积分"
         />
         <Stat
           icon={<Database className="size-4 text-emerald-600" />}
@@ -2825,6 +3049,22 @@ function YuandianCreditsCard({
           suffix={`次 (命中率 ${kbHitRate}%)`}
         />
       </div>
+      <p className="text-caption text-muted-foreground">
+        {comparisonText}
+        {balance?.count_balance
+          ? ` 另有 ${balance.count_balance} 次权益余额。`
+          : ""}
+        {fetchedTime ? ` · 余额更新于 ${fetchedTime}` : ""}
+        {balance?.cached ? "（当前显示缓存）" : ""}
+      </p>
+      {balanceError && (
+        <p className="-mt-1 rounded-md bg-amber-50 px-2.5 py-1.5 text-caption text-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
+          官方余额刷新失败，已保留本机账和最后一次余额：{balanceError}
+        </p>
+      )}
+      <p className="-mt-1 text-caption text-muted-foreground">
+        本月记录 {cur?.api_calls ?? 0} 次在线调用；本机账按实际端点目录价累计。余额差额可能包含其他 MCP/客户端调用、充值赠送及平台计价变化，不会自动改写本机账。
+      </p>
       {showHistory && (
         <p className="-mt-1 rounded-md bg-sky-50 px-2.5 py-1.5 text-caption text-sky-700 dark:bg-sky-950/30 dark:text-sky-300">
           本月暂未使用(每月 1 号归零)。

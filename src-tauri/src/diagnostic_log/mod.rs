@@ -14,11 +14,15 @@
 //! 也不用跟 tokio runtime 抢 subscriber 所有权。
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::{mpsc, Mutex, OnceLock};
 
 const RING_CAPACITY: usize = 200;
+const RUNTIME_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const FILE_QUEUE_CAPACITY: usize = 1024;
 
 static RING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static FILE_LOG_SENDER: OnceLock<mpsc::SyncSender<(String, String)>> = OnceLock::new();
 
 /// 推一条日志进 ring buffer。同时 `eprintln!` 到原 stderr(开发时仍可见)。
 ///
@@ -27,13 +31,55 @@ pub fn push_log(line: String) {
     // 先脱敏(路径里可能含当事人姓名)
     let safe = crate::feedback::sanitize_paths(&line);
     eprintln!("{}", safe);
+    let ts = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string();
     if let Ok(mut g) = RING.lock() {
         if g.len() >= RING_CAPACITY {
             g.pop_front();
         }
-        let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
-        g.push_back(format!("[{}] {}", ts, safe));
+        g.push_back(format!("[{}] {}", &ts[11..], safe));
     }
+    // 文件 IO 在专用线程串行执行；队列满时只丢文件副本，不阻塞业务线程，内存 ring 仍保留。
+    let _ = runtime_log_sender().try_send((ts, safe));
+}
+
+fn runtime_log_sender() -> &'static mpsc::SyncSender<(String, String)> {
+    FILE_LOG_SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<(String, String)>(FILE_QUEUE_CAPACITY);
+        let _ = std::thread::Builder::new()
+            .name("caseboard-runtime-log".into())
+            .spawn(move || {
+                while let Ok((timestamp, line)) = receiver.recv() {
+                    let Ok(base) = crate::db::app_data_dir() else {
+                        continue;
+                    };
+                    let _ = append_runtime_log_at(&base.join("logs"), &timestamp, &line);
+                }
+            });
+        sender
+    })
+}
+
+fn append_runtime_log_at(dir: &Path, timestamp: &str, line: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("caseboard.log");
+    if std::fs::metadata(&path)
+        .map(|metadata| metadata.len() >= RUNTIME_LOG_MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let backup = dir.join("caseboard.log.1");
+        if backup.exists() {
+            std::fs::remove_file(&backup)?;
+        }
+        std::fs::rename(&path, backup)?;
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "[{}] {}", timestamp, line)
 }
 
 /// 拿当前 ring buffer 快照(给反馈 MD 用)。

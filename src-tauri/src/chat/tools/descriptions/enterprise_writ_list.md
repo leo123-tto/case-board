@@ -21,6 +21,6 @@ enterprise_writ_list — 涉诉文书完整列表(案号 / 案由 / 法院 / 日
 - 返回字段:`[{ah(案号), title, court, case_type, judge_date, party_role}]`
   - **party_role**:本企业在该案中是「原告 / 被告 / 第三人」
 - 拿到案号后,**精选 3-5 个** 最相关的(优先看 case_type = 「执行」「破产」+ 近 2 年),用 `get_case_detail` 拿全文
-- **本工具 1 积分** × 翻页次数;`get_case_detail` 每个文书 1 积分
+- **本工具 10 积分** × 翻页次数；`get_case_detail` 每次 5 积分，先看摘要再决定取全文
 - LLM **不要把 50 个案号全列给用户**,挑最有代表性 / 最新的报告;海量列表只在用户明确要求「列出所有案件」时全展开
 - `<CITATIONS>` 标 `type: "enterprise"`,title 写企业名 + 「(涉诉文书)」

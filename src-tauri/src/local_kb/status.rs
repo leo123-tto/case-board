@@ -138,35 +138,43 @@ fn read_index_stats(kb: &LocalKb) -> (u64, serde_json::Value) {
     (count, serde_json::to_value(breakdown).unwrap_or_default())
 }
 
-/// 数可检索内容篇数。范围跟 `search::default_scopes` 一致(raw/notes + raw/companies +
-/// wiki/sources + wiki/topics + gap-log,**不含** yuandian-cache),只数 `.md` / `.txt`。
+/// 数可检索内容篇数。范围跟 `search::default_scopes` 一致：整根 KB 的 `.md/.txt`，
+/// 排除元典缓存与技术目录；自建分类也计入。
 /// 给 Settings 卡片区分"已检索内容"和"元典缓存",避免只显缓存数误导用户。
 fn count_content_files(root: &std::path::Path) -> u64 {
     use walkdir::WalkDir;
-    let mut n: u64 = 0;
-    for dir in ["raw/notes", "raw/companies", "wiki/sources", "wiki/topics"] {
-        let target = root.join(dir);
-        if !target.exists() {
+    let mut n = 0u64;
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let p = entry.path();
+        if !p.is_file() {
             continue;
         }
-        for entry in WalkDir::new(&target)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
+        let rel = p
+            .strip_prefix(root)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if rel.starts_with("raw/yuandian-cache/")
+            || rel.split('/').any(|seg| {
+                matches!(
+                    seg,
+                    ".git" | "node_modules" | "target" | "dist" | "__MACOSX"
+                )
+            })
         {
-            let p = entry.path();
-            let ext_ok = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| matches!(e.to_lowercase().as_str(), "md" | "txt"))
-                .unwrap_or(false);
-            if p.is_file() && ext_ok {
-                n += 1;
-            }
+            continue;
         }
-    }
-    if root.join("gap-log.md").is_file() {
-        n += 1;
+        let ext_ok = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| matches!(e.to_lowercase().as_str(), "md" | "txt"))
+            .unwrap_or(false);
+        if ext_ok {
+            n += 1;
+        }
     }
     n
 }

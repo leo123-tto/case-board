@@ -130,7 +130,7 @@ pub fn build_non_stream_chat_body_with_response_format(
     let mut body = json!({
         "model": model,
         "messages": messages,
-        "temperature": temperature,
+        "temperature": capability.normalize_temperature(temperature),
         "stream": false,
     });
     match capability.output_token_param {
@@ -172,34 +172,99 @@ pub async fn complete_non_stream_chat(
         .build()
         .map_err(|e| LlmGatewayError::new(LlmGatewayErrorKind::Network, e.to_string()))?;
 
-    let mut req = client.post(&config.endpoint).json(&body);
-    if let Some(key) = config
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req.send().await.map_err(|e| {
-        if e.is_timeout() {
-            LlmGatewayError::new(LlmGatewayErrorKind::Timeout, e.to_string())
-        } else {
-            LlmGatewayError::new(LlmGatewayErrorKind::Network, e.to_string())
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_error = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut req = client.post(&config.endpoint).json(&body);
+        if let Some(key) = config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            req = req.bearer_auth(key);
         }
-    })?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(LlmGatewayError::http(status.as_u16(), body));
-    }
 
-    let value = response
-        .json::<Value>()
-        .await
-        .map_err(|e| LlmGatewayError::new(LlmGatewayErrorKind::ResponseFormat, e.to_string()))?;
-    parse_non_stream_chat_response(value)
+        let response = match req.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let mapped = if error.is_timeout() {
+                    LlmGatewayError::new(LlmGatewayErrorKind::Timeout, error.to_string())
+                } else {
+                    LlmGatewayError::new(LlmGatewayErrorKind::Network, error.to_string())
+                };
+                if attempt + 1 >= MAX_ATTEMPTS {
+                    return Err(mapped);
+                }
+                last_error = Some(mapped);
+                sleep_before_retry(attempt, None).await;
+                continue;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = retry_after_seconds(response.headers());
+            let error_body = response.text().await.unwrap_or_default();
+            let error = LlmGatewayError::http(status.as_u16(), error_body.clone());
+            let retryable = status.as_u16() == 429 || status.is_server_error();
+            // 余额/总额度耗尽不是瞬时限流，等待只会拖慢并重复失败。
+            if !retryable || is_quota_exhausted(&error_body) || attempt + 1 >= MAX_ATTEMPTS {
+                return Err(error);
+            }
+            last_error = Some(error);
+            sleep_before_retry(attempt, retry_after).await;
+            continue;
+        }
+
+        let value = response.json::<Value>().await.map_err(|e| {
+            LlmGatewayError::new(LlmGatewayErrorKind::ResponseFormat, e.to_string())
+        })?;
+        return parse_non_stream_chat_response(value);
+    }
+    Err(last_error.unwrap_or_else(|| {
+        LlmGatewayError::new(
+            LlmGatewayErrorKind::ProviderUnavailable,
+            "LLM 重试次数已用尽",
+        )
+    }))
+}
+
+fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| seconds.min(30))
+}
+
+fn is_quota_exhausted(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    [
+        "insufficient balance",
+        "balance insufficient",
+        "insufficient quota",
+        "quota exceeded",
+        "usage limit",
+        "credit balance",
+        "余额不足",
+        "额度不足",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+async fn sleep_before_retry(attempt: u32, retry_after_secs: Option<u64>) {
+    let delay = retry_after_secs
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| {
+            std::time::Duration::from_millis((500u64.saturating_mul(1 << attempt)).min(4_000))
+        });
+    crate::dlog!(
+        "[llm gateway] 瞬时失败，第 {}/3 次请求后等待 {}ms 重试",
+        attempt + 1,
+        delay.as_millis()
+    );
+    tokio::time::sleep(delay).await;
 }
 
 fn parse_non_stream_chat_response(value: Value) -> Result<NonStreamChatOutput, LlmGatewayError> {

@@ -310,18 +310,9 @@ pub async fn verify_openai_compat_key(api_key: &str, endpoint: &str, model: &str
 
 /// 验证元典(open.chineselaw.com)API key。
 ///
-/// 两段探测:
-///   1. `GET /rh_enterpriseSearch?name=test&top_k=1` — 基础企业接口(老套餐就有)
-///   2. `POST /hall_detect {"text":"《民法典》第1条"}` — V0.2 chat 依赖的法律幻觉校验
-///      (新套餐才解锁,V0.2 实施时加这一步预先暴露套餐问题)
-///
-/// 判定:
-///   - 1 失败 → fail(基础接口都不通,key 大概率失效)
-///   - 1 ok + 2 ok → ok
-///   - 1 ok + 2 失败(401/403)→ fail(套餐没解锁 hall_detect,chat 功能受限)
-///   - 1 ok + 2 失败(其他错误)→ ok + 服务侧异常,不让用户卡在这
-///
-/// 注意:元典 key 格式 `sk_` 开头(注意是下划线,不是 DeepSeek 的 sk-)。
+/// 2026-07-12 起改用 `yuandian-law` MCP 自带的免费余额工具验证。旧版会先调 1 分
+/// 企业搜索、再调 50 分 hall_detect，单点一次「验证」就可能浪费 51 分；余额工具既能
+/// 证明 Bearer key 有效，又不消费法律业务接口积分。
 pub async fn verify_yuandian_key(api_key: &str) -> VerifyResult {
     let api_key = api_key.trim();
     if api_key.is_empty() {
@@ -331,78 +322,18 @@ pub async fn verify_yuandian_key(api_key: &str) -> VerifyResult {
         return VerifyResult::fail("格式不像元典 API key(应以 sk_ 开头,注意是下划线)");
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return VerifyResult::fail(format!("HTTP 客户端创建失败: {}", e)),
-    };
-
-    // === 第 1 段:基础企业搜索 ===
-    let resp = match client
-        .get("https://open.chineselaw.com/open/rh_enterpriseSearch")
-        .header("X-Api-Key", api_key)
-        .header("accept", "application/json;charset=UTF-8")
-        .query(&[("name", "test"), ("top_k", "1")])
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return VerifyResult::fail(format!("网络错误: {}", e)),
-    };
-
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-
-    if !status.is_success() {
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return VerifyResult::fail("API Key 无效或已禁用");
-        }
-        return VerifyResult::fail(format!(
-            "HTTP {} · {}",
-            status.as_u16(),
-            body.chars().take(200).collect::<String>()
-        ));
-    }
-    if body.contains("\"code\":401") {
-        return VerifyResult::fail("API Key 无效或已禁用(元典 code:401)");
-    }
-
-    // === 第 2 段:V0.2 hall_detect 套餐探测(失败不一定让整个验证 fail) ===
-    let hall_resp = client
-        .post("https://open.chineselaw.com/open/hall_detect")
-        .header("X-Api-Key", api_key)
-        .header("accept", "application/json;charset=UTF-8")
-        .header("Content-Type", "application/json")
-        .body(r#"{"text":"《民法典》第1条"}"#)
-        .send()
-        .await;
-
-    match hall_resp {
-        Ok(r) => {
-            let hs = r.status();
-            // 套餐没解锁:401/403 明确 fail,让用户去开通
-            if hs.as_u16() == 401 || hs.as_u16() == 403 {
-                return VerifyResult::fail(
-                    "key 通过基础企业接口,但 hall_detect 端点未授权 — 请到元典开通法律幻觉校验套餐(V0.2 AI 助手依赖)",
-                );
+    match crate::yuandian::balance::verify_api_key(api_key).await {
+        Ok(_) => VerifyResult::ok(),
+        Err(error) => {
+            let lower = error.to_ascii_lowercase();
+            if lower.contains("401") || lower.contains("403") {
+                VerifyResult::fail("API Key 无效、已过期或未授权 MCP 服务(401/403)")
+            } else {
+                VerifyResult::fail(format!(
+                    "元典 MCP 余额验证失败: {}",
+                    error.chars().take(200).collect::<String>()
+                ))
             }
-            // 业务码 401(HTTP 200 包业务错误)
-            if hs.is_success() {
-                let hb = r.text().await.unwrap_or_default();
-                if hb.contains("\"code\":401") || hb.contains("\"code\":403") {
-                    return VerifyResult::fail(
-                        "key 通过基础企业接口,但 hall_detect 端点未授权 — 请到元典开通法律幻觉校验套餐(V0.2 AI 助手依赖)",
-                    );
-                }
-            }
-            // 其他状态(500 / 超时之类的服务侧问题)→ 不让用户卡住,放过
-        }
-        Err(_) => {
-            // 网络抖动 → 放过
         }
     }
-
-    VerifyResult::ok()
 }

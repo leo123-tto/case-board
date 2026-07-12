@@ -3,9 +3,7 @@
 //! 注意 wire 现状:
 //! - `search_ptal` / `search_qwal` 当前 yuandian/mod.rs 签名只接 `(keyword, top_k)`,
 //!   高级过滤(court / cause / region / case_no)未启用。description 已标注。
-//! - `get_case_detail` 临时实现:用 `search_ptal`/`search_qwal` 把 case_no 作为 qw,top_k=1,
-//!   取第一条匹配作为详情。元典后续若提供专用 `rh_case_details` 端点,在
-//!   yuandian/mod.rs 加函数,这里切换底层即可。
+//! - `get_case_detail` 直接调用官方 `rh_case_details` GET 端点，以案号或 id 定位详情。
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -135,17 +133,13 @@ impl Tool for GetCaseDetail {
             return Ok(r);
         }
         let api_key = yuandian_key(ctx)?;
-        // 临时实现:用对应库的 search 把 case_no 当 qw,top_k=1 拿到最匹配的文书。
+        // 直接走官方 rh_case_details(5 分)，不再用 10 分关键词检索冒充详情。
         // 取详情是**尽力而为**:某些案号(尤其外地/冷门库)元典会返回 404/无结果。
         // 这不是致命错误 —— LLM 手上已有 search 列表里的摘要,应据此继续,不该让整个
         // 工具调用带着原始 nginx 404 HTML 崩掉。故捕获错误,降级成一条明确提示(反虚构:
         // 让 LLM 用摘要、勿编全文)。真正的鉴权/网络错误仍会在 search 阶段如实反映。
-        let search_res = if lib_normalized == "qwal" {
-            yuandian::search_qwal(api_key, case_no, 1).await
-        } else {
-            yuandian::search_ptal(api_key, case_no, 1).await
-        };
-        let resp = match search_res {
+        let resp = match yuandian::case_details(api_key, lib_normalized, None, Some(case_no)).await
+        {
             Ok(r) => r,
             Err(e) => {
                 crate::dlog!("get_case_detail 取全文失败(降级): {}", e);

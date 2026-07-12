@@ -275,9 +275,15 @@ impl McpClient {
 
     /// tools/call:调远端工具,返回拼好的文本结果。
     pub async fn call_tool(&self, name: &str, arguments: &Value) -> Result<String, String> {
-        let params = json!({ "name": name, "arguments": arguments });
-        let result = self.request("tools/call", params, MCP_CALL_TIMEOUT).await?;
+        let result = self.call_tool_value(name, arguments).await?;
         Ok(extract_tool_text(&result))
+    }
+
+    /// tools/call:保留 MCP 原始结构。账户余额等程序化能力应优先读
+    /// `structuredContent`，避免再从面向 LLM 的展示文本反解析。
+    pub async fn call_tool_value(&self, name: &str, arguments: &Value) -> Result<Value, String> {
+        let params = json!({ "name": name, "arguments": arguments });
+        self.request("tools/call", params, MCP_CALL_TIMEOUT).await
     }
 }
 

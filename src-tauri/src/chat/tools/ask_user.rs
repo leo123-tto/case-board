@@ -48,6 +48,20 @@ impl Tool for AskUser {
                             "allow_input": {
                                 "type": "boolean",
                                 "description": "是否允许用户自己输入文字(选项穷尽不了、要填具体姓名/金额/日期时设 true)"
+                            },
+                            "multiple": {
+                                "type": "boolean",
+                                "description": "是否允许多选。仅当多个选项可以同时成立时设 true；普通追问保持 false"
+                            },
+                            "min_selections": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "多选时至少选择几项"
+                            },
+                            "max_selections": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "多选时最多选择几项，不得超过 options 数量"
                             }
                         },
                         "required": ["question"]

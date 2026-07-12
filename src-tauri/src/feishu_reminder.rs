@@ -324,6 +324,9 @@ pub async fn test_webhook(url: &str) -> Result<(), String> {
 }
 
 async fn run_once(pool: &SqlitePool) -> Result<(), String> {
+    if !crate::device_sync::is_automation_owner() {
+        return Ok(());
+    }
     let current = settings::read_settings()?;
     if !current.feishu_reminder_enabled.unwrap_or(false) {
         return Ok(());

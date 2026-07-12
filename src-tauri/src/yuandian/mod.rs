@@ -9,13 +9,14 @@
 //! 申请 key:https://open.chineselaw.com/
 //! 不入 git;落 settings.json 本地保存。
 
+pub mod balance;
 pub mod deep_dive;
 pub mod full_report;
 pub mod orchestrator;
 pub mod risk_assessment;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 const BASE_URL: &str = "https://open.chineselaw.com/open";
@@ -180,6 +181,8 @@ pub enum YuandianError {
     HttpStatus(u16, String),
     #[error("元典响应解析失败:{0}")]
     Json(String),
+    #[error("元典业务错误 code={0}:{1}")]
+    BusinessStatus(i64, String),
 }
 
 impl serde::Serialize for YuandianError {
@@ -218,9 +221,11 @@ async fn yd_get(
         return Err(YuandianError::HttpStatus(status.as_u16(), body));
     }
 
-    resp.json::<Value>()
+    let value = resp
+        .json::<Value>()
         .await
-        .map_err(|e| YuandianError::Json(e.to_string()))
+        .map_err(|e| YuandianError::Json(e.to_string()))?;
+    validate_business_response(value)
 }
 
 /// 通用 POST 请求(裁判文书 / 法规等检索是 POST + JSON body)。
@@ -242,9 +247,33 @@ async fn yd_post(api_key: &str, path: &str, body: &Value) -> Result<Value, Yuand
         return Err(YuandianError::HttpStatus(status.as_u16(), body));
     }
 
-    resp.json::<Value>()
+    let value = resp
+        .json::<Value>()
         .await
-        .map_err(|e| YuandianError::Json(e.to_string()))
+        .map_err(|e| YuandianError::Json(e.to_string()))?;
+    validate_business_response(value)
+}
+
+/// 元典会在 HTTP 200 里返回业务错误（如 code=401/404/500）。只有 200/201 视为成功；
+/// 没有 code 的历史响应保持兼容。业务失败必须在缓存/记账前变成 Err，避免把失败外壳
+/// 当成“已查到”写入知识库并污染积分统计。
+pub(crate) fn validate_business_response(value: Value) -> Result<Value, YuandianError> {
+    let code = value.get("code").and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+    });
+    if let Some(code) = code {
+        if !matches!(code, 200 | 201) {
+            let message = value
+                .get("message")
+                .or_else(|| value.get("msg"))
+                .and_then(Value::as_str)
+                .unwrap_or("未提供错误信息")
+                .to_string();
+            return Err(YuandianError::BusinessStatus(code, message));
+        }
+    }
+    Ok(value)
 }
 
 /* ============ 企业类(C1-C4)============ */
@@ -466,6 +495,23 @@ pub async fn search_qwal(api_key: &str, keyword: &str, top_k: u32) -> Result<Val
     yd_post(api_key, "/rh_qwal_search", &body).await
 }
 
+/// 案例详情(GET)。官方接口支持按案例库类型 + 案号/ID 查询，返回 `data` 列表（最多 10 条）。
+pub async fn case_details(
+    api_key: &str,
+    case_type: &str,
+    id: Option<&str>,
+    case_no: Option<&str>,
+) -> Result<Value, YuandianError> {
+    let mut params = vec![("type", case_type.to_string())];
+    if let Some(id) = id.filter(|s| !s.trim().is_empty()) {
+        params.push(("id", id.to_string()));
+    }
+    if let Some(case_no) = case_no.filter(|s| !s.trim().is_empty()) {
+        params.push(("ah", case_no.to_string()));
+    }
+    yd_get(api_key, "/rh_case_details", &params).await
+}
+
 /* ============ EntityId(企业有 id / 统一信用代码两种方式查)============ */
 
 #[derive(Debug, Clone)]
@@ -516,7 +562,7 @@ pub struct FtSearchParams {
 }
 
 pub async fn ft_search(api_key: &str, params: &FtSearchParams) -> Result<Value, YuandianError> {
-    let body = serde_json::to_value(params).map_err(|e| YuandianError::Json(e.to_string()))?;
+    let body = build_law_keyword_body(params)?;
     yd_post(api_key, "/rh_ft_search", &body).await
 }
 
@@ -564,7 +610,7 @@ pub struct FgSearchParams {
 }
 
 pub async fn fg_search(api_key: &str, params: &FgSearchParams) -> Result<Value, YuandianError> {
-    let body = serde_json::to_value(params).map_err(|e| YuandianError::Json(e.to_string()))?;
+    let body = build_regulation_keyword_body(params)?;
     yd_post(api_key, "/rh_fg_search", &body).await
 }
 
@@ -604,7 +650,7 @@ pub async fn law_vector_search(
     api_key: &str,
     params: &LawVectorSearchParams,
 ) -> Result<Value, YuandianError> {
-    let body = serde_json::to_value(params).map_err(|e| YuandianError::Json(e.to_string()))?;
+    let body = build_law_vector_body(params);
     yd_post(api_key, "/law_vector_search", &body).await
 }
 
@@ -642,8 +688,118 @@ pub async fn case_vector_search(
     api_key: &str,
     params: &CaseVectorSearchParams,
 ) -> Result<Value, YuandianError> {
-    let body = serde_json::to_value(params).map_err(|e| YuandianError::Json(e.to_string()))?;
+    let body = build_case_vector_body(params);
     yd_post(api_key, "/case_vector_search", &body).await
+}
+
+fn build_law_keyword_body(params: &FtSearchParams) -> Result<Value, YuandianError> {
+    let mut body = serde_json::to_value(params).map_err(|e| YuandianError::Json(e.to_string()))?;
+    normalize_keyword_law_fields(&mut body);
+    Ok(body)
+}
+
+fn build_regulation_keyword_body(params: &FgSearchParams) -> Result<Value, YuandianError> {
+    let mut body = serde_json::to_value(params).map_err(|e| YuandianError::Json(e.to_string()))?;
+    normalize_keyword_law_fields(&mut body);
+    Ok(body)
+}
+
+/// 把 CaseBoard 内部可读字段名转成元典 2026-07 官方 wire 字段。
+fn normalize_keyword_law_fields(body: &mut Value) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for (from, to) in [
+        ("effect_level", "xljb_1"),
+        ("region", "dy"),
+        ("publish_date_start", "fbrq_start"),
+        ("publish_date_end", "fbrq_end"),
+        ("implement_date_start", "ssrq_start"),
+        ("implement_date_end", "ssrq_end"),
+    ] {
+        if let Some(mut value) = obj.remove(from) {
+            if to == "dy" {
+                if let Some(region) = value.as_str() {
+                    value = Value::String(normalize_region(region));
+                }
+            }
+            obj.insert(to.to_string(), value);
+        }
+    }
+    if let Some(valid_only) = obj.remove("valid_only").and_then(|v| v.as_bool()) {
+        if valid_only {
+            obj.insert("sxx".into(), Value::String("现行有效".into()));
+        }
+    }
+}
+
+fn build_law_vector_body(params: &LawVectorSearchParams) -> Value {
+    let mut filter = serde_json::Map::new();
+    if let Some(effect) = params.effect_level.as_deref() {
+        filter.insert("effect1".into(), json!([effect]));
+    }
+    if params.valid_only == Some(true) {
+        filter.insert("sxx".into(), json!(["现行有效"]));
+    }
+    if let Some(start) = params.implement_date_start.as_deref() {
+        filter.insert("law_start".into(), json!(start));
+    }
+    if let Some(end) = params.implement_date_end.as_deref() {
+        filter.insert("law_end".into(), json!(end));
+    }
+    let mut body = json!({
+        "query": params.query,
+        "rewrite_flag": true,
+        "return_num": params.top_k.unwrap_or(10),
+    });
+    if !filter.is_empty() {
+        body["fatiao_filter"] = Value::Object(filter);
+    }
+    body
+}
+
+fn build_case_vector_body(params: &CaseVectorSearchParams) -> Value {
+    let mut body = json!({
+        "query": params.query,
+        "rewrite_flag": true,
+        "return_num": params.top_k.unwrap_or(10),
+    });
+    let Some(filter) = params.wenshu_filter.as_ref() else {
+        return body;
+    };
+    let mut wire = serde_json::Map::new();
+    if let Some(v) = filter.case_lb.as_deref() {
+        wire.insert("wenshu_type".into(), json!(v));
+    }
+    if let Some(v) = filter.ay.as_deref() {
+        wire.insert("ay".into(), json!([v]));
+    }
+    if let Some(v) = filter.ws_type.as_deref() {
+        wire.insert("wszl".into(), json!([v]));
+    }
+    if let Some(v) = filter.fydj.as_deref() {
+        wire.insert("cj".into(), json!(v));
+    }
+    if let Some(v) = filter.region.as_deref() {
+        wire.insert("xzqh_p".into(), json!(normalize_region(v)));
+    }
+    if let Some(v) = filter.jiean_date_start.as_deref() {
+        wire.insert("ja_start".into(), json!(v));
+    }
+    if let Some(v) = filter.jiean_date_end.as_deref() {
+        wire.insert("ja_end".into(), json!(v));
+    }
+    if let Some(v) = filter.dxal {
+        wire.insert("dianxing".into(), json!(v));
+    }
+    if !wire.is_empty() {
+        body["wenshu_filter"] = Value::Object(wire);
+    }
+    body
+}
+
+fn normalize_region(region: &str) -> String {
+    region.trim().trim_end_matches(['省', '市']).to_string()
 }
 
 /// § 17.7 · hall_detect 法律幻觉校验(核心)。把 LLM final answer 塞进 text,

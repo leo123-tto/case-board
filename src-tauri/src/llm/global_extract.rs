@@ -351,6 +351,7 @@ pub fn global_extract_input_char_budget(config: &LlmConfig) -> usize {
         LlmProviderKind::LocalOpenAiCompat => LOCAL_GLOBAL_EXTRACT_MAX_INPUT_CHARS,
         LlmProviderKind::GlmCompat
         | LlmProviderKind::MimoCompat
+        | LlmProviderKind::KimiCompat
         | LlmProviderKind::CustomCompat
         | LlmProviderKind::UnknownOpenAiCompat => LARGE_COMPAT_GLOBAL_EXTRACT_MAX_INPUT_CHARS,
     }

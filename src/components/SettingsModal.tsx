@@ -67,7 +67,7 @@ import {
 import { FONT_SCALE, useFontScale } from "@/lib/uiScale";
 
 type VerifyStatus = "idle" | "verifying" | "ok" | "fail";
-type CompatBackend = "glm" | "mimo" | "custom";
+type CompatBackend = "glm" | "mimo" | "kimi" | "custom";
 type CompatSettingKey =
   | "glm_llm_endpoint"
   | "glm_llm_model"
@@ -77,18 +77,23 @@ type CompatSettingKey =
   | "mimo_llm_model"
   | "mimo_llm_api_key"
   | "mimo_llm_verified_at"
+  | "kimi_llm_endpoint"
+  | "kimi_llm_model"
+  | "kimi_llm_api_key"
+  | "kimi_llm_verified_at"
   | "custom_llm_endpoint"
   | "custom_llm_model"
   | "custom_llm_api_key"
   | "custom_llm_verified_at";
 type CompatFieldKind = "endpoint" | "model" | "apiKey" | "verifiedAt";
 
-/** 云端 AI 后端可选项(下拉)。glm/mimo/custom 共用「通用 OpenAI 兼容」配置(compat_llm_*)。 */
+/** 云端 AI 后端可选项(下拉)。OpenAI 兼容后端各自独立保存配置。 */
 const CLOUD_BACKEND_OPTIONS = [
   { id: "deepseek", label: "DeepSeek(默认)" },
   { id: "minimax", label: "MiniMax(M 系列)" },
   { id: "glm", label: "智谱 GLM(OpenAI 兼容)" },
   { id: "mimo", label: "小米 MiMo(OpenAI 兼容)" },
+  { id: "kimi", label: "Kimi Coding Plan(OpenAI 兼容)" },
   { id: "custom", label: "自定义(OpenAI 兼容)" },
 ] as const;
 
@@ -107,6 +112,12 @@ const COMPAT_PRESETS: Record<
     label: "小米 MiMo",
     endpoint: "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
     model: "mimo-v2.5",
+  },
+  kimi: {
+    label: "Kimi Coding Plan",
+    endpoint: "https://api.kimi.com/coding/v1/chat/completions",
+    model: "kimi-for-coding",
+    applyUrl: "https://www.kimi.com/code/console",
   },
   custom: { label: "自定义(OpenAI 兼容)", endpoint: "", model: "" },
 };
@@ -132,6 +143,12 @@ const COMPAT_FIELD_KEYS: Record<
     apiKey: "mimo_llm_api_key",
     verifiedAt: "mimo_llm_verified_at",
   },
+  kimi: {
+    endpoint: "kimi_llm_endpoint",
+    model: "kimi_llm_model",
+    apiKey: "kimi_llm_api_key",
+    verifiedAt: "kimi_llm_verified_at",
+  },
   custom: {
     endpoint: "custom_llm_endpoint",
     model: "custom_llm_model",
@@ -141,7 +158,7 @@ const COMPAT_FIELD_KEYS: Record<
 };
 
 function isCompatBackend(value: string | null | undefined): value is CompatBackend {
-  return value === "glm" || value === "mimo" || value === "custom";
+  return value === "glm" || value === "mimo" || value === "kimi" || value === "custom";
 }
 
 function compatValue(
@@ -327,6 +344,7 @@ export function SettingsModal({
     settings?.compat_llm_verified_at,
     settings?.glm_llm_verified_at,
     settings?.mimo_llm_verified_at,
+    settings?.kimi_llm_verified_at,
     settings?.custom_llm_verified_at,
     settings?.yuandian_verified_at,
   ]);
@@ -476,7 +494,7 @@ export function SettingsModal({
     }
   }
 
-  // 切换云端 AI 后端。deepseek→存 null(默认);minimax→"minimax";glm/mimo/custom→预填兼容配置。
+  // 切换云端 AI 后端。deepseek→存 null(默认);minimax→"minimax";其余兼容后端预填各自配置。
   function handleChangeBackend(value: string) {
     if (value === "minimax") {
       updateField("cloud_llm_backend", "minimax");
@@ -1252,8 +1270,8 @@ export function SettingsModal({
                   </Section>
                   )}
 
-                  {/* ── 通用 OpenAI 兼容后端(GLM / MiMo / 自定义)── */}
-                  {["glm", "mimo", "custom"].includes(
+                  {/* ── 通用 OpenAI 兼容后端(GLM / MiMo / Kimi / 自定义)── */}
+                  {["glm", "mimo", "kimi", "custom"].includes(
                     settings.cloud_llm_backend ?? "",
                   ) &&
                     (() => {
@@ -1339,22 +1357,44 @@ export function SettingsModal({
                           </Field>
                           <Field
                             label="模型名"
-                            hint="具体型号,以服务商控制台为准(如 glm-4.6 / mimo-v2.5)"
+                            hint={
+                              cur === "kimi"
+                                ? "标准版适合日常使用;高速版约快 5-6 倍,需要对应会员档位"
+                                : "具体型号,以服务商控制台为准(如 glm-4.6 / mimo-v2.5)"
+                            }
                           >
-                            <input
-                              type="text"
-                              value={model}
-                              onChange={(e) => {
-                                updateField(
-                                  keys.model,
-                                  e.target.value || null,
-                                );
-                                onConfigChange();
-                              }}
-                              placeholder="如 glm-4.6"
-                              className={inputCls}
-                              autoComplete="off"
-                            />
+                            {cur === "kimi" ? (
+                              <select
+                                value={model || preset.model}
+                                onChange={(e) => {
+                                  updateField(keys.model, e.target.value);
+                                  onConfigChange();
+                                }}
+                                className={inputCls}
+                              >
+                                <option value="kimi-for-coding">
+                                  Kimi for Coding(标准版)
+                                </option>
+                                <option value="kimi-for-coding-highspeed">
+                                  Kimi for Coding HighSpeed(高速版)
+                                </option>
+                              </select>
+                            ) : (
+                              <input
+                                type="text"
+                                value={model}
+                                onChange={(e) => {
+                                  updateField(
+                                    keys.model,
+                                    e.target.value || null,
+                                  );
+                                  onConfigChange();
+                                }}
+                                placeholder="如 glm-4.6"
+                                className={inputCls}
+                                autoComplete="off"
+                              />
+                            )}
                           </Field>
                           <Field
                             label="接口地址"

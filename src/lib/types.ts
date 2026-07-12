@@ -507,8 +507,8 @@ export interface Settings {
   cloud_llm_endpoint: string | null;
   cloud_llm_model: string | null;
   cloud_llm_api_key: string | null;
-  /** 云端 LLM 后端:"deepseek"(默认/null)/ "minimax" / "glm" / "mimo" / "custom"。
-   *  minimax 读 minimax_*;glm/mimo/custom 读各自独立配置;其余读 cloud_llm_*。 */
+  /** 云端 LLM 后端:"deepseek"(默认/null)/ "minimax" / "glm" / "mimo" / "kimi" / "custom"。
+   *  minimax 读 minimax_*;glm/mimo/kimi/custom 读各自独立配置;其余读 cloud_llm_*。 */
   cloud_llm_backend: string | null;
   minimax_api_key: string | null;
   minimax_endpoint: string | null;
@@ -529,6 +529,10 @@ export interface Settings {
   mimo_llm_model: string | null;
   mimo_llm_api_key: string | null;
   mimo_llm_verified_at: string | null;
+  kimi_llm_endpoint: string | null;
+  kimi_llm_model: string | null;
+  kimi_llm_api_key: string | null;
+  kimi_llm_verified_at: string | null;
   custom_llm_endpoint: string | null;
   custom_llm_model: string | null;
   custom_llm_api_key: string | null;

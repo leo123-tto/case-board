@@ -130,7 +130,7 @@ pub fn build_non_stream_chat_body_with_response_format(
     let mut body = json!({
         "model": model,
         "messages": messages,
-        "temperature": temperature,
+        "temperature": capability.normalize_temperature(temperature),
         "stream": false,
     });
     match capability.output_token_param {

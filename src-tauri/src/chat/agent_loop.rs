@@ -879,7 +879,7 @@ async fn stream_one_request(
         stream_options: StreamOptions {
             include_usage: true,
         },
-        temperature: req.temperature,
+        temperature: capability.normalize_temperature(req.temperature),
         token_budget: ApiTokenBudget::from_capability(req.max_tokens, &capability),
         tools: tool_schemas,
         tool_choice,

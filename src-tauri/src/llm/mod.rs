@@ -312,7 +312,7 @@ impl LlmConfig {
                     temperature: 0.3,
                 };
             }
-            // 2026-06-16:通用 OpenAI 兼容后端(glm / mimo / custom)。走标准 /v1/chat/completions,
+            // 2026-06-16:通用 OpenAI 兼容后端(glm / mimo / kimi / custom)。走标准 /v1/chat/completions,
             // 模型名用户显式填(不套 DeepSeek 档位)。endpoint/model 空时回落预设默认。
             if settings.cloud_llm_is_compat() {
                 let preset =

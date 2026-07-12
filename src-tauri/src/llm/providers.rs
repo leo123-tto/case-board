@@ -1,6 +1,6 @@
 //! 通用 OpenAI 兼容云端 LLM 提供商预设(2026-06-16)。
 //!
-//! 仅服务于「OpenAI 兼容」这一条后端(`cloud_llm_backend` ∈ {glm, mimo, custom});
+//! 仅服务于「OpenAI 兼容」这一条后端(`cloud_llm_backend` ∈ {glm, mimo, kimi, custom});
 //! DeepSeek / MiniMax 各有专属处理,**不**走这里。每个预设只提供「默认 endpoint + 默认模型名」
 //! 两样,作为前端预填值 + 后端兜底(用户没填时不至于打空请求)。模型名一律可在设置里改。
 //!
@@ -33,6 +33,13 @@ pub static MIMO: CompatPreset = CompatPreset {
     default_model: "mimo-v2.5",
 };
 
+pub static KIMI: CompatPreset = CompatPreset {
+    id: "kimi",
+    label: "Kimi Coding Plan",
+    default_endpoint: "https://api.kimi.com/coding/v1/chat/completions",
+    default_model: "kimi-for-coding",
+};
+
 pub static CUSTOM: CompatPreset = CompatPreset {
     id: "custom",
     label: "自定义(OpenAI 兼容)",
@@ -45,7 +52,24 @@ pub fn compat_preset(id: &str) -> Option<&'static CompatPreset> {
     match id.trim() {
         "glm" => Some(&GLM),
         "mimo" => Some(&MIMO),
+        "kimi" => Some(&KIMI),
         "custom" => Some(&CUSTOM),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kimi_coding_plan_uses_official_openai_preset() {
+        let preset = compat_preset("kimi").expect("Kimi preset should exist");
+        assert_eq!(preset.id, "kimi");
+        assert_eq!(
+            preset.default_endpoint,
+            "https://api.kimi.com/coding/v1/chat/completions"
+        );
+        assert_eq!(preset.default_model, "kimi-for-coding");
     }
 }

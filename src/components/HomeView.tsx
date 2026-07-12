@@ -98,6 +98,7 @@ import {
 
 export interface HomeViewProps {
   cases: Case[];
+  caseSectionTitle?: string;
   userDisplayName: string | null;
   onPickCase: (caseId: string) => void;
   onOpenEvent?: (event: UpcomingEvent) => void;
@@ -139,6 +140,7 @@ export type UpcomingEvent = HomeReminderEvent;
 
 export function HomeView({
   cases,
+  caseSectionTitle = "在办案件",
   userDisplayName,
   onPickCase,
   onOpenEvent,
@@ -695,7 +697,9 @@ export function HomeView({
             <div className="mb-4 flex flex-col gap-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-baseline gap-3">
-                  <h2 className="text-lg font-semibold tracking-tight">在办案件</h2>
+                  <h2 className="text-lg font-semibold tracking-tight">
+                    {caseSectionTitle}
+                  </h2>
                   <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
                     {visibleOpenCaseCount} / {cases.length} CASES
                   </span>

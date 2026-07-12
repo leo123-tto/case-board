@@ -109,11 +109,11 @@ pub struct Settings {
     /// MiniMax key 验证通过时间(坑#11:新 cloud key 必配 verified_at,改 key 重置)。
     pub minimax_verified_at: Option<String>,
 
-    /// 2026-06-16:通用 OpenAI 兼容云端 LLM 后端(智谱 GLM / 小米 MiMo / 自定义)。
-    /// `cloud_llm_backend` 取 `"glm"` / `"mimo"` / `"custom"` 时读对应服务商的独立配置。
+    /// 2026-06-16:通用 OpenAI 兼容云端 LLM 后端(智谱 GLM / 小米 MiMo / Kimi Coding Plan / 自定义)。
+    /// `cloud_llm_backend` 取 `"glm"` / `"mimo"` / `"kimi"` / `"custom"` 时读对应服务商的独立配置。
     /// **纯增量调和**:DeepSeek(`cloud_llm_*`+档位)/ MiniMax(`minimax_*`+v2 协议)两条老路完全不动;
     /// 这条走标准 `/v1/chat/completions`,模型名是用户**显式填的具体型号**(不套 DeepSeek 的 flash/pro 档位,
-    /// 同 MiniMax 处理)。glm/mimo/custom 的 key/endpoint/model 分开保存,切换服务商不会互相覆盖。
+    /// 同 MiniMax 处理)。glm/mimo/kimi/custom 的 key/endpoint/model 分开保存,切换服务商不会互相覆盖。
     /// 预设默认值见 `llm::providers`。
     ///
     /// 旧版 `compat_llm_*` 作为兼容字段保留:读当前后端时,如果新字段为空,会 fallback 到旧字段,
@@ -137,6 +137,12 @@ pub struct Settings {
     pub mimo_llm_model: Option<String>,
     pub mimo_llm_api_key: Option<String>,
     pub mimo_llm_verified_at: Option<String>,
+
+    /// Kimi Coding Plan 独立配置(OpenAI-compatible chat completions)。
+    pub kimi_llm_endpoint: Option<String>,
+    pub kimi_llm_model: Option<String>,
+    pub kimi_llm_api_key: Option<String>,
+    pub kimi_llm_verified_at: Option<String>,
 
     /// 自定义 OpenAI 兼容模型独立配置。
     pub custom_llm_endpoint: Option<String>,
@@ -276,23 +282,24 @@ impl Settings {
     }
 
     /// 云端 LLM 后端(2026-06-15;2026-06-16 加 OpenAI 兼容三档)。
-    /// 取值:`"deepseek"`(默认)/ `"minimax"` / `"glm"` / `"mimo"` / `"custom"`。
+    /// 取值:`"deepseek"`(默认)/ `"minimax"` / `"glm"` / `"mimo"` / `"kimi"` / `"custom"`。
     /// 缺省 / 空 / 非法值一律回落 `"deepseek"`(老用户零感知)。
     pub fn effective_cloud_llm_backend(&self) -> &str {
         match self.cloud_llm_backend.as_deref().map(str::trim) {
             Some("minimax") => "minimax",
             Some("glm") => "glm",
             Some("mimo") => "mimo",
+            Some("kimi") => "kimi",
             Some("custom") => "custom",
             _ => "deepseek",
         }
     }
 
-    /// 是否走「通用 OpenAI 兼容」后端(glm / mimo / custom 共用 `compat_llm_*` + 标准 chat 协议)。
+    /// 是否走「通用 OpenAI 兼容」后端(glm / mimo / kimi / custom + 标准 chat 协议)。
     pub fn cloud_llm_is_compat(&self) -> bool {
         matches!(
             self.effective_cloud_llm_backend(),
-            "glm" | "mimo" | "custom"
+            "glm" | "mimo" | "kimi" | "custom"
         )
     }
 
@@ -309,6 +316,7 @@ impl Settings {
         let current = match self.effective_cloud_llm_backend() {
             "glm" => Self::clean_string(&self.glm_llm_endpoint),
             "mimo" => Self::clean_string(&self.mimo_llm_endpoint),
+            "kimi" => Self::clean_string(&self.kimi_llm_endpoint),
             "custom" => Self::clean_string(&self.custom_llm_endpoint),
             _ => None,
         };
@@ -320,6 +328,7 @@ impl Settings {
         let current = match self.effective_cloud_llm_backend() {
             "glm" => Self::clean_string(&self.glm_llm_model),
             "mimo" => Self::clean_string(&self.mimo_llm_model),
+            "kimi" => Self::clean_string(&self.kimi_llm_model),
             "custom" => Self::clean_string(&self.custom_llm_model),
             _ => None,
         };
@@ -331,6 +340,7 @@ impl Settings {
         let current = match self.effective_cloud_llm_backend() {
             "glm" => Self::clean_string(&self.glm_llm_api_key),
             "mimo" => Self::clean_string(&self.mimo_llm_api_key),
+            "kimi" => Self::clean_string(&self.kimi_llm_api_key),
             "custom" => Self::clean_string(&self.custom_llm_api_key),
             _ => None,
         };
@@ -368,6 +378,12 @@ impl Settings {
                 &mut self.mimo_llm_model,
                 &mut self.mimo_llm_api_key,
                 &mut self.mimo_llm_verified_at,
+            ),
+            "kimi" => (
+                &mut self.kimi_llm_endpoint,
+                &mut self.kimi_llm_model,
+                &mut self.kimi_llm_api_key,
+                &mut self.kimi_llm_verified_at,
             ),
             "custom" => (
                 &mut self.custom_llm_endpoint,

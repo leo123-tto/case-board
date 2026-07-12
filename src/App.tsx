@@ -172,11 +172,11 @@ function MainApp() {
   const [view, setView] = useState<"home" | "detail">("home");
   /** 是否正在跑 reaggregate_all_cases(详情页"重新计算画像"按钮触发) */
   /**
-   * 2026-05-24 b:顶部三模块 tab(诉讼 / 非诉 / 工具)。默认诉讼。
+   * 顶部业务模块 tab；独立首页展示全部案件。
    * 各模块完全独立 — 切到非诉/工具不影响诉讼的 cases/selectedId 等 state。
    */
   // string 而非 ModuleId:私人专属顶层 tab(「独立」)的 id 由接缝动态提供,开源仓为空。
-  const [activeModule, setActiveModule] = useState<string>("litigation");
+  const [activeModule, setActiveModule] = useState<string>("home");
   /**
    * F2(2026-06-18):刚导入案件的 id —— 用来「识别为刑事案件后自动切到刑事 tab」。
    * 刑事案件被 civilCases 过滤掉,导入后若不切 tab 会在诉讼 tab「看不见」;但导入瞬间
@@ -288,10 +288,11 @@ function MainApp() {
           "设置里有未保存的改动,切走会丢失这些改动 — 确定继续吗?",
           { danger: true, okLabel: "继续切换" },
         );
-        if (!ok) return;
+        if (!ok) return false;
         setSettingsDirty(false); // 用户确认了,清掉脏标记
       }
       setActiveModule(target);
+      return true;
     },
     [activeModule, settingsDirty],
   );
@@ -473,15 +474,17 @@ function MainApp() {
     }
     {
       // 2026-06-15/16:按云端后端校验对应的 key,与后端 effective_cloud_llm_backend 三选一对齐
-      // (minimax / 通用兼容 glm·mimo·custom / 其余回落 DeepSeek)。各后端 key 字段独立。
+      // (minimax / 通用兼容 glm·mimo·kimi·custom / 其余回落 DeepSeek)。各后端 key 字段独立。
       const backend = s.cloud_llm_backend ?? "deepseek";
       const isMinimax = backend === "minimax";
-      const isCompat = ["glm", "mimo", "custom"].includes(backend);
+      const isCompat = ["glm", "mimo", "kimi", "custom"].includes(backend);
       const compatKey =
         backend === "glm"
           ? s.glm_llm_api_key || s.compat_llm_api_key
           : backend === "mimo"
             ? s.mimo_llm_api_key || s.compat_llm_api_key
+            : backend === "kimi"
+              ? s.kimi_llm_api_key || s.compat_llm_api_key
             : backend === "custom"
               ? s.custom_llm_api_key || s.compat_llm_api_key
               : s.compat_llm_api_key;
@@ -490,6 +493,8 @@ function MainApp() {
           ? s.glm_llm_verified_at || s.compat_llm_verified_at
           : backend === "mimo"
             ? s.mimo_llm_verified_at || s.compat_llm_verified_at
+            : backend === "kimi"
+              ? s.kimi_llm_verified_at || s.compat_llm_verified_at
             : backend === "custom"
               ? s.custom_llm_verified_at || s.compat_llm_verified_at
               : s.compat_llm_verified_at;
@@ -506,7 +511,7 @@ function MainApp() {
       const providerName = isMinimax
         ? "MiniMax"
         : isCompat
-          ? { glm: "智谱 GLM", mimo: "小米 MiMo", custom: "自定义模型" }[backend] ??
+          ? { glm: "智谱 GLM", mimo: "小米 MiMo", kimi: "Kimi Coding Plan", custom: "自定义模型" }[backend] ??
             "云端模型"
           : "DeepSeek";
       const label = `${providerName} API Key(云端 LLM)`;
@@ -1107,6 +1112,11 @@ function MainApp() {
     setSelectedId(caseId);
     setView("detail");
   };
+  const pickCaseFromHome = (caseId: string) => {
+    const target = cases.find((c) => c.id === caseId);
+    setActiveModule(target && isCriminalCase(target) ? "criminal" : "litigation");
+    pickCase(caseId);
+  };
   const handleCaseStatusChanged = useCallback(
     (caseId: string, status: string | null) => {
       const patch = {
@@ -1124,14 +1134,16 @@ function MainApp() {
   );
   const openHomeEvent = (event: UpcomingEvent) => {
     if (!event.caseId) return;
-    setSelectedId(event.caseId);
-    setView("detail");
+    pickCaseFromHome(event.caseId);
     if (event.sourceDoc) {
       setViewerDoc(event.sourceDoc);
     }
   };
-  const goHome = () => {
+  const goHome = async () => {
+    const switched = await setActiveModuleSafe("home");
+    if (!switched) return;
     setView("home");
+    setSelectedId(null);
   };
 
   // 诉讼 / 刑事 共享导入·PDF分类·OCR·全局抽取·case+document 数据层,只按「领域」过滤显示
@@ -1167,6 +1179,33 @@ function MainApp() {
     onArtifactCreated: handleArtifactCreated,
   };
 
+  // 独立首页展示数据库中的全部案件；点卡片后再按领域进入对应详情模块。
+  const homeBody =
+    cases.length === 0 && !loading ? (
+      <HomeDropZone onImportPath={handleDropImport}>
+        <EmptyState
+          onImport={handleImport}
+          error={error}
+          onOpenSettings={openSettings}
+        />
+      </HomeDropZone>
+    ) : (
+      <HomeDropZone onImportPath={handleDropImport}>
+        <HomeView
+          cases={cases}
+          caseSectionTitle="全部案件"
+          userDisplayName={userDisplayName}
+          onPickCase={pickCaseFromHome}
+          onOpenEvent={openHomeEvent}
+          onImport={handleImport}
+          onDeleteCase={handleDeleteCaseById}
+          onDeleteCases={handleDeleteCases}
+          onCaseStatusChanged={handleCaseStatusChanged}
+          onImportFolder={handleCalendarImport}
+        />
+      </HomeDropZone>
+    );
+
   // 诉讼模块整体渲染:从未导入任何案件→EmptyState / 选中民事案件→CaseView / 否则→HomeView。
   // 首页两态(EmptyState / HomeView)都包一层 HomeDropZone:拖案件文件夹进来即导入。
   // EmptyState 判据用全量 cases(不是 civilCases):否则只有刑事案件时诉讼 tab 会误显「还没有案件」。
@@ -1187,6 +1226,7 @@ function MainApp() {
       <HomeDropZone onImportPath={handleDropImport}>
         <HomeView
           cases={civilCases}
+          caseSectionTitle="诉讼案件"
           userDisplayName={userDisplayName}
           onPickCase={pickCase}
           onOpenEvent={openHomeEvent}
@@ -1238,6 +1278,7 @@ function MainApp() {
       <HomeDropZone onImportPath={handleDropImport}>
         <HomeView
           cases={criminalCases}
+          caseSectionTitle="刑事案件"
           userDisplayName={userDisplayName}
           onPickCase={pickCase}
           onOpenEvent={openHomeEvent}
@@ -1256,11 +1297,7 @@ function MainApp() {
       <ModuleTabs
         active={activeModule}
         onSwitch={setActiveModuleSafe}
-        onGoHome={() => {
-          setActiveModuleSafe("litigation");
-          setView("home");
-          setSelectedId(null);
-        }}
+        onGoHome={goHome}
         rightSlot={
           <>
             {showDeepSeekChip && <DeepSeekBalanceChip />}
@@ -1271,6 +1308,7 @@ function MainApp() {
 
       {/* 模块内容区(flex-1 + min-h-0 让子模块能正常滚动) */}
       <div className="min-h-0 flex-1">
+        {activeModule === "home" && homeBody}
         {activeModule === "litigation" && litigationBody}
         {activeModule === "criminal" && criminalBody}
         {activeModule === "execution" && (

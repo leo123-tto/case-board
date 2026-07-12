@@ -1,5 +1,5 @@
 /**
- * 顶部模块导航条:左边「首页」按钮 + 三 tab(诉讼 · 非诉 · 工具)。
+ * 顶部模块导航条:左边「首页」按钮 + 各业务模块 tab。
  *
  * 设计(2026-05-24 b 作者拍板):顶部横排,当前 tab 下划线高亮,苹果风克制。
  * 2026-05-24 e:加首页按钮,任何模块/任何子页都可以一键回诉讼首页(HomeView)。
@@ -62,7 +62,7 @@ export function ModuleTabs({
 }: {
   active: string;
   onSwitch: (id: string) => void;
-  /** 「首页」按钮点击:切到诉讼模块 + 重置到 HomeView(由 App.tsx 处理) */
+  /** 「首页」按钮点击:进入全部案件 HomeView(由 App.tsx 处理) */
   onGoHome: () => void;
   /** 2026-05-24 e:右侧自定义插槽(给 DeepSeekBalanceChip 等用) */
   rightSlot?: React.ReactNode;
@@ -116,8 +116,13 @@ export function ModuleTabs({
         <button
           type="button"
           onClick={onGoHome}
-          className="mr-2 inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-border/80 bg-card/80 px-2.5 text-xs font-medium text-muted-foreground shadow-xs transition-[transform,background-color,color,border-color,box-shadow] duration-150 hover:border-brand/20 hover:bg-brand-soft/70 hover:text-foreground hover:shadow-sm active:scale-[0.97]"
-          title="回到首页(诉讼案件看板)"
+          className={cn(
+            "mr-2 inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border px-2.5 text-xs font-medium shadow-xs transition-[transform,background-color,color,border-color,box-shadow] duration-150 hover:border-brand/20 hover:bg-brand-soft/70 hover:text-foreground hover:shadow-sm active:scale-[0.97]",
+            active === "home"
+              ? "border-brand/25 bg-brand-soft/72 text-foreground"
+              : "border-border/80 bg-card/80 text-muted-foreground",
+          )}
+          title="回到首页(全部案件)"
           aria-label="首页"
         >
           <Home className="size-3.5" />

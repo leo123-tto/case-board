@@ -35,7 +35,7 @@ pub const MAX_OUTPUT_TOKENS: u32 = 384_000;
 /// 不用 DeepSeek 的 384K —— 远超 MiniMax 模型上限,可能触发 2013 参数错。
 pub const MINIMAX_MAX_OUTPUT_TOKENS: u32 = 32_768;
 
-/// 通用 OpenAI 兼容后端(glm/mimo/custom)输出上限保守值。GLM≈32K / MiMo≈128K,
+/// 通用 OpenAI 兼容后端(glm/mimo/kimi/custom)输出上限保守值。GLM≈32K / MiMo≈128K,
 /// 各家不一,取保守 32K 防超限 400(用户嫌短可后续按服务商放宽)。
 pub const COMPAT_MAX_OUTPUT_TOKENS: u32 = 32_768;
 
@@ -90,7 +90,7 @@ impl ModelChoice {
         }
     }
 
-    /// 通用 OpenAI 兼容后端(glm / mimo / custom · 2026-06-16)。同 MiniMax:无档位、用户直接填模型名。
+    /// 通用 OpenAI 兼容后端(glm / mimo / kimi / custom · 2026-06-16)。同 MiniMax:无档位、用户直接填模型名。
     /// 温度 0.3(兼容档常为推理型,0.0 易死循环);max_tokens 取保守上限(GLM/MiMo 输出上限远低于
     /// DeepSeek 的 384k,发过高会被服务商 400)。
     pub fn from_compat(model: &str) -> Self {
@@ -114,7 +114,7 @@ pub fn route_model(task: TaskType, user_message: &str, settings: &Settings) -> M
             .unwrap_or("MiniMax-M2.7");
         return ModelChoice::from_minimax(model);
     }
-    // 2026-06-16:通用 OpenAI 兼容后端(glm/mimo/custom)也不套档位,直接用显式模型名。
+    // 2026-06-16:通用 OpenAI 兼容后端(glm/mimo/kimi/custom)也不套档位,直接用显式模型名。
     if settings.cloud_llm_is_compat() {
         let backend = settings.effective_cloud_llm_backend();
         let model = settings

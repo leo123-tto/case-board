@@ -19,9 +19,15 @@ use thiserror::Error;
 use super::context::TaskType;
 
 pub const DEFAULT_CHAT_LOOP_TIMEOUT_DEFAULT_SECS: u64 = 300;
-pub const DEFAULT_CHAT_LOOP_TIMEOUT_COMPLEX_SECS: u64 = 480;
-pub const DEFAULT_CHAT_LOOP_TIMEOUT_DEEP_ANALYSIS_SECS: u64 = 900;
+pub const DEFAULT_CHAT_LOOP_TIMEOUT_COMPLEX_SECS: u64 = 1_800;
+pub const DEFAULT_CHAT_LOOP_TIMEOUT_DEEP_ANALYSIS_SECS: u64 = 2_700;
 pub const DEFAULT_CHAT_LOOP_IDLE_TIMEOUT_SECS: u64 = 180;
+pub const DEFAULT_CHAT_LOOP_MAX_ITERS_DEFAULT: u32 = 16;
+pub const DEFAULT_CHAT_LOOP_MAX_ITERS_COMPLEX: u32 = 48;
+pub const DEFAULT_CHAT_LOOP_MAX_ITERS_DEEP_ANALYSIS: u32 = 64;
+pub const DEFAULT_REASONING_TOKENS_DEFAULT: u64 = 64_000;
+pub const DEFAULT_REASONING_TOKENS_COMPLEX: u64 = 192_000;
+pub const DEFAULT_REASONING_TOKENS_DEEP_ANALYSIS: u64 = 256_000;
 const MIN_CHAT_LOOP_TIMEOUT_SECS: u64 = 60;
 const MIN_CHAT_LOOP_IDLE_TIMEOUT_SECS: u64 = 30;
 
@@ -50,25 +56,46 @@ pub struct LoopGuardConfig {
 
 impl LoopGuardConfig {
     pub fn from_settings_for_task(s: &crate::settings::Settings, task: TaskType) -> Self {
-        let max_duration_secs = match task {
-            TaskType::DeepAnalysis | TaskType::CriminalDeepAnalysis => {
-                DEFAULT_CHAT_LOOP_TIMEOUT_DEEP_ANALYSIS_SECS
-            }
+        let (task_default_iters, max_duration_secs, max_reasoning_tokens) = match task {
+            TaskType::DeepAnalysis | TaskType::CriminalDeepAnalysis => (
+                DEFAULT_CHAT_LOOP_MAX_ITERS_DEEP_ANALYSIS,
+                DEFAULT_CHAT_LOOP_TIMEOUT_DEEP_ANALYSIS_SECS,
+                DEFAULT_REASONING_TOKENS_DEEP_ANALYSIS,
+            ),
             TaskType::CompileLegalBasis
             | TaskType::FindSimilarCases
             | TaskType::VerifyMyDraft
-            | TaskType::SimulateOpposition => DEFAULT_CHAT_LOOP_TIMEOUT_COMPLEX_SECS,
-            TaskType::FreeChat => DEFAULT_CHAT_LOOP_TIMEOUT_DEFAULT_SECS,
-        }
-        .max(MIN_CHAT_LOOP_TIMEOUT_SECS);
+            | TaskType::SimulateOpposition
+            | TaskType::VisualizeCase => (
+                DEFAULT_CHAT_LOOP_MAX_ITERS_COMPLEX,
+                DEFAULT_CHAT_LOOP_TIMEOUT_COMPLEX_SECS,
+                DEFAULT_REASONING_TOKENS_COMPLEX,
+            ),
+            TaskType::FreeChat => (
+                DEFAULT_CHAT_LOOP_MAX_ITERS_DEFAULT,
+                DEFAULT_CHAT_LOOP_TIMEOUT_DEFAULT_SECS,
+                DEFAULT_REASONING_TOKENS_DEFAULT,
+            ),
+        };
+        let max_duration_secs = max_duration_secs.max(MIN_CHAT_LOOP_TIMEOUT_SECS);
+        // 16 是旧版写进 settings.json 的显示默认值，不代表用户主动限制复杂任务。
+        // 其他值视为明确自定义并继续尊重。
+        let configured_iters = s
+            .chat_loop_max_iters
+            .unwrap_or(DEFAULT_CHAT_LOOP_MAX_ITERS_DEFAULT);
+        let max_iters = if configured_iters == DEFAULT_CHAT_LOOP_MAX_ITERS_DEFAULT {
+            task_default_iters
+        } else {
+            configured_iters
+        };
         let idle_secs = DEFAULT_CHAT_LOOP_IDLE_TIMEOUT_SECS
             .max(MIN_CHAT_LOOP_IDLE_TIMEOUT_SECS)
             .min(max_duration_secs);
         Self {
-            max_iters: s.chat_loop_max_iters.unwrap_or(16),
+            max_iters,
             max_duration: Duration::from_secs(max_duration_secs),
             idle_timeout: Duration::from_secs(idle_secs),
-            max_reasoning_tokens: 64_000,
+            max_reasoning_tokens,
         }
     }
 }

@@ -4,6 +4,11 @@ import { cn } from "@/lib/utils";
 
 import type { CaseGraph, CaseGraphNode, CaseGraphView } from "./types";
 import { statusVisual } from "./visualizationTheme";
+import { configChoice } from "./viewConfig";
+
+export function timelineOrientation(view: CaseGraphView): "vertical" | "horizontal" {
+  return configChoice(view, "orientation", ["vertical", "horizontal"] as const, "vertical");
+}
 
 export interface TimelineItem {
   node: CaseGraphNode;
@@ -53,6 +58,42 @@ export default function LegalTimelineView({
     return (
       <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
         当前视图还没有事件节点
+      </div>
+    );
+  }
+  if (timelineOrientation(view) === "horizontal") {
+    return (
+      <div data-visual-export-root className="h-full overflow-auto px-6 py-8">
+        <div className="flex min-w-max items-start gap-4 border-t border-border pt-5">
+          {items.map((item) => {
+            const visual = statusVisual(item.node.status);
+            return (
+              <button
+                key={item.node.id}
+                type="button"
+                onClick={() => onSelectNode?.(item.node.id)}
+                className={cn(
+                  "relative w-64 shrink-0 rounded-md border border-border bg-background px-4 py-3 text-left shadow-sm",
+                  selectedNodeId === item.node.id && "ring-2 ring-brand/25",
+                )}
+              >
+                <span
+                  className="absolute -top-[27px] left-5 flex size-4 items-center justify-center rounded-full border-2 bg-background text-[9px]"
+                  style={{ borderColor: visual.color, color: visual.color }}
+                  aria-label={visual.label}
+                >
+                  {visual.marker}
+                </span>
+                <p className="font-mono text-xs font-medium text-foreground">{item.dateText}</p>
+                <h3 className="mt-2 text-sm font-semibold text-foreground">{item.node.label}</h3>
+                {item.node.detail && <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{item.node.detail}</p>}
+                <p className="mt-2 text-[10px] text-muted-foreground">
+                  {visual.label} · {item.sourceCount > 0 ? `${item.sourceCount} 项材料依据` : "未绑定材料"}
+                </p>
+              </button>
+            );
+          })}
+        </div>
       </div>
     );
   }

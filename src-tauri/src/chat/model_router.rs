@@ -149,6 +149,7 @@ pub fn route_model(task: TaskType, user_message: &str, settings: &Settings) -> M
         | TaskType::FindSimilarCases
         | TaskType::VerifyMyDraft
         | TaskType::SimulateOpposition
+        | TaskType::VisualizeCase
         | TaskType::DeepAnalysis
         | TaskType::CriminalDeepAnalysis => ModelChoice::pro(false),
         // 自由问 → 启发式

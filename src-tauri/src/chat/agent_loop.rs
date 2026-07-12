@@ -231,6 +231,8 @@ pub enum AgentLoopError {
     HttpStatus(u16, String),
     #[error("LLM 流式响应解析失败:{0}")]
     Parse(String),
+    #[error("回答未完成:{0}")]
+    Incomplete(String),
     #[error("用户取消")]
     Cancelled,
     #[error("LoopGuard 触发:{0}")]
@@ -489,6 +491,36 @@ const FORCE_FINISH_PROMPT: &str = "已达到本次会话的最大检索轮数,�
 必须明确标注「未能核实」或「需进一步核查」,严禁编造或杜撰任何法规、条文、判例或事实。\
 诚实的部分结论优于虚构的完整结论。";
 
+fn force_finish_notice(iterations: u32) -> String {
+    format!(
+        "\n\n> 运行说明：本次任务已达到安全轮次上限（{iterations} 轮）。系统确认期间持续有输出或工具结果，并非卡死；为避免继续无效扩张，现停止检索，并基于已经核验的信息强制收尾。以下为强制收尾结果。\n\n"
+    )
+}
+
+fn validate_terminal_pass(
+    content: &str,
+    finish_reason: Option<&str>,
+    phase: &str,
+    allow_missing_finish_reason: bool,
+) -> Result<(), AgentLoopError> {
+    match finish_reason {
+        Some("length") => Err(AgentLoopError::Incomplete(format!(
+            "{phase}达到模型输出长度上限，正文被截断"
+        ))),
+        Some("stop") if !content.trim().is_empty() => Ok(()),
+        None if allow_missing_finish_reason && !content.trim().is_empty() => Ok(()),
+        None => Err(AgentLoopError::Incomplete(format!(
+            "{phase}的网络流在未提供结束标记时中断"
+        ))),
+        Some("stop") => Err(AgentLoopError::Incomplete(format!(
+            "{phase}没有返回可用正文"
+        ))),
+        Some(other) => Err(AgentLoopError::Incomplete(format!(
+            "{phase}以非终态 {other} 结束"
+        ))),
+    }
+}
+
 /// 跑一次带工具的 chat 多轮循环。
 pub async fn run_chat_with_tools(
     config: &LlmConfig,
@@ -542,6 +574,11 @@ pub async fn run_chat_with_tools(
                 role: "user".into(),
                 content: FORCE_FINISH_PROMPT.into(),
             });
+            let notice = force_finish_notice(guard.iter_count());
+            full_content.push_str(&notice);
+            let _ = tx.send(ChatStreamEvent::Delta {
+                text: notice.clone(),
+            });
             match stream_one_request(
                 &endpoint,
                 config,
@@ -555,6 +592,12 @@ pub async fn run_chat_with_tools(
             .await
             {
                 Ok(o) => {
+                    validate_terminal_pass(
+                        &o.content,
+                        o.finish_reason.as_deref(),
+                        "最大轮次后的强制收尾",
+                        is_compat,
+                    )?;
                     full_content.push_str(&o.content);
                     merge_usage(&mut usage, &o.usage_chunk);
                     m_prompt += o.usage_chunk.prompt_tokens.unwrap_or(0);
@@ -564,10 +607,11 @@ pub async fn run_chat_with_tools(
                 }
                 Err(e) => {
                     crate::dlog!("agent_loop: 强制收尾轮失败 → {}", e);
-                    // 收尾失败:有半截内容就保留半截,否则透传真错(别静默吞)
-                    if full_content.trim().is_empty() {
-                        return Err(e);
-                    }
+                    // 过程文本由上层 streamed_partial 保留，但最终收尾失败绝不能标 done。
+                    // 否则用户只看到“第一步：开始查法条”之类过程稿，却没有中断提示。
+                    return Err(AgentLoopError::Incomplete(format!(
+                        "最大轮次后的最终收尾失败：{e}"
+                    )));
                 }
             }
             break;
@@ -809,13 +853,23 @@ pub async fn run_chat_with_tools(
                 continue;
             }
             Some("stop") | None => {
-                // 最终 — 完整内容已在 full_content 累积
+                validate_terminal_pass(
+                    &one.content,
+                    one.finish_reason.as_deref(),
+                    "最终回答",
+                    is_compat,
+                )?;
                 break;
             }
             Some("length") => {
-                // 超 max_tokens,可能被截断;不重试,告诉前端
                 crate::dlog!("agent_loop: finish_reason=length,本轮被 max_tokens 截断");
-                break;
+                validate_terminal_pass(
+                    &one.content,
+                    one.finish_reason.as_deref(),
+                    "最终回答",
+                    is_compat,
+                )?;
+                unreachable!("length 必须由 validate_terminal_pass 返回错误");
             }
             Some(other) => {
                 return Err(AgentLoopError::Parse(format!(

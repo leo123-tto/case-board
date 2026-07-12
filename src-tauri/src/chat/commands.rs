@@ -33,7 +33,7 @@ use crate::chat::context::TaskType;
 use crate::chat::model_router::route_model;
 use crate::chat::prompts::task_user_prompt;
 use crate::chat::quality_gate::{
-    evaluate_task_quality, format_quality_gate_note, QualityGateInput,
+    evaluate_task_quality, format_quality_gate_note, task_output_incomplete, QualityGateInput,
 };
 use crate::chat::stream::{ChatStreamEvent, ChatUsage};
 use crate::chat::task_contract::task_contract_prompt;
@@ -182,6 +182,7 @@ fn visualization_consent_from_message(message: &str) -> bool {
         "做一",
         "出图",
         "展示一下",
+        "展示给我",
         "可视化一下",
     ]
     .iter()
@@ -463,9 +464,11 @@ pub async fn case_chat_impl(
             // V0.2 D6.5 · 入 chat_messages.content 用 cleaned(剥掉 <CITATIONS> 块);
             // artifact 落盘也用 cleaned,防止 .md 文件里残留 JSON 引用块。
             let mut assistant_content = content_cleaned;
+            let output_incomplete = ask_user.as_ref().is_none_or(|items| items.is_empty())
+                && task_output_incomplete(task, &assistant_content);
             // ── 9. 决定是否落 artifact ──────────────────────────────
             let mut artifact_doc_id = if let Some(task_str) = task.as_db_str() {
-                if assistant_content.chars().count() >= 1500 {
+                if !output_incomplete && assistant_content.chars().count() >= 1500 {
                     match write_chat_artifact(
                         pool,
                         &input.case_id,
@@ -527,6 +530,9 @@ pub async fn case_chat_impl(
                 ask_user_present: ask_user.as_ref().is_some_and(|items| !items.is_empty()),
                 artifact_doc_id: artifact_doc_id.as_deref(),
             });
+            let incomplete_error = quality_report
+                .incomplete
+                .then(|| "模拟对抗未生成完整终稿；已保留过程内容，请重试本任务。".to_string());
             let quality_note = format_quality_gate_note(&quality_report);
             if !quality_note.is_empty() {
                 assistant_content.push_str(&quality_note);
@@ -564,7 +570,11 @@ pub async fn case_chat_impl(
                     },
                 )
                 .await;
-                let _ = crate::db::chat_tasks::finish_chat_task(pool, tid, "done", None).await;
+                let _ = if let Some(error) = incomplete_error.as_deref() {
+                    crate::db::chat_tasks::finish_chat_task(pool, tid, "failed", Some(error)).await
+                } else {
+                    crate::db::chat_tasks::finish_chat_task(pool, tid, "done", None).await
+                };
             }
 
             insert_chat_message(
@@ -581,7 +591,7 @@ pub async fn case_chat_impl(
                     latency_ms: Some(latency_ms as i64),
                     based_on: Some(&based_on_json),
                     artifact_doc_id: artifact_doc_id.as_deref(),
-                    error_short: None,
+                    error_short: incomplete_error.as_deref(),
                     attached_doc_ids: None,
                     citations_json: citations_json.as_deref(),
                     task_id: chat_task_id.as_deref(),
@@ -590,19 +600,21 @@ pub async fn case_chat_impl(
             .await
             .map_err(|e| format!("入库 assistant 消息失败: {}", e))?;
 
-            match persist_memory_candidates_from_turn(
-                pool,
-                &input.case_id,
-                &user_msg_id,
-                &assistant_id,
-                &input.user_message,
-                &assistant_content,
-            )
-            .await
-            {
-                Ok(n) if n > 0 => crate::dlog!("[memory] 新增 {} 条候选记忆", n),
-                Ok(_) => {}
-                Err(e) => crate::dlog!("[memory] 生成候选记忆失败: {}", e),
+            if incomplete_error.is_none() {
+                match persist_memory_candidates_from_turn(
+                    pool,
+                    &input.case_id,
+                    &user_msg_id,
+                    &assistant_id,
+                    &input.user_message,
+                    &assistant_content,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => crate::dlog!("[memory] 新增 {} 条候选记忆", n),
+                    Ok(_) => {}
+                    Err(e) => crate::dlog!("[memory] 生成候选记忆失败: {}", e),
+                }
             }
 
             // chat 完成后后台增量索引:本轮若调过 get_law_article/get_case_detail,新缓存的

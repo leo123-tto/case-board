@@ -11,6 +11,7 @@ use crate::db::case_visuals::{
 use super::{Tool, ToolContext, ToolError, ToolResult};
 
 pub struct SaveCaseVisualization;
+pub struct ApplyCaseVisualUpdate;
 pub struct ProposeCaseVisualUpdate;
 pub struct GetCaseVisualization;
 
@@ -138,7 +139,6 @@ fn graph_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "schema_version": {"type": "integer", "enum": [1]},
-            "case_id": {"type": "string"},
             "title": {"type": "string"},
             "summary": {"type": "string"},
             "nodes": {"type": "array", "maxItems": 300, "items": node_schema()},
@@ -146,7 +146,7 @@ fn graph_schema() -> Value {
             "datasets": {"type": "array", "maxItems": 20, "items": dataset_schema()},
             "views": {"type": "array", "maxItems": 20, "items": view_schema()}
         },
-        "required": ["schema_version", "case_id", "title", "summary", "nodes", "edges", "datasets", "views"]
+        "required": ["schema_version", "title", "summary", "nodes", "edges", "datasets", "views"]
     })
 }
 
@@ -179,11 +179,17 @@ fn ensure_consent(ctx: &ToolContext<'_>) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn parse_graph(args: &Value) -> Result<CaseGraph, ToolError> {
-    let value = args
+fn parse_graph(args: &Value, case_id: &str) -> Result<CaseGraph, ToolError> {
+    let mut value = args
         .get("graph")
         .cloned()
         .ok_or_else(|| ToolError::InvalidArgs("缺必填字段:graph".into()))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ToolError::InvalidArgs("graph 必须是对象".into()))?;
+    // case_id 属于当前会话的可信上下文，不应要求模型猜测数据库 UUID。
+    // 同时覆盖旧提示词/缓存可能继续传来的案件名称、"current" 或空字符串。
+    object.insert("case_id".into(), Value::String(case_id.to_string()));
     let graph: CaseGraph = serde_json::from_value(value)
         .map_err(|error| ToolError::InvalidArgs(format!("graph 结构错误:{error}")))?;
     case_visuals::validate_graph(&graph).map_err(ToolError::Visualization)?;
@@ -221,10 +227,19 @@ impl Tool for GetCaseVisualization {
         let case_id = ctx.case_id.ok_or(ToolError::NoCaseBound)?;
         let workspace = case_visuals::get_workspace(ctx.pool, case_id)
             .await
-            .map_err(ToolError::Visualization)?
-            .ok_or_else(|| ToolError::Runtime("本案还没有可视化工作区。".into()))?;
+            .map_err(ToolError::Visualization)?;
+        let Some(workspace) = workspace else {
+            return Ok(ToolResult::plain(
+                serde_json::to_string(&json!({
+                    "exists": false,
+                    "message": "本案还没有可视化工作区；如用户已同意，请调用 save_case_visualization 首次创建。"
+                }))
+                .map_err(|error| ToolError::Runtime(error.to_string()))?,
+            ));
+        };
         Ok(ToolResult::plain(
             serde_json::to_string(&json!({
+                "exists": true,
                 "workspace_id": workspace.id,
                 "revision": workspace.revision,
                 "graph": workspace.graph,
@@ -261,19 +276,14 @@ impl Tool for SaveCaseVisualization {
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
         ensure_consent(ctx)?;
         let case_id = ctx.case_id.ok_or(ToolError::NoCaseBound)?;
-        let graph = parse_graph(args)?;
-        if graph.case_id != case_id {
-            return Err(ToolError::InvalidArgs(
-                "graph.case_id 与当前案件不一致".into(),
-            ));
-        }
+        let graph = parse_graph(args, case_id)?;
         if case_visuals::get_workspace(ctx.pool, case_id)
             .await
             .map_err(ToolError::Visualization)?
             .is_some()
         {
             return Err(ToolError::Runtime(
-                "本案已有可视化工作区，请读取现有结构并调用 propose_case_visual_update 提交更新提案。"
+                "本案已有可视化工作区，请读取现有结构；用户已授权时调用 apply_case_visual_update 直接更新。"
                     .into(),
             ));
         }
@@ -308,6 +318,62 @@ impl Tool for SaveCaseVisualization {
                 "title": workspace.graph.title,
                 "views": views,
                 "message": "案情可视化工作区已保存，可提示用户进入工作台查看和编辑。"
+            }))
+            .map_err(|error| ToolError::Runtime(error.to_string()))?,
+        ))
+    }
+
+    fn is_mutating(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait]
+impl Tool for ApplyCaseVisualUpdate {
+    fn name(&self) -> &str {
+        "apply_case_visual_update"
+    }
+
+    fn description(&self) -> &str {
+        include_str!("descriptions/apply_case_visual_update.md")
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"patch": patch_schema()},
+            "required": ["patch"]
+        })
+    }
+
+    async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
+        ensure_consent(ctx)?;
+        let case_id = ctx.case_id.ok_or(ToolError::NoCaseBound)?;
+        let workspace = case_visuals::get_workspace(ctx.pool, case_id)
+            .await
+            .map_err(ToolError::Visualization)?
+            .ok_or_else(|| {
+                ToolError::Runtime(
+                    "本案还没有可视化工作区，请调用 save_case_visualization 首次创建。".into(),
+                )
+            })?;
+        let patch = parse_patch(args)?;
+        let saved = case_visuals::apply_direct_patch(ctx.pool, &workspace.id, &patch)
+            .await
+            .map_err(ToolError::Visualization)?;
+        let views: Vec<Value> = saved
+            .graph
+            .views
+            .iter()
+            .map(|view| json!({"id": view.id, "kind": view.kind, "title": view.title}))
+            .collect();
+        Ok(ToolResult::plain(
+            serde_json::to_string(&json!({
+                "workspace_id": saved.id,
+                "revision": saved.revision,
+                "views": views,
+                "message": "用户授权的可视化修改已直接应用到工作台，可立即查看或撤销。"
             }))
             .map_err(|error| ToolError::Runtime(error.to_string()))?,
         ))

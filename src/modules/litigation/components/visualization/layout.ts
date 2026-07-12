@@ -27,6 +27,13 @@ export interface CaseGraphLayout {
   height: number;
 }
 
+export function graphLayoutDirection(view: CaseGraphView): "RIGHT" | "DOWN" {
+  const configured = view.config.direction;
+  if (configured === "LR") return "RIGHT";
+  if (configured === "TB") return "DOWN";
+  return view.kind === "mindmap" ? "RIGHT" : "DOWN";
+}
+
 export async function layoutCaseGraph(
   graph: CaseGraph,
   view: CaseGraphView,
@@ -51,7 +58,7 @@ export async function layoutCaseGraph(
     id: "case-graph",
     layoutOptions: {
       "elk.algorithm": "layered",
-      "elk.direction": view.kind === "mindmap" ? "RIGHT" : "DOWN",
+      "elk.direction": graphLayoutDirection(view),
       "elk.edgeRouting": "ORTHOGONAL",
       "elk.layered.spacing.nodeNodeBetweenLayers": "72",
       "elk.spacing.nodeNode": "36",

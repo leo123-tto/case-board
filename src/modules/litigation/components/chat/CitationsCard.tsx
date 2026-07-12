@@ -31,11 +31,13 @@ import {
 } from "lucide-react";
 
 import { openInDefaultApp, openUrl } from "@/lib/api";
-import type { Citation } from "@/lib/types";
+import type { Citation, Document } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 interface Props {
   citations: Citation[];
+  /** 当前案件文档。引用协议只保存文件名，打开时必须据此解析本机真实路径。 */
+  documents?: Document[];
   /** 默认是否展开;一般 LLM 回答完后默认折叠,用户主动点开 */
   defaultOpen?: boolean;
 }
@@ -47,9 +49,14 @@ interface Group {
   items: Citation[];
 }
 
-export function CitationsCard({ citations, defaultOpen = false }: Props) {
+export function CitationsCard({
+  citations,
+  documents = [],
+  defaultOpen = false,
+}: Props) {
   const [open, setOpen] = useState(defaultOpen);
   const [copiedRef, setCopiedRef] = useState<number | null>(null);
+  const [openError, setOpenError] = useState<string | null>(null);
 
   const groups = useMemo<Group[]>(() => {
     const byKind = new Map<string, Citation[]>();
@@ -94,9 +101,15 @@ export function CitationsCard({ citations, defaultOpen = false }: Props) {
 
   const handleOpenPath = async (c: Citation) => {
     try {
-      await openInDefaultApp(c.source);
+      setOpenError(null);
+      const path = resolveCitationOpenPath(c, documents);
+      if (!path) {
+        throw new Error(`未在当前案件中找到引用文档：${c.source}`);
+      }
+      await openInDefaultApp(path);
     } catch (e) {
       console.error("[CitationsCard] open_in_default_app failed", e);
+      setOpenError(e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -136,6 +149,14 @@ export function CitationsCard({ citations, defaultOpen = false }: Props) {
 
       {open && (
         <div className="border-t border-border/40">
+          {openError && (
+            <div
+              role="alert"
+              className="mx-3 mt-2 rounded border border-amber-500/40 bg-amber-500/5 px-2 py-1.5 text-amber-700 dark:text-amber-300"
+            >
+              打开文档失败：{openError}
+            </div>
+          )}
           {groups.map((g) => (
             <div key={g.key} className="px-3 py-2">
               <div className="mb-1 flex items-center gap-1.5 text-label font-medium text-muted-foreground">
@@ -162,6 +183,22 @@ export function CitationsCard({ citations, defaultOpen = false }: Props) {
       )}
     </div>
   );
+}
+
+export function resolveCitationOpenPath(
+  citation: Citation,
+  documents: Document[],
+): string | null {
+  if (citation.type === "kb_local") return citation.source || null;
+  if (citation.type !== "doc") return null;
+
+  const exact = documents.find(
+    (doc) =>
+      doc.filename === citation.source ||
+      doc.display_name === citation.source ||
+      doc.source_path === citation.source,
+  );
+  return exact?.source_path ?? null;
 }
 
 interface RowProps {

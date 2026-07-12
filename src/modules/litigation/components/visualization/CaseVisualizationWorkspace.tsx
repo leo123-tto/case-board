@@ -21,8 +21,11 @@ import {
   Redo2,
   RotateCcw,
   Save,
+  SlidersHorizontal,
   Sparkles,
+  Trash2,
   Undo2,
+  X,
 } from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
 
@@ -48,7 +51,7 @@ import type {
   VisualProposal,
   VisualWorkspace,
 } from "./types";
-import { pushHistory, redoHistory, undoHistory } from "./graphReducer";
+import { pushHistory, redoHistory, removeGraphView, undoHistory } from "./graphReducer";
 import { statusVisual } from "./visualizationTheme";
 import {
   buildVisualPdfBase64,
@@ -64,6 +67,8 @@ const QuantitativeChartView = lazy(() => import("./QuantitativeChartView"));
 const BarTableView = lazy(() => import("./BarTableView"));
 const NodeInspector = lazy(() => import("./NodeInspector"));
 const ProposalReviewPanel = lazy(() => import("./ProposalReviewPanel"));
+const ViewSettingsPanel = lazy(() => import("./ViewSettingsPanel"));
+const AiVisualAdjustPanel = lazy(() => import("./AiVisualAdjustPanel"));
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -172,6 +177,7 @@ interface Props {
   onClose: () => void;
   onOpenSource?: (documentId: string) => void;
   onSaved?: (workspace: VisualWorkspace) => void;
+  onRequestAiChange?: (request: string) => Promise<void>;
 }
 
 export default function CaseVisualizationWorkspace({
@@ -180,6 +186,7 @@ export default function CaseVisualizationWorkspace({
   onClose,
   onOpenSource,
   onSaved,
+  onRequestAiChange,
 }: Props) {
   const [workspace, setWorkspace] = useState(initialWorkspace);
   const [graph, setGraph] = useState(initialWorkspace.graph);
@@ -198,13 +205,18 @@ export default function CaseVisualizationWorkspace({
   const [saveState, setSaveState] = useState<"idle" | "saved">("idle");
   const [error, setError] = useState<string | null>(null);
   const [proposals, setProposals] = useState<VisualProposal[]>([]);
-  const [reviewingProposal, setReviewingProposal] = useState(true);
+  const [activePanel, setActivePanel] = useState<"proposal" | "node" | "settings" | "ai">("node");
+  const [panelOpen, setPanelOpen] = useState(false);
   const [proposalBusy, setProposalBusy] = useState(false);
+  const [aiBusy, setAiBusy] = useState(false);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [exportMenuPosition, setExportMenuPosition] = useState({ top: 56, left: 8 });
   const [exporting, setExporting] = useState<"png" | "pdf" | "markdown" | "json" | null>(null);
   const saveInFlight = useRef(false);
   const savedStateTimer = useRef<number | null>(null);
   const canvasRef = useRef<HTMLElement>(null);
+  const exportButtonRef = useRef<HTMLButtonElement>(null);
+  const reconciledProposalIds = useRef<Set<string>>(new Set());
 
   const currentView = useMemo(
     () => graph.views.find((view) => view.id === currentViewId) ?? graph.views[0] ?? null,
@@ -219,17 +231,18 @@ export default function CaseVisualizationWorkspace({
     [currentView?.dataset_id, graph.datasets],
   );
   const activeProposal = useMemo(
-    () => proposals.find((proposal) => proposal.status === "pending")
-      ?? proposals.find((proposal) => proposal.status === "stale")
-      ?? null,
+    () => proposals.find((proposal) => proposal.status === "pending") ?? null,
     [proposals],
   );
 
   const loadProposals = useCallback(async (workspaceId: string) => {
     try {
-      setProposals(await listCaseVisualProposals(caseId, workspaceId));
+      const next = await listCaseVisualProposals(caseId, workspaceId);
+      setProposals(next);
+      return next;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "读取 AI 变更建议失败");
+      return [];
     }
   }, [caseId]);
 
@@ -249,8 +262,49 @@ export default function CaseVisualizationWorkspace({
   }, [onSaved]);
 
   useEffect(() => {
-    void loadProposals(workspace.id);
-  }, [loadProposals, workspace.id]);
+    let cancelled = false;
+    async function reconcileLegacyProposal() {
+      const next = await loadProposals(workspace.id);
+      if (cancelled) return;
+      const pending = next.find((proposal) =>
+        proposal.status === "pending"
+        && proposal.base_revision === workspace.revision
+        && !reconciledProposalIds.current.has(proposal.id));
+      if (!pending) return;
+      reconciledProposalIds.current.add(pending.id);
+      try {
+        const merged = await resolveCaseVisualProposal({
+          caseId,
+          workspaceId: workspace.id,
+          proposalId: pending.id,
+          action: "accept",
+          acceptedPatch: pending.patch,
+        });
+        if (cancelled) return;
+        adoptWorkspace(merged);
+        setProposals([]);
+      } catch (reason) {
+        if (!cancelled) {
+          setError(reason instanceof Error ? reason.message : "旧版可视化建议自动应用失败，请刷新后重试");
+        }
+      }
+    }
+    void reconcileLegacyProposal();
+    return () => {
+      cancelled = true;
+    };
+  }, [adoptWorkspace, caseId, loadProposals, workspace.id, workspace.revision]);
+
+  useEffect(() => {
+    if (!exportMenuOpen) return;
+    const close = () => setExportMenuOpen(false);
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [exportMenuOpen]);
 
   const persist = useCallback(
     async (summary: string): Promise<VisualWorkspace | null> => {
@@ -259,9 +313,13 @@ export default function CaseVisualizationWorkspace({
       setSaving(true);
       setError(null);
       try {
+        const currentViewIds = new Set(graph.views.map((view) => view.id));
+        const savedPositions = Object.fromEntries(
+          Object.entries(positionsByView).filter(([viewId]) => currentViewIds.has(viewId)),
+        );
         const layout: Record<string, JsonValue> = {
           ...workspace.layout,
-          positions_by_view: positionsByView,
+          positions_by_view: savedPositions,
           current_view_id: currentView?.id ?? "",
         };
         const saved = await saveCaseVisualUserRevision({
@@ -323,6 +381,35 @@ export default function CaseVisualizationWorkspace({
     setSaveState("idle");
   }
 
+  function changeView(view: CaseGraphView) {
+    setPast((items) => pushHistory(items, graph));
+    setFuture([]);
+    setGraph((current) => ({
+      ...current,
+      views: current.views.map((item) => item.id === view.id ? view : item),
+    }));
+    setSemanticDirty(true);
+    setSaveState("idle");
+  }
+
+  function deleteCurrentView() {
+    if (!currentView) return;
+    if (!window.confirm(`确定删除《${currentView.title}》吗？删除后可在保存前撤销。`)) return;
+    const currentIndex = graph.views.findIndex((view) => view.id === currentView.id);
+    const nextGraph = removeGraphView(graph, currentView.id);
+    const nextView = nextGraph.views[Math.min(currentIndex, nextGraph.views.length - 1)] ?? null;
+    setPast((items) => pushHistory(items, graph));
+    setFuture([]);
+    setGraph(nextGraph);
+    setCurrentViewId(nextView?.id ?? "");
+    setSelectedNodeId(null);
+    setSemanticDirty(true);
+    setLayoutDirty(true);
+    setSaveState("idle");
+    setActivePanel("node");
+    setPanelOpen(false);
+  }
+
   function undo() {
     const result = undoHistory(past, graph, future);
     if (!result.changed) return;
@@ -346,6 +433,26 @@ export default function CaseVisualizationWorkspace({
       return;
     }
     onClose();
+  }
+
+  function toggleExportMenu() {
+    if (exportMenuOpen) {
+      setExportMenuOpen(false);
+      return;
+    }
+    const rect = exportButtonRef.current?.getBoundingClientRect();
+    if (rect) {
+      setExportMenuPosition({
+        top: rect.bottom + 4,
+        left: Math.max(8, Math.min(window.innerWidth - 184, rect.right - 176)),
+      });
+    }
+    setExportMenuOpen(true);
+  }
+
+  function openPanel(panel: "proposal" | "node" | "settings" | "ai") {
+    setActivePanel(panel);
+    setPanelOpen(true);
   }
 
   async function captureCurrentView(): Promise<string> {
@@ -503,6 +610,52 @@ export default function CaseVisualizationWorkspace({
     }
   }
 
+  async function requestAiChange(request: string) {
+    if (semanticDirty || layoutDirty) {
+      setError("请先保存当前人工修改，再让 AI 调整视图");
+      return;
+    }
+    if (!onRequestAiChange) {
+      setError("当前无法连接案件 AI 助手");
+      return;
+    }
+    setAiBusy(true);
+    setError(null);
+    try {
+      await onRequestAiChange(request);
+      const latest = await getCaseVisualWorkspace(caseId);
+      if (!latest) throw new Error("AI 修改完成后未找到可视化工作区");
+      adoptWorkspace(latest);
+      setProposals([]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "AI 调整视图失败");
+    } finally {
+      setAiBusy(false);
+    }
+  }
+
+  function renderSidePanel() {
+    if (activeProposal && activePanel === "proposal") {
+      return (
+        <ProposalReviewPanel
+          proposal={activeProposal}
+          currentGraph={graph}
+          applying={proposalBusy}
+          onApply={(patch) => applyProposal(activeProposal, patch)}
+          onReject={() => rejectProposal(activeProposal)}
+          onRefresh={refreshWorkspace}
+        />
+      );
+    }
+    if (currentView && activePanel === "settings") {
+      return <ViewSettingsPanel view={currentView} onChange={changeView} />;
+    }
+    if (currentView && activePanel === "ai") {
+      return <AiVisualAdjustPanel view={currentView} busy={aiBusy} onSubmit={requestAiChange} />;
+    }
+    return <NodeInspector node={selectedNode} onChange={changeNode} onOpenSource={onOpenSource} />;
+  }
+
   function renderCurrentView() {
     if (!currentView) {
       return <div className="flex h-full items-center justify-center text-sm text-muted-foreground">工作区还没有视图</div>;
@@ -565,17 +718,49 @@ export default function CaseVisualizationWorkspace({
           </div>
         </div>
         <div className="flex w-full items-center gap-1.5 overflow-x-auto sm:w-auto">
-          {activeProposal && (
-            <Button
-              type="button"
-              variant={reviewingProposal ? "secondary" : "outline"}
-              size="sm"
-              onClick={() => setReviewingProposal((current) => !current)}
-            >
-              {reviewingProposal ? <FileSearch className="size-3.5" /> : <Sparkles className="size-3.5" />}
-              {reviewingProposal ? "节点检查" : "AI 建议"}
-            </Button>
-          )}
+          <Button
+            type="button"
+            variant={activePanel === "node" ? "secondary" : "outline"}
+            size="sm"
+            onClick={() => openPanel("node")}
+            aria-pressed={activePanel === "node"}
+          >
+            <FileSearch className="size-3.5" />
+            节点编辑
+          </Button>
+          <Button
+            type="button"
+            variant={activePanel === "settings" ? "secondary" : "outline"}
+            size="sm"
+            onClick={() => openPanel("settings")}
+            aria-pressed={activePanel === "settings"}
+            disabled={!currentView}
+          >
+            <SlidersHorizontal className="size-3.5" />
+            展示设置
+          </Button>
+          <Button
+            type="button"
+            variant={activePanel === "ai" ? "secondary" : "outline"}
+            size="sm"
+            onClick={() => openPanel("ai")}
+            aria-pressed={activePanel === "ai"}
+            disabled={!currentView || !onRequestAiChange || aiBusy}
+          >
+            {aiBusy ? <LoaderCircle className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />}
+            让 AI 调整
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="text-destructive hover:border-destructive/30 hover:bg-destructive/8 hover:text-destructive"
+            onClick={deleteCurrentView}
+            disabled={!currentView || saving}
+          >
+            <Trash2 className="size-3.5" />
+            删除当前图表
+          </Button>
           <Button type="button" variant="ghost" size="sm" disabled={past.length === 0} onClick={undo} aria-label="撤销">
             <Undo2 className="size-3.5" />
             撤销
@@ -586,6 +771,7 @@ export default function CaseVisualizationWorkspace({
           </Button>
           {currentView && ["relationship", "mindmap"].includes(currentView.kind) && (
             <Button
+              ref={exportButtonRef}
               type="button"
               variant="outline"
               size="sm"
@@ -604,7 +790,7 @@ export default function CaseVisualizationWorkspace({
               variant="outline"
               size="sm"
               disabled={saving || exporting !== null}
-              onClick={() => setExportMenuOpen((open) => !open)}
+              onClick={toggleExportMenu}
               aria-expanded={exportMenuOpen}
               aria-haspopup="menu"
             >
@@ -613,7 +799,11 @@ export default function CaseVisualizationWorkspace({
               {!exporting && <ChevronDown className="size-3" />}
             </Button>
             {exportMenuOpen && (
-              <div className="absolute right-0 top-full z-30 mt-1 w-44 rounded-md border border-border bg-card p-1 shadow-lg" role="menu">
+              <div
+                className="fixed z-[180] w-44 rounded-md border border-border bg-card p-1 shadow-lg"
+                style={{ top: exportMenuPosition.top, left: exportMenuPosition.left }}
+                role="menu"
+              >
                 {([
                   ["png", "当前视图 PNG"],
                   ["pdf", "全部视图 PDF"],
@@ -651,7 +841,7 @@ export default function CaseVisualizationWorkspace({
         </div>
       )}
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[auto_minmax(0,1fr)] lg:grid-cols-[220px_minmax(0,1fr)_310px] lg:grid-rows-1">
+      <div className="grid min-h-0 flex-1 grid-cols-1 grid-rows-[auto_minmax(0,1fr)] lg:grid-cols-[220px_minmax(0,1fr)] lg:grid-rows-1 xl:grid-cols-[220px_minmax(0,1fr)_310px]">
         <nav className="flex min-h-0 items-center gap-2 overflow-x-auto border-b border-border bg-surface-muted px-2 py-2 lg:block lg:overflow-y-auto lg:border-b-0 lg:border-r lg:py-3" aria-label="可视化视图">
           <div className="flex shrink-0 items-center gap-2 px-2 lg:mb-2">
             <Sparkles className="size-3.5 text-brand" />
@@ -710,20 +900,33 @@ export default function CaseVisualizationWorkspace({
           </Suspense>
         </main>
 
-        <div className="hidden min-h-0 lg:block">
+        {panelOpen && (
+          <button
+            type="button"
+            className="fixed inset-0 z-[150] bg-black/15 xl:hidden"
+            aria-label="关闭工作面板遮罩"
+            onClick={() => setPanelOpen(false)}
+          />
+        )}
+        <div
+          data-testid="visual-panel-drawer"
+          className={cn(
+            "fixed bottom-0 right-0 top-14 z-[160] min-h-0 w-[min(360px,calc(100vw-20px))] bg-background shadow-2xl xl:static xl:z-auto xl:flex xl:w-auto xl:shadow-none",
+            panelOpen ? "flex" : "hidden",
+          )}
+        >
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="absolute right-2 top-2 z-10 px-2 xl:hidden"
+            onClick={() => setPanelOpen(false)}
+            aria-label="关闭工作面板"
+          >
+            <X className="size-4" />
+          </Button>
           <Suspense fallback={<aside className="h-full border-l border-border bg-surface-muted" />}>
-            {activeProposal && reviewingProposal ? (
-              <ProposalReviewPanel
-                proposal={activeProposal}
-                currentGraph={graph}
-                applying={proposalBusy}
-                onApply={(patch) => applyProposal(activeProposal, patch)}
-                onReject={() => rejectProposal(activeProposal)}
-                onRefresh={refreshWorkspace}
-              />
-            ) : (
-              <NodeInspector node={selectedNode} onChange={changeNode} onOpenSource={onOpenSource} />
-            )}
+            {renderSidePanel()}
           </Suspense>
         </div>
       </div>

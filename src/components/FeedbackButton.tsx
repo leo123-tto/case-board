@@ -14,6 +14,7 @@
  */
 
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Check,
   ChevronDown,
@@ -514,7 +515,10 @@ function ModalShell({
   onClose: () => void;
   children: React.ReactNode;
 }) {
-  return (
+  // ModuleTabs 使用 backdrop-filter，且内部导航行会裁切横向内容。WebKit/WebView2
+  // 都可能因此把后代 fixed 元素限制在顶部栏的 containing block 内。弹窗必须挂到
+  // body，才能真正覆盖整个窗口；否则用户只会看到一条灰色遮罩和被截断的标题。
+  return createPortal(
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 px-4 py-8 backdrop-blur-sm animate-in fade-in-0 duration-200"
       onClick={(e) => {
@@ -538,6 +542,7 @@ function ModalShell({
         </header>
         <div className="min-h-0 flex-1 overflow-auto px-5 py-4">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

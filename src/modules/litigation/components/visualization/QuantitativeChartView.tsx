@@ -3,6 +3,7 @@ import type { EChartsCoreOption } from "echarts/core";
 
 import type { CaseGraphDataset, CaseGraphView } from "./types";
 import { ECHARTS_CASEBOARD_THEME } from "./visualizationTheme";
+import { configBool, configChoice } from "./viewConfig";
 
 function configString(view: CaseGraphView, key: string): string | undefined {
   const value = view.config[key];
@@ -58,16 +59,28 @@ export function buildChartOption(
     };
   }
 
+  const horizontal = view.kind === "bar"
+    && configChoice(view, "orientation", ["vertical", "horizontal"] as const, "vertical") === "horizontal";
+  const showLabels = configBool(view, "show_labels", false);
+  const smooth = view.kind === "line" ? configBool(view, "smooth", true) : false;
+
   return {
     ...base,
-    xAxis: { type: "category", name: categoryKey, axisLabel: { interval: 0, rotate: 18 } },
-    yAxis: { type: "value", name: valueKey, splitLine: { lineStyle: { type: "dashed" } } },
+    xAxis: horizontal
+      ? { type: "value", name: valueKey, splitLine: { lineStyle: { type: "dashed" } } }
+      : { type: "category", name: categoryKey, axisLabel: { interval: 0, rotate: 18 } },
+    yAxis: horizontal
+      ? { type: "category", name: categoryKey, axisLabel: { interval: 0 } }
+      : { type: "value", name: valueKey, splitLine: { lineStyle: { type: "dashed" } } },
     series: [
       {
         type: view.kind,
-        encode: { x: categoryKey, y: valueKey, itemName: categoryKey, tooltip: [categoryKey, valueKey] },
+        encode: horizontal
+          ? { x: valueKey, y: categoryKey, itemName: categoryKey, tooltip: [categoryKey, valueKey] }
+          : { x: categoryKey, y: valueKey, itemName: categoryKey, tooltip: [categoryKey, valueKey] },
         barMaxWidth: view.kind === "bar" ? 42 : undefined,
-        smooth: view.kind === "line" ? 0.18 : undefined,
+        smooth: view.kind === "line" ? (smooth ? 0.18 : false) : undefined,
+        label: showLabels ? { show: true, position: horizontal ? "right" : "top" } : undefined,
       },
     ],
   };

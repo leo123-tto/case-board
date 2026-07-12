@@ -54,6 +54,7 @@ import {
   updateTodo,
   updateWorkflowStatus,
 } from "@/lib/api";
+import { isCriminalCase } from "@/lib/caseDomain";
 import {
   ttStatus,
   ttListItems,
@@ -68,7 +69,15 @@ import { cn } from "@/lib/utils";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { CalendarBoard } from "./CalendarBoard";
 import { DashboardAssistantCard } from "./DashboardAssistantCard";
+import { buildDashboardAssistantContext } from "./dashboardAssistantContext";
 import { countOpenCaseRows, isOpenCaseStatus } from "./homeCaseCounts";
+import {
+  loadHomeListPreferences,
+  saveHomeListPreferences,
+  type HomeSortDir,
+  type HomeSortKey,
+  type HomeViewMode,
+} from "./homeListPreferences";
 import type { DailyBrief } from "./HomeCompanionStrip";
 import {
   loadHearingDisplayDetail,
@@ -113,9 +122,9 @@ export interface HomeViewProps {
   onImportFolder?: (eventTitle: string) => void;
 }
 
-type ViewMode = "grid" | "list";
-type SortKey = "status" | "amount" | "filed_at" | "hearing";
-type SortDir = "asc" | "desc";
+type ViewMode = HomeViewMode;
+type SortKey = HomeSortKey;
+type SortDir = HomeSortDir;
 
 interface CaseDisplayFields {
   caseNo: string | null;
@@ -157,9 +166,10 @@ export function HomeView({
   const [docsByCase, setDocsByCase] = useState<Record<string, Document[]>>({});
   const [statusOverride, setStatusOverride] = useState<Record<string, StatusId | null>>({});
   const [userOrder, setUserOrder] = useState<string[] | null>(null);
-  const [viewMode, setViewMode] = useState<ViewMode>("grid");
-  const [sortKey, setSortKey] = useState<SortKey>("status");
-  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  const [initialListPreferences] = useState(loadHomeListPreferences);
+  const [viewMode, setViewMode] = useState<ViewMode>(initialListPreferences.viewMode);
+  const [sortKey, setSortKey] = useState<SortKey>(initialListPreferences.sortKey);
+  const [sortDir, setSortDir] = useState<SortDir>(initialListPreferences.sortDir);
   const [statusFilters, setStatusFilters] = useState<Set<StatusId>>(new Set());
   const [courtFilter, setCourtFilter] = useState("");
   // 2026-06-16 · 首页模糊搜索(原告/被告名,公司或人名都可子串匹配)
@@ -182,6 +192,10 @@ export function HomeView({
   const [filterBarOn] = useFeatureFlag("home_filter_bar");
   const [homeCompanionOn] = useFeatureFlag("home_companion");
   const [ticktickOn] = useFeatureFlag("home_ticktick");
+
+  useEffect(() => {
+    saveHomeListPreferences({ viewMode, sortKey, sortDir });
+  }, [sortDir, sortKey, viewMode]);
 
   const reloadManualEvents = () => {
     listCalendarEvents()
@@ -377,6 +391,26 @@ export function HomeView({
   const dailyBriefContext = useMemo(
     () => buildHomeDailyBrief(upcomingEvents, activeCases, docsByCase),
     [activeCases, docsByCase, upcomingEvents],
+  );
+  const dashboardAssistantContext = useMemo(
+    () =>
+      buildDashboardAssistantContext({
+        cases: caseRows.map(({ caseData, status }) => ({
+          statusId: status.id,
+          statusLabel: status.label,
+          isCriminal: isCriminalCase(caseData),
+        })),
+        documents: Object.values(docsByCase)
+          .flat()
+          .map((document) => ({
+            extractionStatus: document.extraction_status,
+            deleted: !!document.deleted_at,
+          })),
+        openTodoCount: openTodos.length,
+        reminderUrgencies: upcomingEvents.map((event) => eventUrgency(event)),
+        snapshotComplete: cases.every((caseData) => caseData.id in docsByCase),
+      }),
+    [caseRows, cases, docsByCase, openTodos.length, upcomingEvents],
   );
   const hearingEventsSeed = upcomingEventsBase
     .filter((event) => event.kind === "hearing")
@@ -624,6 +658,7 @@ export function HomeView({
                 openCaseCount={openCaseCount}
                 displayName={userDisplayName}
                 activeCaseCount={activeCases.length}
+                assistantContext={dashboardAssistantContext}
                 reminderSummaries={assistantReminderSummaries}
                 dailyBrief={dailyBriefContext.brief}
                 onDailyBriefAction={() => {

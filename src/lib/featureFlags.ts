@@ -54,7 +54,7 @@ export const FEATURE_FLAGS: FeatureFlagMeta[] = [
     name: "home_companion",
     title: "首页看板助手",
     description:
-      "在首页显示问候、天气、案件简报和产品答疑聊天；还可以整理反馈草稿并打开反馈窗口。",
+      "在首页显示问候、天气和案件简报；产品答疑严格依据功能说明书，并可读取首页聚合数据、整理反馈草稿。",
     defaultValue: true,
     location: "settings",
   },

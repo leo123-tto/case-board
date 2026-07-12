@@ -191,7 +191,7 @@ function buildReviewItems(proposal: VisualProposal, graph: CaseGraph): ReviewIte
 }
 
 const sections = [
-  { category: "addition" as const, title: "新增事件", icon: Plus },
+  { category: "addition" as const, title: "新增内容与视图", icon: Plus },
   { category: "modification" as const, title: "事实变化", icon: GitCompareArrows },
   { category: "source" as const, title: "材料依据变化", icon: FileCheck2 },
   { category: "relation" as const, title: "关系变化", icon: Trash2 },
@@ -209,6 +209,11 @@ export default function ProposalReviewPanel({
   const [selected, setSelected] = useState<Set<PatchSelectionKey>>(new Set());
   const items = useMemo(() => buildReviewItems(proposal, currentGraph), [currentGraph, proposal]);
   const stale = proposal.status === "stale";
+  const viewChanges = proposal.patch.upsert_views.length + proposal.patch.remove_view_ids.length;
+  const selectableKeys = useMemo(
+    () => items.filter((item) => item.selectable).map((item) => item.key),
+    [items],
+  );
 
   function toggle(key: PatchSelectionKey) {
     setSelected((current) => {
@@ -230,7 +235,21 @@ export default function ProposalReviewPanel({
     <aside className="flex min-h-0 flex-col border-l border-border bg-surface-muted" aria-label="AI 变更审查">
       <div className="border-b border-border px-4 py-3">
         <p className="text-xs font-semibold text-foreground">AI 变更审查</p>
+        {viewChanges > 0 && (
+          <p className="mt-1 rounded border border-brand/20 bg-brand-soft/55 px-2 py-1.5 text-[11px] font-medium text-foreground">
+            {viewChanges} 张新图尚未加入工作台
+          </p>
+        )}
         <p className="mt-1 text-[11px] leading-4 text-muted-foreground">{proposal.patch.summary}</p>
+        {!stale && selectableKeys.length > 0 && (
+          <button
+            type="button"
+            className="mt-2 text-[11px] font-medium text-brand hover:underline"
+            onClick={() => setSelected(new Set(selectableKeys))}
+          >
+            全选可应用变更
+          </button>
+        )}
       </div>
 
       {stale && (

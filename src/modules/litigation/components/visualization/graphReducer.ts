@@ -211,6 +211,23 @@ export function applyCaseGraphPatch(
   return { graph: output, conflicts };
 }
 
+export function removeGraphView(graph: CaseGraph, viewId: string): CaseGraph {
+  const removed = graph.views.find((view) => view.id === viewId);
+  if (!removed) return graph;
+  const views = graph.views.filter((view) => view.id !== viewId);
+  const removedDatasetId = removed.dataset_id;
+  const datasetStillUsed = removedDatasetId
+    ? views.some((view) => view.dataset_id === removedDatasetId)
+    : true;
+  return {
+    ...graph,
+    views,
+    datasets: removedDatasetId && !datasetStillUsed
+      ? graph.datasets.filter((dataset) => dataset.id !== removedDatasetId)
+      : graph.datasets,
+  };
+}
+
 export function pushHistory<T>(past: T[], current: T, limit = 50): T[] {
   const boundedLimit = Math.max(0, Math.floor(limit));
   if (boundedLimit === 0) return [];

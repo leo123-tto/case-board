@@ -553,7 +553,26 @@ export interface DashboardAssistantMessage {
 
 export interface DashboardAssistantInput {
   messages: DashboardAssistantMessage[];
-  active_case_count: number;
+  context: DashboardAssistantContext;
+}
+
+export interface DashboardAssistantContext {
+  total_case_count: number;
+  open_case_count: number;
+  closed_case_count: number;
+  criminal_case_count: number;
+  execution_case_count: number;
+  status_counts: Record<string, number>;
+  document_count: number;
+  pending_document_count: number;
+  processing_document_count: number;
+  failed_document_count: number;
+  open_todo_count: number;
+  upcoming_event_count: number;
+  urgent_reminder_count: number;
+  overdue_reminder_count: number;
+  snapshot_complete: boolean;
+  captured_at: string;
 }
 
 export interface DashboardAssistantResponse {
@@ -562,6 +581,8 @@ export interface DashboardAssistantResponse {
   feedback_draft: string | null;
   source: "ai" | "fallback" | string;
   error: string | null;
+  references: string[];
+  data_sources: string[];
 }
 
 export function chatDashboardAssistant(
@@ -1405,6 +1426,7 @@ export type CaseChatTaskType =
   | "verify_my_draft"
   | "find_similar_cases"
   | "simulate_opposition"
+  | "visualize_case"
   | "deep_analysis"
   | "criminal_deep_analysis";
 

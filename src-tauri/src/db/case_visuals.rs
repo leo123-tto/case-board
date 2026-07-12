@@ -621,6 +621,59 @@ fn validate_view(view: &CaseGraphView, label: &str) -> Result<(), VisualError> {
             ViewConfigValue::Number(_) | ViewConfigValue::Bool(_) => {}
         }
     }
+    let choice = |key: &str, allowed: &[&str]| -> Result<(), VisualError> {
+        let Some(value) = view.config.get(key) else {
+            return Ok(());
+        };
+        match value {
+            ViewConfigValue::Text(value) if allowed.contains(&value.as_str()) => Ok(()),
+            _ => Err(validation(format!(
+                "{label}.config.{key}必须是{}",
+                allowed.join("/")
+            ))),
+        }
+    };
+    let boolean = |key: &str| -> Result<(), VisualError> {
+        let Some(value) = view.config.get(key) else {
+            return Ok(());
+        };
+        if matches!(value, ViewConfigValue::Bool(_)) {
+            Ok(())
+        } else {
+            Err(validation(format!("{label}.config.{key}必须是布尔值")))
+        }
+    };
+    match view.kind {
+        ViewKind::Timeline => {
+            choice("orientation", &["vertical", "horizontal"])?;
+            choice("density", &["comfortable", "compact"])?;
+            choice("group_by", &["none", "phase", "year"])?;
+            boolean("show_detail")?;
+            boolean("show_sources")?;
+        }
+        ViewKind::Relationship | ViewKind::Mindmap => {
+            choice("direction", &["LR", "TB"])?;
+            choice("layout_mode", &["layered", "free"])?;
+            boolean("show_minimap")?;
+            boolean("show_edge_labels")?;
+        }
+        ViewKind::EvidenceMatrix => {
+            choice("density", &["comfortable", "compact"])?;
+            choice("group_by", &["issue", "element"])?;
+            boolean("show_empty_columns")?;
+        }
+        ViewKind::Bar => {
+            choice("orientation", &["vertical", "horizontal"])?;
+            choice("sort", &["none", "ascending", "descending"])?;
+            boolean("show_labels")?;
+        }
+        ViewKind::Line => {
+            choice("sort", &["none", "ascending", "descending"])?;
+            boolean("show_labels")?;
+            boolean("smooth")?;
+        }
+        ViewKind::Heatmap | ViewKind::BarTable => {}
+    }
     Ok(())
 }
 
@@ -1186,6 +1239,74 @@ fn apply_patch(graph: &CaseGraph, patch: &CaseGraphPatch) -> CaseGraph {
         views,
         ..graph.clone()
     }
+}
+
+pub async fn apply_direct_patch(
+    pool: &SqlitePool,
+    workspace_id: &str,
+    patch: &CaseGraphPatch,
+) -> Result<VisualWorkspace, VisualError> {
+    validate_patch(patch)?;
+    validate_text(&patch.summary, "patch.summary", MAX_DETAIL_CHARS, false)?;
+    let mut tx = pool.begin().await?;
+    let workspace_query =
+        format!("SELECT {WORKSPACE_COLUMNS} FROM case_visual_workspaces WHERE id = ?");
+    let workspace_row = sqlx::query_as::<_, WorkspaceRow>(&workspace_query)
+        .bind(workspace_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(VisualError::WorkspaceNotFound)?;
+    let workspace = workspace_from_row(workspace_row)?;
+    if patch.base_revision != workspace.revision {
+        return Err(VisualError::RevisionConflict);
+    }
+
+    let graph = apply_patch(&workspace.graph, patch);
+    validate_graph(&graph)?;
+    let graph_json = serde_json::to_string(&graph)?;
+    let layout_json = serde_json::to_string(&workspace.layout)?;
+    let next_revision = workspace.revision + 1;
+    let result = sqlx::query(
+        "UPDATE case_visual_workspaces \
+         SET graph_json = ?, revision = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ? AND revision = ?",
+    )
+    .bind(&graph_json)
+    .bind(next_revision)
+    .bind(workspace_id)
+    .bind(workspace.revision)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(VisualError::RevisionConflict);
+    }
+    sqlx::query(
+        "INSERT INTO case_visual_revisions \
+         (id, workspace_id, revision, base_revision, graph_json, layout_json, source, summary) \
+         VALUES (?, ?, ?, ?, ?, ?, 'ai_merge', ?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(workspace_id)
+    .bind(next_revision)
+    .bind(workspace.revision)
+    .bind(&graph_json)
+    .bind(&layout_json)
+    .bind(&patch.summary)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE case_visual_proposals \
+         SET status = 'stale', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE workspace_id = ? AND status = 'pending'",
+    )
+    .bind(workspace_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    prune_revisions(pool, workspace_id).await?;
+    get_workspace_by_id(pool, workspace_id)
+        .await?
+        .ok_or(VisualError::WorkspaceNotFound)
 }
 
 fn ensure_patch_subset(

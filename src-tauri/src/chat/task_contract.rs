@@ -128,6 +128,26 @@ impl TaskContract {
                     "必须列出我方最需要补强的证据缺口和对方最可能突破的薄弱点",
                 ],
             },
+            TaskType::VisualizeCase => Self {
+                task,
+                name: "案情可视化",
+                required_tools: &[
+                    "list_case_docs",
+                    "read_case_doc",
+                    "ask_user",
+                    "get_case_visualization",
+                    "save_case_visualization",
+                    "apply_case_visual_update",
+                ],
+                citation_policy: CitationPolicy::WhenCitingSources,
+                ask_user_policy: AskUserPolicy::RequiredBeforeFinal,
+                artifact_policy: ArtifactPolicy::Optional,
+                success_criteria: &[
+                    "首次点击必须先分析本案适合的可视化角度，并通过一次多选让律师决定",
+                    "用户选择前不得写入工作区；选择后只生成所选视图",
+                    "已有工作区在用户完成选择后直接应用，不能再次要求审核底层节点或关系",
+                ],
+            },
             TaskType::DeepAnalysis => Self {
                 task,
                 name: "民事深度分析",
@@ -207,7 +227,7 @@ impl TaskContract {
         out.push_str(&format!("- 追问要求: {}\n", ask_user));
         out.push_str(&format!("- 成果形态: {}\n", artifact));
         out.push_str(
-            "- 可视化工具: get_case_visualization 可读取现状；save_case_visualization / propose_case_visual_update 写入前须先取得用户同意\n",
+            "- 可视化工具: get_case_visualization 可读取现状；save_case_visualization / apply_case_visual_update 写入前须先取得用户同意；明确授权后直接应用，不再二次审核\n",
         );
         out.push_str("- 成功标准:\n");
         for item in self.success_criteria {

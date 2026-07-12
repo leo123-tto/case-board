@@ -32,6 +32,8 @@ pub enum TaskType {
     VerifyMyDraft,
     /// 模拟对抗:站对方立场推演抗辩/进攻 + 我方应对(走 agent_loop,查支持对方的法条/类案)
     SimulateOpposition,
+    /// 一键案情可视化:先分析适合本案的视图并一次多选，用户选择后才创建或提交更新提案。
+    VisualizeCase,
     /// 深度分析:请求权基础 + 鉴定式方法论,两闸交互确认(候选请求权清单 → 大纲)后逐要件论证,
     /// 落一份深度分析报告 artifact(走 agent_loop,逐条 get_law_article 校验法条)。
     DeepAnalysis,
@@ -49,6 +51,7 @@ impl TaskType {
             Some("find_similar_cases") => Self::FindSimilarCases,
             Some("verify_my_draft") => Self::VerifyMyDraft,
             Some("simulate_opposition") => Self::SimulateOpposition,
+            Some("visualize_case") => Self::VisualizeCase,
             Some("deep_analysis") => Self::DeepAnalysis,
             Some("criminal_deep_analysis") => Self::CriminalDeepAnalysis,
             _ => Self::FreeChat,
@@ -63,6 +66,7 @@ impl TaskType {
             Self::FindSimilarCases => Some("find_similar_cases"),
             Self::VerifyMyDraft => Some("verify_my_draft"),
             Self::SimulateOpposition => Some("simulate_opposition"),
+            Self::VisualizeCase => Some("visualize_case"),
             Self::DeepAnalysis => Some("deep_analysis"),
             Self::CriminalDeepAnalysis => Some("criminal_deep_analysis"),
         }
@@ -77,6 +81,7 @@ impl TaskType {
                 | Self::FindSimilarCases
                 | Self::VerifyMyDraft
                 | Self::SimulateOpposition
+                | Self::VisualizeCase
                 | Self::DeepAnalysis
                 | Self::CriminalDeepAnalysis
         )

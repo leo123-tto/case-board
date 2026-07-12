@@ -114,6 +114,7 @@ import {
   subscribeRun,
   type ChatSegment,
 } from "./chatRunRegistry";
+import { loadWorkspaceAfterVisualMutation } from "./visualizationCompletion";
 
 const CaseVisualizationWorkspace = lazy(
   () => import("../visualization/CaseVisualizationWorkspace"),
@@ -710,12 +711,18 @@ export function CaseChatPanel({
         (t) => t.tool === "edit_artifact" && t.success,
       );
       if (calledEditArtifact) onArtifactEdited?.();
-      const calledVisualTool = result.tool_calls?.some(
-        (tool) =>
-          (tool.tool === "save_case_visualization" || tool.tool === "propose_case_visual_update")
-          && tool.success,
-      );
-      if (calledVisualTool) await refreshVisualSummaries();
+      // 用户明确要求生成/更新图表后，直接进入真正的全屏工作台。
+      // 不再让用户停留在聊天 Markdown 里猜“图表在哪里”或寻找隐蔽入口。
+      try {
+        const workspace = await loadWorkspaceAfterVisualMutation(
+          result.tool_calls,
+          refreshVisualSummaries,
+          () => getCaseVisualWorkspace(caseId),
+        );
+        if (workspace) setOpenedVisualWorkspace(workspace);
+      } catch (reason) {
+        setError(`可视化已保存，但工作台暂时无法打开：${formatError(reason)}`);
+      }
     } catch (e) {
       const msg = formatError(e);
       setError(msg);
@@ -1008,6 +1015,7 @@ export function CaseChatPanel({
           <MessageBubble
             key={msg.id}
             msg={msg}
+            documents={caseDocs}
             visualSummary={visualSummaryByMessageId.get(msg.id)}
             onOpenVisual={setOpenedVisualWorkspace}
           />
@@ -1285,6 +1293,13 @@ export function CaseChatPanel({
             onClick={() => send("", "criminal_deep_analysis")}
             disabled={disabled}
           />
+          <QuickChip
+            icon={GitBranch}
+            label="案情可视化"
+            hint="自动分析本案哪些内容适合做时间线、关系图、证据矩阵或量化图表，再一次多选生成；不会未经确认直接写入"
+            onClick={() => send("", "visualize_case")}
+            disabled={disabled}
+          />
         </div>
       ) : (
       /* 快捷任务 chip(V0.3.3:6 个功能单一的生成型 chip 已删 —— AI 助手已是 agent,
@@ -1327,6 +1342,13 @@ export function CaseChatPanel({
           label="深度分析"
           hint="请求权基础+鉴定式深度分析:先让你确认候选请求权清单,再确认分析大纲,然后逐要件论证(法条逐条校验),落一份深度分析报告。复杂疑难案件用(会停下来问你两次,推理模式)"
           onClick={() => send("", "deep_analysis")}
+          disabled={disabled}
+        />
+        <QuickChip
+          icon={GitBranch}
+          label="案情可视化"
+          hint="自动分析本案哪些内容适合做时间线、关系图、证据矩阵或量化图表，再一次多选生成；不会未经确认直接写入"
+          onClick={() => send("", "visualize_case")}
           disabled={disabled}
         />
         {/* V0.3 · 写文书一键入口(走 save_artifact 出「可编辑+可导出 Word」的正式文书,
@@ -1470,6 +1492,9 @@ export function CaseChatPanel({
               setOpenedVisualWorkspace(workspace);
               void refreshVisualSummaries().catch(() => {});
             }}
+            onRequestAiChange={async (request) => {
+              await send(request, null);
+            }}
           />
         </Suspense>
       )}
@@ -1485,10 +1510,12 @@ export function CaseChatPanel({
 
 const MessageBubble = memo(function MessageBubble({
   msg,
+  documents,
   visualSummary,
   onOpenVisual,
 }: {
   msg: ChatMessage;
+  documents: Document[];
   visualSummary?: VisualWorkspaceSummary;
   onOpenVisual: (workspace: VisualWorkspace) => void;
 }) {
@@ -1529,7 +1556,9 @@ const MessageBubble = memo(function MessageBubble({
         <div className="max-w-[95%] rounded-lg bg-card/92 px-3 py-2 text-sm text-foreground shadow-sm ring-1 ring-border">
           <MarkdownView text={msg.content} />
           {/* V0.2 D6.5 · 引用卡(若 LLM 落了 <CITATIONS>) */}
-          {citations.length > 0 && <CitationsCard citations={citations} />}
+          {citations.length > 0 && (
+            <CitationsCard citations={citations} documents={documents} />
+          )}
           {/* 出错中断但有半截内容:展示已生成部分 + 中断提示(防"全消失") */}
           {msg.error_short && (
             <div className="mt-2 border-t border-destructive/30 pt-1.5 text-label text-destructive">

@@ -1,6 +1,5 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import App from "./App";
 import "./styles/globals.css";
 import { installConsoleTap } from "@/lib/console-tap";
 import { applyFontScale } from "@/lib/uiScale";
@@ -20,8 +19,10 @@ applyFontScale();
 // 主题在 React 首屏前应用，避免先闪现默认主题。默认值仍是现有主题。
 applyThemePreference();
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-);
+import("./App").then(({ default: App }) => {
+  ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>,
+  );
+});

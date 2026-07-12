@@ -206,9 +206,10 @@ impl ToolRegistry {
             Box::new(artifact::EditArtifact),
             // 交互工具 1(V0.3):选项式追问(agent_loop 拦截,不进 parallel 派发)
             Box::new(ask_user::AskUser),
-            // 案情可视化 3:读取现状 + 首次创建 + 更新提案
+            // 案情可视化 4:读取现状 + 首次创建 + 用户授权后直改 + 非主动建议提案
             Box::new(visualization::GetCaseVisualization),
             Box::new(visualization::SaveCaseVisualization),
+            Box::new(visualization::ApplyCaseVisualUpdate),
             Box::new(visualization::ProposeCaseVisualUpdate),
             // 文档维护 1(V0.3):触发后台重抽某文档(mutating,会重跑 OCR/LLM 烧积分)
             Box::new(reextract::ReextractDocument),

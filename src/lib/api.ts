@@ -1431,6 +1431,14 @@ export interface KbInitResult {
   reused_existing: boolean;
 }
 
+/** 知识库迁移结果(对应 Rust `local_kb::init::KbRelocateResult`)。 */
+export interface KbRelocateResult {
+  old_root: string;
+  new_root: string;
+  moved_files: number;
+  moved_bytes: number;
+}
+
 /** 导出结果。 */
 export interface KbExportResult {
   output_path: string;
@@ -1467,6 +1475,14 @@ export function detectKbStatus(): Promise<KbStatus> {
 /** 在指定路径建空 KB(已有则只补缺失子目录),自动写回 settings 启用。 */
 export function createLocalKb(path: string): Promise<KbInitResult> {
   return invoke<KbInitResult>("create_local_kb", { path });
+}
+
+/** 将本地知识库迁移到新目录;由前端在确认是否移动旧文件后调用。 */
+export function relocateLocalKb(
+  oldRoot: string,
+  newRoot: string,
+): Promise<KbRelocateResult> {
+  return invoke<KbRelocateResult>("relocate_local_kb", { oldRoot, newRoot });
 }
 
 /** 从 zip 导入资料包合并进当前 KB。 */

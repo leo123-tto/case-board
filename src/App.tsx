@@ -34,6 +34,7 @@ import { EmptyState } from "@/modules/litigation/components/EmptyState";
 import { ProgressBanner } from "@/modules/litigation/components/ProgressBanner";
 import { confirmDialog } from "@/lib/dialog";
 import { useFeatureFlag } from "@/lib/featureFlags";
+import { applyThemePreference } from "@/lib/theme";
 import {
   checkForUpdate,
   deleteCase,
@@ -117,6 +118,7 @@ function App() {
 }
 
 function MainApp() {
+  const [emeraldThemeOn] = useFeatureFlag("theme_emerald");
   /** 全部已入库案件(按 updated_at 倒序) */
   const [cases, setCases] = useState<Case[]>([]);
   /** 当前选中案件 ID */
@@ -207,6 +209,10 @@ function MainApp() {
    * 用来决定 ModuleTabs 右侧是否显示 DeepSeekBalanceChip。
    */
   const [showDeepSeekChip, setShowDeepSeekChip] = useState(false);
+
+  useEffect(() => {
+    applyThemePreference(emeraldThemeOn);
+  }, [emeraldThemeOn]);
 
   // 首次启动检测是否需要 onboarding + 判断是否显示 DeepSeek chip
   useEffect(() => {
@@ -985,16 +991,6 @@ function MainApp() {
           `${parts.join(" · ")}${needsAnalysis ? " · 后台抽取中" : " · 无需重新分析"}`,
           "success",
         );
-        // 立刻刷一次文档列表,让前端看到 deleted_at / pending 状态变化
-        if (selectedId) {
-          try {
-            const r = await getCaseWithDocs(selectedId);
-            setSelectedCase(r.case);
-            setDocuments(r.documents);
-          } catch {
-            /* 不阻塞 */
-          }
-        }
       }
       if (stats.scan_warnings.length > 0) {
         toast(
@@ -1002,6 +998,16 @@ function MainApp() {
           "error",
           12000,
         );
+      }
+      // 无论源文件夹有无变化,都顺手重刷一次案件数据,让 AI 对 snapshot 的覆盖立即生效
+      if (selectedId) {
+        try {
+          const r = await getCaseWithDocs(selectedId);
+          setSelectedCase(r.case);
+          setDocuments(r.documents);
+        } catch {
+          /* 不阻塞 */
+        }
       }
     } catch (e) {
       setError(`刷新源文件失败: ${e}`);
@@ -1056,6 +1062,23 @@ function MainApp() {
     },
     [selectedId],
   );
+
+  // AI 助手通过 update_case_snapshot_field 修改案件画像后,前端立即刷新当前案件
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    listen<{ case_id: string }>("case-snapshot-changed", (event) => {
+      if (selectedId && event.payload.case_id === selectedId) {
+        handleReloadCase();
+      }
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch((e) => console.warn("listen case-snapshot-changed failed", e));
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [selectedId, handleReloadCase]);
 
   /** V0.3 D1+D2 · 在编辑器里打开一份文书(从 MarkdownModal「✏️ 进行编辑」入口) */
   const handleOpenEditor = useCallback((doc: Document) => {
@@ -1146,6 +1169,7 @@ function MainApp() {
     documents,
     loading,
     error,
+    onDismissError: () => setError(null),
     onSwitchCase: setSelectedId,
     onGoHome: goHome,
     onOpenDoc: handleOpenDoc,

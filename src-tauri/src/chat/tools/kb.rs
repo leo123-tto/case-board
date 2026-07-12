@@ -1,6 +1,6 @@
 //! 本地知识库 2 个 tool(V0.2 D2-D3.E)。
 //!
-//! `search_local_kb` / `read_kb_file` 全部读 `~/Documents/知识库/` 任意位置,
+//! `search_local_kb` / `read_kb_file` 全部读 `~/Documents/案件知识库/` 任意位置,
 //! 走 `local_kb::search` 模块,**不消耗元典积分**。
 //! KB 未启用时(`ctx.local_kb` = None)直接返回空,不报错(降级)。
 

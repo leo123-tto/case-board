@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::settings::Settings;
 
 const MEMORY_DIR_NAME: &str = "记忆";
-const DEFAULT_KB_DIR_NAME: &str = "知识库";
+const DEFAULT_KB_DIR_NAME: &str = "案件知识库";
 const README_FILE: &str = "README.md";
 const NOTE_MAX_CHARS: usize = 20_000;
 

@@ -324,6 +324,20 @@ const NUMBER_PATHS: Record<string, "claim_amount"> = {
 };
 
 /**
+ * 数组型字段(path 形如 agg_plaintiffs.0) → snapshot 数组字段名。
+ * 用于 AI 助手纠正当事人/法官列表中的某一项。
+ */
+const ARRAY_PATHS: Record<
+  string,
+  "plaintiffs" | "defendants" | "third_parties" | "judges"
+> = {
+  agg_plaintiffs: "plaintiffs",
+  agg_defendants: "defendants",
+  agg_third_parties: "third_parties",
+  agg_judges: "judges",
+};
+
+/**
  * 子表里是 number 类型的 inner 字段(用户改时要 parseFloat,不能字符串直写)。
  * 不在这里的 inner 默认按字符串写。
  *
@@ -358,6 +372,19 @@ const SUBTABLE_SNAPSHOT_KEY: Record<
   agg_key_dates: "key_dates",
   agg_fees: "fees",
 };
+
+/**
+ * 解析数组索引 path:`agg_xxx.N` → 结构化对象。
+ */
+function parseArrayIndexPath(
+  path: string,
+): { field: keyof typeof ARRAY_PATHS; index: number } | null {
+  const match = path.match(/^(agg_[a-z_]+)\.(\d+)$/);
+  if (!match) return null;
+  const field = match[1] as keyof typeof ARRAY_PATHS;
+  if (!(field in ARRAY_PATHS)) return null;
+  return { field, index: parseInt(match[2], 10) };
+}
 
 /**
  * 解析子表 dotted path:`agg_xxx.{row-key}.inner` → 结构化对象。
@@ -434,6 +461,27 @@ export function applyFieldOverrides<S extends object>(
       } else if (typeof raw === "string") {
         const parsed = parseCleanNumber(raw);
         if (parsed !== undefined) next[numberKey] = parsed;
+      }
+      continue;
+    }
+    // 数组型字段:agg_plaintiffs.0 / agg_defendants.1 等
+    const array = parseArrayIndexPath(path);
+    if (array) {
+      const snapKey = ARRAY_PATHS[array.field];
+      const rows = (next[snapKey] as Array<unknown> | undefined) ?? [];
+      if (array.index >= 0 && array.index <= rows.length) {
+        const newRows = rows.slice();
+        const value =
+          raw === null || (typeof raw === "string" && raw.trim() === "")
+            ? ""
+            : raw;
+        if (array.index === newRows.length) {
+          // AI 纠正时目标数组为空或要在末尾新增,直接追加,避免写入不存在的下标
+          newRows.push(value);
+        } else {
+          newRows[array.index] = value;
+        }
+        next[snapKey] = newRows as unknown[];
       }
       continue;
     }

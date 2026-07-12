@@ -1,16 +1,17 @@
 //! 案件 AI 助手 V2 的工具集合(V0.2 D2-D3)。
 //!
-//! 30 个内置 tool 分 11 类(详 docs/V0.2-法律AI工作台-实施计划.md § 5):
+//! 31 个内置 tool 分 12 类(详 docs/V0.2-法律AI工作台-实施计划.md § 5):
 //!   - 法规法条 5 (laws.rs)
 //!   - 案例 4 (cases.rs)
 //!   - 企业 6 (companies.rs)
 //!   - 幻觉校验 1 (verify.rs · hall_detect,不缓存)
 //!   - 案件文档 4 (docs.rs · sqlite + 案件 extracted_text_path;semantic.rs · 向量语义检索)
-//!   - 本地知识库 3 (kb.rs · `~/Documents/知识库/` 整库;semantic_kb.rs · 语义检索)
+//!   - 本地知识库 3 (kb.rs · `~/Documents/案件知识库/` 整库;semantic_kb.rs · 语义检索)
 //!   - 写作工具 2 (artifact.rs · save_artifact 文书生产 + edit_artifact 局部编辑,均 mutating)
 //!   - 交互工具 1 (ask_user.rs · 选项式追问,agent_loop 拦截不进派发)
 //!   - 文档维护 1 (reextract.rs · reextract_document,V0.3 触发后台重抽,mutating)
 //!   - 入库工具 1 (save_kb.rs · save_company_report,企业报告入库 raw/companies/,P2,mutating)
+//!   - 快照维护 1 (snapshot.rs · update_case_snapshot_field,AI 助手直接纠正案件画像,mutating)
 //!   - 公开联网工具 2 (web.rs · web_search / web_fetch,只读兜底)
 //!
 //! 调用方:`chat::agent_loop`(D3-D4 实施)拿到 LLM 的 function_call,
@@ -26,7 +27,7 @@
 //! `read_case_doc`、`find_in_document`(全部案件内查 sqlite/文件)、
 //! `semantic_search_case_docs`、`search_local_kb`、`semantic_search_local_kb`、`read_kb_file`
 //! (本身就是从 KB 读或查向量索引)、`save_artifact` / `edit_artifact` / `ask_user` /
-//! `reextract_document` / `save_company_report` / `web_search` / `web_fetch`。
+//! `reextract_document` / `save_company_report` / `update_case_snapshot_field` / `web_search` / `web_fetch`。
 
 pub mod artifact;
 pub mod ask_user;
@@ -40,6 +41,7 @@ pub mod reextract;
 pub mod save_kb;
 pub mod semantic;
 pub mod semantic_kb;
+pub mod snapshot;
 pub mod verify;
 pub mod web;
 
@@ -202,6 +204,8 @@ impl ToolRegistry {
             Box::new(reextract::ReextractDocument),
             // 入库工具 1(P2):把企业调查报告写进本地 KB raw/companies/(mutating)
             Box::new(save_kb::SaveCompanyReport),
+            // 快照维护 1:AI 助手直接纠正案件画像字段(mutating)
+            Box::new(snapshot::UpdateCaseSnapshotField),
             // 通用联网工具 2:公开网页搜索 / 读取。只读,作为本地 KB + 元典之外的兜底。
             Box::new(web::WebSearch),
             Box::new(web::WebFetch),

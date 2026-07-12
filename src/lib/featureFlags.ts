@@ -18,6 +18,7 @@ const PREFIX = "caseboard:feature:";
 const CHANGE_EVENT = "caseboard:feature-change";
 
 export type FeatureFlagName =
+  | "theme_emerald"
   | "home_filter_bar"
   | "home_companion"
   | "home_ticktick"
@@ -42,6 +43,14 @@ export interface FeatureFlagMeta {
 
 /** 注册表:所有首页功能开关。**新增首页功能 → 在这里加一条。** */
 export const FEATURE_FLAGS: FeatureFlagMeta[] = [
+  {
+    name: "theme_emerald",
+    title: "墨绿 + 象牙白主题皮肤",
+    description:
+      "开启后使用墨绿主色和象牙白背景。关闭则回到原来的白灰中性主题。",
+    defaultValue: true,
+    location: "settings",
+  },
   {
     name: "home_filter_bar",
     title: "首页筛选工具栏",

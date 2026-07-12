@@ -120,3 +120,204 @@ pub fn reconcile_existing(target: &Path) -> Result<KbInitResult, KbError> {
         reused_existing: true,
     })
 }
+
+/// 知识库迁移回执。
+#[derive(Debug, Clone, Serialize)]
+pub struct KbRelocateResult {
+    pub old_root: PathBuf,
+    pub new_root: PathBuf,
+    pub moved_files: u64,
+    pub moved_bytes: u64,
+}
+
+/// 忽略 macOS 在空目录里自动生成的占位文件,避免"看起来空"的目录被误判为非空。
+fn is_effectively_empty(dir: &Path) -> Result<bool, KbError> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".DS_Store" || name == ".localized" {
+            continue;
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// 将旧知识库目录下的内容迁移到新目录。
+///
+/// 行为:
+/// - 新目录不存在:自动创建。
+/// - 新目录存在但为空(忽略 `.DS_Store`/`.localized`):把旧内容移入。
+/// - 新目录存在且非空:返回错误,避免覆盖或混淆。
+/// - 旧目录迁移完成后若为空则删除。
+/// - 跨卷/跨设备时自动回退为"复制后删除源文件"。
+pub fn relocate_kb(old_root: &Path, new_root: &Path) -> Result<KbRelocateResult, KbError> {
+    let old = old_root
+        .canonicalize()
+        .unwrap_or_else(|_| old_root.to_path_buf());
+    let new = new_root
+        .canonicalize()
+        .unwrap_or_else(|_| new_root.to_path_buf());
+
+    if old == new {
+        return Err(KbError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "新路径与当前路径相同",
+        )));
+    }
+    if new.starts_with(&old) || old.starts_with(&new) {
+        return Err(KbError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "新旧目录不能互相嵌套",
+        )));
+    }
+
+    if !old.exists() || !old.is_dir() {
+        return Err(KbError::NoPath(old));
+    }
+    if new.exists() && new.is_file() {
+        return Err(KbError::NotADir(new));
+    }
+    if !new.exists() {
+        std::fs::create_dir_all(&new)?;
+    } else if !is_effectively_empty(&new)? {
+        return Err(KbError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "目标目录已存在且非空,请选择一个空目录",
+        )));
+    } else {
+        // 清理 macOS 占位文件,避免后续同名文件冲突。
+        for name in [".DS_Store", ".localized"] {
+            let _ = std::fs::remove_file(new.join(name));
+        }
+    }
+
+    let mut moved_files = 0u64;
+    let mut moved_bytes = 0u64;
+    let mut failed_removals: Vec<String> = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&old).contents_first(true) {
+        let entry = entry.map_err(|e| KbError::Io(std::io::Error::other(e)))?;
+        let src = entry.path();
+        if src == old.as_path() {
+            continue;
+        }
+        let rel = src.strip_prefix(&old).map_err(|e| {
+            KbError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e.to_string(),
+            ))
+        })?;
+        let dst = new.join(rel);
+
+        if entry.file_type().is_dir() {
+            if !dst.exists() {
+                std::fs::create_dir_all(&dst)?;
+            }
+            if std::fs::read_dir(src)?.next().is_none() {
+                if let Err(e) = std::fs::remove_dir(src) {
+                    failed_removals.push(format!("{}: {}", src.display(), e));
+                }
+            }
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = dst.parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            let size = entry
+                .metadata()
+                .map_err(|e| KbError::Io(std::io::Error::other(e)))?
+                .len();
+            if std::fs::rename(src, &dst).is_ok() {
+                moved_files += 1;
+                moved_bytes += size;
+            } else {
+                // 跨卷等场景:复制后删除源文件。
+                std::fs::copy(src, &dst)?;
+                moved_files += 1;
+                moved_bytes += size;
+                if let Err(e) = std::fs::remove_file(src) {
+                    failed_removals.push(format!("{}: {}", src.display(), e));
+                }
+            }
+        }
+        // 其他类型(如符号链接)跳过,不迁移也不报错。
+    }
+
+    if std::fs::read_dir(&old)?.next().is_none() {
+        let _ = std::fs::remove_dir(&old);
+    }
+
+    if !failed_removals.is_empty() {
+        return Err(KbError::Io(std::io::Error::other(format!(
+            "迁移完成,但未能清理部分源文件: {}",
+            failed_removals.join("; ")
+        ))));
+    }
+
+    Ok(KbRelocateResult {
+        old_root: old,
+        new_root: new,
+        moved_files,
+        moved_bytes,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relocate_kb_moves_content_and_leaves_empty_old() {
+        let tmp =
+            std::env::temp_dir().join(format!("caseboard-relocate-test-{}", std::process::id()));
+        let old = tmp.join("old-kb");
+        let new = tmp.join("new-kb");
+
+        // 清理残留
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        create_empty_kb(&old).unwrap();
+        std::fs::write(
+            old.join("raw").join("notes").join("note.md"),
+            "# 测试笔记\n",
+        )
+        .unwrap();
+        std::fs::write(old.join("wiki").join("index.md"), "# 已有 Wiki\n").unwrap();
+
+        let r = relocate_kb(&old, &new).unwrap();
+
+        assert!(r.moved_files >= 2);
+        assert!(new.join("raw").join("notes").join("note.md").exists());
+        assert!(new.join("wiki").join("index.md").exists());
+        // 旧目录应已被删除(因为迁移后为空)
+        assert!(!old.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn relocate_kb_rejects_nonempty_target() {
+        let tmp =
+            std::env::temp_dir().join(format!("caseboard-relocate-nontest-{}", std::process::id()));
+        let old = tmp.join("old-kb");
+        let new = tmp.join("new-kb");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        create_empty_kb(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("existing.txt"), "占坑").unwrap();
+
+        let err = relocate_kb(&old, &new).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("非空") || msg.contains("目标目录"),
+            "错误提示应说明目标目录非空: {}",
+            msg
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}

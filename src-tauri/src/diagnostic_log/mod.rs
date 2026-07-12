@@ -17,8 +17,10 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 const RING_CAPACITY: usize = 200;
+const RUNTIME_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 static RING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static FILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// 推一条日志进 ring buffer。同时 `eprintln!` 到原 stderr(开发时仍可见)。
 ///
@@ -27,12 +29,47 @@ pub fn push_log(line: String) {
     // 先脱敏(路径里可能含当事人姓名)
     let safe = crate::feedback::sanitize_paths(&line);
     eprintln!("{}", safe);
+    let ts = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string();
     if let Ok(mut g) = RING.lock() {
         if g.len() >= RING_CAPACITY {
             g.pop_front();
         }
-        let ts = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
-        g.push_back(format!("[{}] {}", ts, safe));
+        g.push_back(format!("[{}] {}", &ts[11..], safe));
+    }
+    append_runtime_log(&ts, &safe);
+}
+
+/// 持续运行日志落盘。达到 5 MiB 时把上一份轮换为 `caseboard.log.1`，最多保留两份，
+/// 避免长期运行无限占用磁盘。失败静默，日志系统本身绝不能拖垮业务任务。
+fn append_runtime_log(ts: &str, line: &str) {
+    let Ok(_guard) = FILE_WRITE_LOCK.lock() else {
+        return;
+    };
+    let Ok(base) = crate::db::app_data_dir() else {
+        return;
+    };
+    let dir = base.join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("caseboard.log");
+    if std::fs::metadata(&path)
+        .map(|meta| meta.len() >= RUNTIME_LOG_MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let backup = dir.join("caseboard.log.1");
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::rename(&path, backup);
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "[{}] {}", ts, line);
     }
 }
 
@@ -108,4 +145,21 @@ macro_rules! dlog {
     ($($arg:tt)*) => {
         $crate::diagnostic_log::push_log(format!($($arg)*))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_log_persists_runtime_log() {
+        let marker = format!("runtime-log-test-{}", uuid::Uuid::new_v4());
+        push_log(marker.clone());
+        let path = crate::db::app_data_dir()
+            .expect("app data dir")
+            .join("logs")
+            .join("caseboard.log");
+        let body = std::fs::read_to_string(path).expect("runtime log should exist");
+        assert!(body.contains(&marker));
+    }
 }

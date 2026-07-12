@@ -353,6 +353,51 @@ pub async fn update_user_overrides(
     Ok(())
 }
 
+/// 2026-07-12 · 给 AI 助手用的字段级补丁:只改 `fields` 里的一个 path,保留其它覆盖。
+///
+/// `value = None/""` 时把该 path 写为 JSON null(表示用户清空);否则写字符串。
+/// 会自动清理完全为空的顶层对象,让 DB 保持 NULL。
+pub async fn patch_user_override_field(
+    pool: &SqlitePool,
+    id: &str,
+    path: &str,
+    value: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT user_overrides_json FROM cases WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    let mut overrides: serde_json::Value = current
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !overrides.is_object() {
+        overrides = serde_json::json!({});
+    }
+    let root = overrides.as_object_mut().expect("json object");
+    let fields = root
+        .entry("fields")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .expect("fields object");
+    let trimmed = value.map(str::trim);
+    if trimmed.map(|s| s.is_empty()).unwrap_or(true) {
+        fields.insert(path.to_string(), serde_json::Value::Null);
+    } else {
+        fields.insert(path.to_string(), serde_json::Value::String(trimmed.unwrap().to_string()));
+    }
+    if fields.is_empty() {
+        root.remove("fields");
+    }
+    let next_json = if root.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&overrides).ok()
+    };
+    update_user_overrides(pool, id, next_json.as_deref()).await
+}
+
 /// 显式重置「我方代理立场」:同时清掉首次 AI 识别值和人工 override,
 /// 但保留 user_overrides_json 里的其它字段/隐藏卡片/排序。
 pub async fn reset_our_side(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {

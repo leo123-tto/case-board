@@ -400,6 +400,7 @@ pub async fn extract_one(
     path: &Path,
     filename: &str,
     category: Option<&str>,
+    cached_text: Option<String>,
 ) -> ExtractResult {
     let kind = text_extraction_kind(filename);
 
@@ -424,7 +425,9 @@ pub async fn extract_one(
     let t0 = Instant::now();
     // 2026-06-13:去水印重识别(force_backend=ppocrv6)时强制走 OCR —— 用户明确要 OCR 去水印,
     // 不要因为带水印 PDF 恰好有可抽文本层就跳过 OCR(那层往往也被水印污染)。
-    let text_extract_result = if ocr_ctx.force_backend.is_some() {
+    let text_extract_result = if let Some(text) = cached_text {
+        Ok((text, "retry-cache"))
+    } else if ocr_ctx.force_backend.is_some() {
         Err("__NEEDS_OCR__".to_string())
     } else {
         extract_text(path, kind)
@@ -825,5 +828,49 @@ async fn ocr_fallback(path: PathBuf, ctx: OcrContext) -> Result<(String, &'stati
             Err(format!("{}(尝试后端:{})", error, attempted.join(", ")))
         }
         ocr::OcrResult::Skipped { reason } => Err(format!("OCR 跳过:{}", reason)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cached_text_retry_never_reopens_source_or_calls_ocr() {
+        let llm_config = llm::LlmConfig {
+            endpoint: "http://127.0.0.1:9/v1/chat/completions".to_string(),
+            model: "retry-cache-test".to_string(),
+            api_key: None,
+            timeout_secs: 1,
+            temperature: 0.0,
+        };
+        let ocr_ctx = OcrContext {
+            cloud_enabled: true,
+            mineru_token: Some("must-not-be-used".to_string()),
+            ..OcrContext::default()
+        };
+        let result = extract_one(
+            &llm_config,
+            &ocr_ctx,
+            Path::new("/definitely/missing/source.pdf"),
+            "source.pdf",
+            None,
+            Some(
+                "这是已经成功落盘的正文，长度足够进入字段抽取；重试时不得再次读取源文件或调用OCR。"
+                    .to_string(),
+            ),
+        )
+        .await;
+
+        let metrics = match result {
+            ExtractResult::Failed { metrics, .. } => metrics,
+            other => panic!("unreachable LLM should fail, got {other:?}"),
+        };
+        assert!(metrics.iter().any(|metric| {
+            metric.stage == "text_extract"
+                && metric.backend == "retry-cache"
+                && metric.outcome == "ok"
+        }));
+        assert!(!metrics.iter().any(|metric| metric.stage == "ocr"));
     }
 }

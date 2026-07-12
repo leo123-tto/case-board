@@ -13,6 +13,7 @@
 
 use crate::db::cases::Case;
 use crate::db::documents::Document;
+use serde_json::Value;
 
 // =============================================================================
 // 公开类型
@@ -92,7 +93,17 @@ const PER_DOC_LIGHT_CHAR_LIMIT: usize = 600;
 /// 把 case.agg_* 字段拼成 MD 段(给 LLM 看的"案件信息卡")。
 ///
 /// V0.2 D4-D5 起,`chat::constitution::build_system_prompt` 也复用本函数 — 因此 `pub(crate)`。
+///
+/// 2026-07-12:本函数现在会叠加 `cases.user_overrides_json` 里用户(或 AI 通过工具)确认的值,
+/// 让 AI 助手看到的快照与前端编辑模式/详情页保持一致。
 pub(crate) fn case_snapshot_md(case: &Case) -> String {
+    let overrides = case
+        .user_overrides_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .unwrap_or_default();
+    let fields = overrides.get("fields").and_then(|v| v.as_object());
+
     let mut s = String::with_capacity(2048);
 
     // 基本信息
@@ -102,23 +113,41 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
     push_kv(
         &mut s,
         "案号",
-        case.agg_case_no.as_deref().or(case.case_no.as_deref()),
+        over_str(
+            fields,
+            "agg_case_no",
+            case.agg_case_no.as_deref().or(case.case_no.as_deref()),
+        ),
     );
     push_kv(
         &mut s,
         "法院",
-        case.agg_court.as_deref().or(case.court.as_deref()),
+        over_str(
+            fields,
+            "agg_court",
+            case.agg_court.as_deref().or(case.court.as_deref()),
+        ),
     );
     push_kv(
         &mut s,
         "案由",
-        case.agg_cause.as_deref().or(case.cause.as_deref()),
+        over_str(
+            fields,
+            "agg_cause",
+            case.agg_cause.as_deref().or(case.cause.as_deref()),
+        ),
     );
-    push_kv(&mut s, "立案日", case.agg_filed_at.as_deref());
+    push_kv(
+        &mut s,
+        "立案日",
+        over_str(fields, "agg_filed_at", case.agg_filed_at.as_deref()),
+    );
     push_kv(
         &mut s,
         "诉讼请求金额",
-        case.agg_claim_amount.map(format_amount).as_deref(),
+        over_amount(fields, "agg_claim_amount", case.agg_claim_amount)
+            .map(format_amount)
+            .as_deref(),
     );
     // D9-1:DB 存英文 StatusId,喂 LLM 时还原中文 label(更可读,且不依赖 agg_status_text)。
     push_kv(
@@ -128,9 +157,21 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
             .as_deref()
             .map(crate::ingest::global_pipeline::workflow_status_en_to_zh),
     );
-    push_kv(&mut s, "LLM 状态描述", case.agg_status_text.as_deref());
-    push_kv(&mut s, "案件总状态", Some(&case.case_status));
-    push_kv(&mut s, "一句话摘要", case.case_summary.as_deref());
+    push_kv(
+        &mut s,
+        "LLM 状态描述",
+        over_str(fields, "agg_status_text", case.agg_status_text.as_deref()),
+    );
+    push_kv(
+        &mut s,
+        "案件总状态",
+        over_str(fields, "case_status", Some(&case.case_status)),
+    );
+    push_kv(
+        &mut s,
+        "一句话摘要",
+        over_str(fields, "case_summary", case.case_summary.as_deref()),
+    );
 
     // 当事人
     s.push_str("\n【当事人】\n");
@@ -159,20 +200,36 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
             "- 我方代理立场: 未确认(若要做立场化分析/对抗/检索,先确认我方是原告方还是被告方;未确认前保持中立、勿臆断)\n",
         ),
     }
-    push_json_list(&mut s, "原告/申请人", case.agg_plaintiffs.as_deref());
-    push_json_list(&mut s, "被告/被申请人", case.agg_defendants.as_deref());
-    push_json_list(&mut s, "第三人", case.agg_third_parties.as_deref());
-    push_json_list(&mut s, "承办法官", case.agg_judges.as_deref());
+    push_string_list(
+        &mut s,
+        "原告/申请人",
+        &over_string_array(fields, "agg_plaintiffs", case.agg_plaintiffs.as_deref()),
+    );
+    push_string_list(
+        &mut s,
+        "被告/被申请人",
+        &over_string_array(fields, "agg_defendants", case.agg_defendants.as_deref()),
+    );
+    push_string_list(
+        &mut s,
+        "第三人",
+        &over_string_array(fields, "agg_third_parties", case.agg_third_parties.as_deref()),
+    );
+    push_string_list(
+        &mut s,
+        "承办法官",
+        &over_string_array(fields, "agg_judges", case.agg_judges.as_deref()),
+    );
 
     // 联系人(简略)
     if let Some(party_json) = &case.agg_party_contacts {
-        let summary = summarize_party_contacts(party_json);
+        let summary = summarize_party_contacts(party_json, fields);
         if !summary.is_empty() {
             s.push_str(&format!("- 当事人联系人:\n{}\n", indent_block(&summary, 2)));
         }
     }
     if let Some(court_json) = &case.agg_court_contacts {
-        let summary = summarize_court_contacts(court_json);
+        let summary = summarize_court_contacts(court_json, fields);
         if !summary.is_empty() {
             s.push_str(&format!("- 法院联系人:\n{}\n", indent_block(&summary, 2)));
         }
@@ -180,7 +237,7 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
 
     // 关键日期
     if let Some(kd_json) = &case.agg_key_dates {
-        let summary = summarize_key_dates(kd_json);
+        let summary = summarize_key_dates(kd_json, fields);
         if !summary.is_empty() {
             s.push_str("\n【关键日期】\n");
             s.push_str(&summary);
@@ -189,7 +246,7 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
 
     // 费用
     if let Some(fees_json) = &case.agg_fees {
-        let summary = summarize_fees(fees_json);
+        let summary = summarize_fees(fees_json, fields);
         if !summary.is_empty() {
             s.push_str("\n【费用记录】\n");
             s.push_str(&summary);
@@ -225,14 +282,92 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
     }
 
     if let Some(reso) = &case.agg_resolution {
-        if !reso.trim().is_empty() {
+        let effective = over_str(fields, "agg_resolution", Some(reso.as_str()));
+        if !effective.unwrap_or("").trim().is_empty() {
             s.push_str("\n【处理结果】\n");
-            s.push_str(reso);
+            s.push_str(effective.unwrap());
             s.push('\n');
         }
     }
 
+    // 用户覆盖透明说明(让 AI 知道哪些值是人工确认的,避免擅自改回去)
+    if let Some(f) = fields {
+        s.push_str("\n【用户已手工覆盖的字段】(这些值已覆盖 LLM 抽取结果)\n");
+        for (k, v) in f {
+            let val = if v.is_null() {
+                "（已清空）".to_string()
+            } else {
+                v.as_str().unwrap_or("（非字符串）").to_string()
+            };
+            s.push_str(&format!("- {}: {}\n", k, val));
+        }
+    }
+
     s
+}
+
+/// 取字段覆盖值。返回 Some("") 表示用户清空,返回 None 表示未覆盖(用 raw)。
+fn over_str<'a>(
+    fields: Option<&'a serde_json::Map<String, Value>>,
+    path: &str,
+    raw: Option<&'a str>,
+) -> Option<&'a str> {
+    if let Some(v) = fields.and_then(|m| m.get(path)) {
+        if v.is_null() {
+            return Some("");
+        }
+        if let Some(s) = v.as_str() {
+            return Some(s);
+        }
+    }
+    raw
+}
+
+/// 数值字段覆盖。空串/null 返回 None,否则尝试 parse。
+fn over_amount(
+    fields: Option<&serde_json::Map<String, Value>>,
+    path: &str,
+    raw: Option<f64>,
+) -> Option<f64> {
+    if let Some(v) = fields.and_then(|m| m.get(path)) {
+        if v.is_null() {
+            return None;
+        }
+        if let Some(s) = v.as_str() {
+            return parse_clean_number(s);
+        }
+    }
+    raw
+}
+
+/// 把数组型字段的覆盖应用到原始 JSON 数组,返回过滤后的字符串列表。
+fn over_string_array(
+    fields: Option<&serde_json::Map<String, Value>>,
+    field: &str,
+    raw_json: Option<&str>,
+) -> Vec<String> {
+    let mut arr: Vec<Value> = raw_json
+        .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
+        .unwrap_or_default();
+    if let Some(f) = fields {
+        for (path, val) in f {
+            if let Some(rest) = path.strip_prefix(&format!("{}.", field)) {
+                if let Ok(idx) = rest.parse::<usize>() {
+                    if idx < arr.len() {
+                        arr[idx] = if val.is_null() {
+                            Value::String(String::new())
+                        } else {
+                            val.clone()
+                        };
+                    }
+                }
+            }
+        }
+    }
+    arr.into_iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .filter(|s| !s.trim().is_empty())
+        .collect()
 }
 
 fn push_kv(s: &mut String, label: &str, val: Option<&str>) {
@@ -243,14 +378,9 @@ fn push_kv(s: &mut String, label: &str, val: Option<&str>) {
     }
 }
 
-fn push_json_list(s: &mut String, label: &str, json: Option<&str>) {
-    if let Some(j) = json {
-        if let Ok(arr) = serde_json::from_str::<Vec<String>>(j) {
-            let cleaned: Vec<String> = arr.into_iter().filter(|x| !x.trim().is_empty()).collect();
-            if !cleaned.is_empty() {
-                s.push_str(&format!("- {}: {}\n", label, cleaned.join("、")));
-            }
-        }
+fn push_string_list(s: &mut String, label: &str, values: &[String]) {
+    if !values.is_empty() {
+        s.push_str(&format!("- {}: {}\n", label, values.join("、")));
     }
 }
 
@@ -262,7 +392,71 @@ fn format_amount(amount: f64) -> String {
     }
 }
 
-fn summarize_party_contacts(json: &str) -> String {
+/// 清洗 + parse 数值字符串。失败返回 None。
+fn parse_clean_number(raw: &str) -> Option<f64> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '¥' | '￥' | '$' | '元' | ',' | '，' | ' ' | '　'))
+        .collect();
+    cleaned.parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+/// 把 Value 转成 row key 可用的字符串(支持字符串/数字/布尔)。
+fn json_as_string(v: Option<&Value>) -> String {
+    v.map(|val| match val {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => String::new(),
+    })
+    .unwrap_or_default()
+}
+
+/// 按字段类型计算 stable row key,与前端 `userOverrides.ts` 的 `rowKeyOf` 保持一致。
+fn row_key_for(field: &str, row: &Value) -> String {
+    let obj = row.as_object();
+    let s = |key: &str| json_as_string(obj.and_then(|o| o.get(key)));
+    match field {
+        "agg_party_contacts" | "agg_court_contacts" => format!("{}|{}", s("name"), s("role")),
+        "agg_key_dates" => {
+            let event = s("event_type");
+            let event = if event.is_empty() { s("event") } else { event };
+            format!("{}|{}", event, s("date"))
+        }
+        "agg_fees" => format!("{}|{}", s("item"), s("amount")),
+        _ => String::new(),
+    }
+}
+
+/// 取子表行内字段的覆盖值。
+fn over_subtable_field<'a>(
+    fields: Option<&'a serde_json::Map<String, Value>>,
+    field: &str,
+    row_key: &str,
+    inner: &str,
+    raw: Option<&'a str>,
+) -> Option<&'a str> {
+    let path = format!("{}.{}{}.{}", field, '{', row_key, inner);
+    if let Some(v) = fields.and_then(|m| m.get(&path)) {
+        if v.is_null() {
+            return Some("");
+        }
+        if let Some(s) = v.as_str() {
+            return Some(s);
+        }
+    }
+    raw
+}
+
+fn parse_bool_str(s: &str) -> Option<bool> {
+    match s.trim().to_lowercase().as_str() {
+        "true" | "是" | "1" | "yes" => Some(true),
+        "false" | "否" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn summarize_party_contacts(json: &str, fields: Option<&serde_json::Map<String, Value>>) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return String::new();
     };
@@ -271,19 +465,24 @@ fn summarize_party_contacts(json: &str) -> String {
     };
     let mut out = String::new();
     for item in arr {
-        let name = item.get("name").and_then(|x| x.as_str()).unwrap_or("");
-        let role = item.get("role").and_then(|x| x.as_str()).unwrap_or("");
-        let phone = item.get("phone").and_then(|x| x.as_str()).unwrap_or("");
+        let row_key = row_key_for("agg_party_contacts", item);
+        let name = over_subtable_field(fields, "agg_party_contacts", &row_key, "name", item.get("name").and_then(|x| x.as_str())).unwrap_or("");
+        let role = over_subtable_field(fields, "agg_party_contacts", &row_key, "role", item.get("role").and_then(|x| x.as_str())).unwrap_or("");
+        let phone = over_subtable_field(fields, "agg_party_contacts", &row_key, "phone", item.get("phone").and_then(|x| x.as_str())).unwrap_or("");
         let aliases = item.get("aliases").and_then(|x| x.as_array());
         // 2026-06-13:把 is_our_side 标出来(此前读了却丢弃 → AI 看不到谁是我方,各 chip 只能瞎猜)。
-        let side = match item.get("is_our_side").and_then(|x| x.as_bool()) {
+        let is_our_side_raw = item.get("is_our_side").and_then(|x| x.as_bool());
+        let is_our_side = over_subtable_field(fields, "agg_party_contacts", &row_key, "is_our_side", None)
+            .and_then(parse_bool_str)
+            .or(is_our_side_raw);
+        if name.is_empty() && role.is_empty() {
+            continue;
+        }
+        let side = match is_our_side {
             Some(true) => " [我方]",
             Some(false) => " [对方]",
             None => "",
         };
-        if name.is_empty() && role.is_empty() {
-            continue;
-        }
         out.push_str(&format!("- {} ({}){}", name, role, side));
         if !phone.is_empty() {
             out.push_str(&format!(", 电话 {}", phone));
@@ -302,7 +501,7 @@ fn summarize_party_contacts(json: &str) -> String {
     out
 }
 
-fn summarize_court_contacts(json: &str) -> String {
+fn summarize_court_contacts(json: &str, fields: Option<&serde_json::Map<String, Value>>) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return String::new();
     };
@@ -311,9 +510,10 @@ fn summarize_court_contacts(json: &str) -> String {
     };
     let mut out = String::new();
     for item in arr {
-        let name = item.get("name").and_then(|x| x.as_str()).unwrap_or("");
-        let role = item.get("role").and_then(|x| x.as_str()).unwrap_or("");
-        let phone = item.get("phone").and_then(|x| x.as_str()).unwrap_or("");
+        let row_key = row_key_for("agg_court_contacts", item);
+        let name = over_subtable_field(fields, "agg_court_contacts", &row_key, "name", item.get("name").and_then(|x| x.as_str())).unwrap_or("");
+        let role = over_subtable_field(fields, "agg_court_contacts", &row_key, "role", item.get("role").and_then(|x| x.as_str())).unwrap_or("");
+        let phone = over_subtable_field(fields, "agg_court_contacts", &row_key, "phone", item.get("phone").and_then(|x| x.as_str())).unwrap_or("");
         if name.is_empty() && role.is_empty() {
             continue;
         }
@@ -326,7 +526,7 @@ fn summarize_court_contacts(json: &str) -> String {
     out
 }
 
-fn summarize_key_dates(json: &str) -> String {
+fn summarize_key_dates(json: &str, fields: Option<&serde_json::Map<String, Value>>) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return String::new();
     };
@@ -335,9 +535,10 @@ fn summarize_key_dates(json: &str) -> String {
     };
     let mut out = String::new();
     for item in arr {
-        let date = item.get("date").and_then(|x| x.as_str()).unwrap_or("");
-        let event = item.get("event").and_then(|x| x.as_str()).unwrap_or("");
-        let note = item.get("note").and_then(|x| x.as_str());
+        let row_key = row_key_for("agg_key_dates", item);
+        let date = over_subtable_field(fields, "agg_key_dates", &row_key, "date", item.get("date").and_then(|x| x.as_str())).unwrap_or("");
+        let event = over_subtable_field(fields, "agg_key_dates", &row_key, "event", item.get("event").and_then(|x| x.as_str())).unwrap_or("");
+        let note = over_subtable_field(fields, "agg_key_dates", &row_key, "note", item.get("note").and_then(|x| x.as_str()));
         if date.is_empty() || event.is_empty() {
             continue;
         }
@@ -352,7 +553,7 @@ fn summarize_key_dates(json: &str) -> String {
     out
 }
 
-fn summarize_fees(json: &str) -> String {
+fn summarize_fees(json: &str, fields: Option<&serde_json::Map<String, Value>>) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return String::new();
     };
@@ -361,20 +562,31 @@ fn summarize_fees(json: &str) -> String {
     };
     let mut out = String::new();
     for item in arr {
-        let item_name = item.get("item").and_then(|x| x.as_str()).unwrap_or("");
-        let amount = item.get("amount");
-        let note = item.get("note").and_then(|x| x.as_str()).unwrap_or("");
+        let row_key = row_key_for("agg_fees", item);
+        let item_name = over_subtable_field(fields, "agg_fees", &row_key, "item", item.get("item").and_then(|x| x.as_str())).unwrap_or("");
+        let amount_override = over_subtable_field(fields, "agg_fees", &row_key, "amount", None);
+        let note = over_subtable_field(fields, "agg_fees", &row_key, "note", item.get("note").and_then(|x| x.as_str()));
         if item_name.is_empty() {
             continue;
         }
-        let amount_str = match amount {
-            Some(serde_json::Value::Number(n)) => n.as_f64().map(format_amount).unwrap_or_default(),
-            Some(serde_json::Value::String(s)) => s.clone(),
-            _ => String::new(),
+        let amount_str = if let Some(s) = amount_override {
+            if s.trim().is_empty() {
+                String::new()
+            } else {
+                parse_clean_number(s).map(format_amount).unwrap_or_default()
+            }
+        } else {
+            match item.get("amount") {
+                Some(Value::Number(n)) => n.as_f64().map(format_amount).unwrap_or_default(),
+                Some(Value::String(s)) => s.clone(),
+                _ => String::new(),
+            }
         };
         out.push_str(&format!("- {} {}", item_name, amount_str));
-        if !note.is_empty() {
-            out.push_str(&format!(" — {}", note));
+        if let Some(n) = note {
+            if !n.trim().is_empty() {
+                out.push_str(&format!(" — {}", n));
+            }
         }
         out.push('\n');
     }

@@ -626,6 +626,13 @@ async fn get_lawyer_insights(
 /// 不动原始文件夹,只删 CaseBoard 数据库里这个案件的记录。
 #[tauri::command]
 async fn delete_case(pool: tauri::State<'_, SqlitePool>, id: String) -> Result<(), String> {
+    let cancelled = pipeline::cancel_case_extraction(&id);
+    if cancelled > 0 {
+        dlog!(
+            "[case] 删除案件前已取消 {} 个运行中/排队中抽取任务",
+            cancelled
+        );
+    }
     cases_db::delete_case(pool.inner(), &id)
         .await
         .map_err(db_err)
@@ -5728,9 +5735,29 @@ async fn create_local_kb(path: String) -> Result<local_kb::init::KbInitResult, S
     Ok(result)
 }
 
+/// 将本地知识库迁移到新目录。
+///
+/// 前端已经问过用户"是否移动旧文件";本命令只执行:旧目录存在且为目录,
+/// 新目录不存在或为空时,把旧内容移过去,然后更新 settings.local_kb_root。
+#[tauri::command]
+async fn relocate_local_kb(
+    old_root: String,
+    new_root: String,
+) -> Result<local_kb::init::KbRelocateResult, String> {
+    let old_expanded = std::path::PathBuf::from(shellexpand::tilde(&old_root).into_owned());
+    let new_expanded = std::path::PathBuf::from(shellexpand::tilde(&new_root).into_owned());
+    let result =
+        local_kb::init::relocate_kb(&old_expanded, &new_expanded).map_err(|e| e.to_string())?;
+    let mut s = settings::read_settings().unwrap_or_default();
+    s.local_kb_root = Some(new_root);
+    s.local_kb_enabled = Some(true);
+    settings::write_settings(&s).map_err(|e| format!("写 settings 失败: {}", e))?;
+    Ok(result)
+}
+
 /// 启动兜底:老版本(1.x,无本地 KB 功能)升级用户的 settings 里没有 `local_kb_root` →
 /// `LocalKb::auto_detect` 返回 None → 找到的法规/案例不写回 KB、本地命中省积分全失效。
-/// 这里在默认路径 `~/Documents/知识库` 创建(已存在则只补目录不覆盖)+ 写回 settings,
+/// 这里在默认路径 `~/Documents/案件知识库` 创建(已存在则只补目录不覆盖)+ 写回 settings,
 /// 让所有用户(含老用户、新装用户)开箱即用「越用越省钱」。
 /// 幂等:只在 `local_kb_root` 为空且用户没显式禁用(`local_kb_enabled != Some(false)`)时动作;
 /// 返回 `Some(展示路径)` 表示本次新配置了 KB(用于前端提示),`None` = 已配置过 / 已禁用 / 失败。
@@ -5752,7 +5779,7 @@ fn ensure_default_local_kb() -> Option<String> {
     if has_root {
         return None;
     }
-    const DEFAULT_KB: &str = "~/Documents/知识库";
+    const DEFAULT_KB: &str = "~/Documents/案件知识库";
     let expanded = shellexpand::tilde(DEFAULT_KB).into_owned();
     let target = std::path::PathBuf::from(&expanded);
     match local_kb::init::create_empty_kb(&target) {
@@ -6033,6 +6060,7 @@ pub fn run() {
     // 2026-05-26 V0.1.11:启动早期装 panic hook,把 panic 信息落到 diagnostic_log
     // ring buffer,反馈通道带出来。
     diagnostic_log::install_panic_hook();
+    dlog!("[startup] CaseBoard v{} 启动", env!("CARGO_PKG_VERSION"));
 
     // 2026-06-15:创建 webview 之前先检测 WebView2 运行时。Windows 缺 WebView2 时
     // app 根本起不了窗口(老 Win10/弱网/CDN 被墙,装机时没下成)→ 这里弹原生对话框
@@ -6309,6 +6337,7 @@ pub fn run() {
             // V0.2 D7 · 本地知识库 + 元典积分
             detect_kb_status,
             create_local_kb,
+            relocate_local_kb,
             import_kb_from_zip,
             export_kb_to_zip,
             export_case_bundle,

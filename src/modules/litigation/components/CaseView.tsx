@@ -9,6 +9,7 @@ import {
   Loader2,
   Pencil,
   RefreshCw,
+  RotateCcw,
   Trash2,
 } from "lucide-react";
 
@@ -60,6 +61,7 @@ export function CaseView({
   documents,
   loading,
   error,
+  onDismissError,
   onSwitchCase,
   onGoHome,
   onOpenDoc,
@@ -86,6 +88,7 @@ export function CaseView({
   documents: Document[];
   loading: boolean;
   error: string | null;
+  onDismissError?: () => void;
   onSwitchCase: (id: string) => void;
   onGoHome: () => void;
   onOpenDoc: (doc: Document) => void;
@@ -580,6 +583,16 @@ export function CaseView({
             </button>
             <button
               type="button"
+              onClick={onReloadCase}
+              disabled={!selectedCase}
+              className="icon-action text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+              title="刷新案件画像（只重读数据库，不重新抽取源文件）"
+              aria-label="刷新案件画像"
+            >
+              <RotateCcw className="size-4" />
+            </button>
+            <button
+              type="button"
               onClick={onToggleEditMode}
               disabled={!selectedCase}
               className={cn(
@@ -621,7 +634,9 @@ export function CaseView({
           <div className="app-page-enter flex-1 overflow-auto">
             <div className="mx-auto max-w-6xl px-4 py-5 sm:px-6 xl:px-8 xl:py-6">
               {loading && <LoadingState />}
-              {error && !loading && <ErrorState message={error} />}
+              {error && !loading && (
+                <ErrorState message={error} onDismiss={onDismissError} />
+              )}
               {!loading && !error && documents.length === 0 && <NoDocsHint />}
               {!loading && !error && documents.length > 0 && selectedCase && (
                 <div className="space-y-5">

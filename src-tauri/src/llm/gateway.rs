@@ -145,6 +145,10 @@ pub fn build_non_stream_chat_body_with_response_format(
     body
 }
 
+/// 429 退避参数:最多重试 5 次,基础间隔 800ms,指数增长并带轻微抖动避免羊群效应。
+const MAX_RATE_LIMIT_RETRIES: u32 = 5;
+const BASE_BACKOFF_MS: u64 = 800;
+
 pub async fn complete_non_stream_chat(
     config: &LlmConfig,
     capability: &ProviderCapability,
@@ -172,34 +176,60 @@ pub async fn complete_non_stream_chat(
         .build()
         .map_err(|e| LlmGatewayError::new(LlmGatewayErrorKind::Network, e.to_string()))?;
 
-    let mut req = client.post(&config.endpoint).json(&body);
-    if let Some(key) = config
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req.send().await.map_err(|e| {
-        if e.is_timeout() {
-            LlmGatewayError::new(LlmGatewayErrorKind::Timeout, e.to_string())
-        } else {
-            LlmGatewayError::new(LlmGatewayErrorKind::Network, e.to_string())
+    let mut last_error: Option<LlmGatewayError> = None;
+    for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+        if attempt > 0 {
+            // 指数退避:800ms -> 1.6s -> 3.2s -> 6.4s -> 12.8s,加上基于 attempt 的抖动 0~300ms
+            let jitter = (attempt as u64 * 73) % 300;
+            let delay_ms = BASE_BACKOFF_MS * (1_u64 << (attempt - 1)) + jitter;
+            crate::dlog!(
+                "[llm gateway] 遇到 429 速率限制,第 {} 次退避 {} ms",
+                attempt,
+                delay_ms
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
-    })?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(LlmGatewayError::http(status.as_u16(), body));
+
+        let mut req = client.post(&config.endpoint).json(&body);
+        if let Some(key) = config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            req = req.bearer_auth(key);
+        }
+
+        let response = req.send().await.map_err(|e| {
+            if e.is_timeout() {
+                LlmGatewayError::new(LlmGatewayErrorKind::Timeout, e.to_string())
+            } else {
+                LlmGatewayError::new(LlmGatewayErrorKind::Network, e.to_string())
+            }
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let err_body = response.text().await.unwrap_or_default();
+            let err = LlmGatewayError::http(status.as_u16(), err_body);
+            if err.kind == LlmGatewayErrorKind::RateLimit && attempt < MAX_RATE_LIMIT_RETRIES {
+                last_error = Some(err);
+                continue;
+            }
+            return Err(err);
+        }
+
+        let value = response.json::<Value>().await.map_err(|e| {
+            LlmGatewayError::new(LlmGatewayErrorKind::ResponseFormat, e.to_string())
+        })?;
+        return parse_non_stream_chat_response(value);
     }
 
-    let value = response
-        .json::<Value>()
-        .await
-        .map_err(|e| LlmGatewayError::new(LlmGatewayErrorKind::ResponseFormat, e.to_string()))?;
-    parse_non_stream_chat_response(value)
+    Err(last_error.unwrap_or_else(|| {
+        LlmGatewayError::new(
+            LlmGatewayErrorKind::RateLimit,
+            "LLM 服务持续返回 429,已超过最大重试次数",
+        )
+    }))
 }
 
 fn parse_non_stream_chat_response(value: Value) -> Result<NonStreamChatOutput, LlmGatewayError> {

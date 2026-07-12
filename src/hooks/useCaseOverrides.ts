@@ -13,6 +13,7 @@
  *   timer 触发后 updateCaseOverrides 写 SQLite → 写完不 refetch(local 已经是 truth)
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { getCaseWithDocs, updateCaseOverrides } from "@/lib/api";
 import {
@@ -138,6 +139,54 @@ export function useCaseOverrides(
     }
     // 故意只依赖 caseId,**不依赖 initialJson** — 防 mid-edit clobber:
     // 外部 setSelectedCase 刷新 caseData 时本 hook 不会重置 local overrides。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [caseId]);
+
+  // 外部(如 AI 工具)修改 DB 后 App 会刷新 selectedCase,initialJson 可能变化。
+  // 在本地没有 pending 编辑时,把服务器最新覆盖层合并进来,让 AI 修改立即生效;
+  // 有 pending 编辑时跳过,防 mid-edit clobber。
+  useEffect(() => {
+    if (timerRef.current) return;
+    const incoming = parseOverrides(initialJson);
+    if (serializeOverrides(incoming) !== serializeOverrides(latestRef.current)) {
+      setOverrides(incoming);
+      latestRef.current = incoming;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialJson]);
+
+  // 兜底:即使 App.tsx 的 handleReloadCase 因为某种原因没有刷新到最新覆盖层,
+  // 后端 emit 的 case-snapshot-changed 事件也会直接在这里拉 DB 最新值。
+  useEffect(() => {
+    if (!caseId) return;
+    let unlisten: UnlistenFn | undefined;
+    listen<{ case_id: string }>("case-snapshot-changed", (event) => {
+      if (event.payload.case_id !== caseId) return;
+      // 用户正在输入时先不覆盖,避免 mid-edit clobber
+      if (timerRef.current) return;
+      const cid = caseId;
+      void getCaseWithDocs(cid)
+        .then((r) => {
+          if (caseIdRef.current !== cid || timerRef.current) return;
+          const latest = parseOverrides(r.case.user_overrides_json);
+          if (
+            serializeOverrides(latest) !== serializeOverrides(latestRef.current)
+          ) {
+            setOverrides(latest);
+            latestRef.current = latest;
+          }
+        })
+        .catch(() => {
+          /* 静默失败,保留当前 local overrides */
+        });
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch((e) => console.warn("listen case-snapshot-changed failed", e));
+    return () => {
+      if (unlisten) unlisten();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseId]);
 

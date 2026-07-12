@@ -38,10 +38,11 @@ import {
   getSettings,
   getYuandianCreditsOverview,
   importKbFromZip,
-  pruneYuandianCache,
   openInDefaultApp,
   openUrl,
   parseMcpPaste,
+  pruneYuandianCache,
+  relocateLocalKb,
   saveSettings,
   testMcpServer,
   verifyDeepSeekKey,
@@ -53,6 +54,7 @@ import {
   verifyYuandianKey,
   type KbConflictStrategy,
   type KbImportResult,
+  type KbRelocateResult,
   type KbStatus,
   type CreditsOverview,
 } from "@/lib/api";
@@ -2328,7 +2330,7 @@ function McpServerRow({
 // V0.2 D7 · 本地知识库三态卡 + 元典积分卡
 // =============================================================================
 
-const DEFAULT_KB_PATH = "~/Documents/知识库";
+const DEFAULT_KB_PATH = "~/Documents/案件知识库";
 
 function LocalKbCard({
   kbRoot,
@@ -2396,6 +2398,57 @@ function LocalKbCard({
     } finally {
       setBusy(false);
       window.setTimeout(() => setBusyMsg(""), 3000);
+    }
+  }
+
+  async function handleRelocate() {
+    if (!status || status.state !== "bound") return;
+    setError(null);
+    try {
+      const picked = await dialogOpen({ directory: true, multiple: false });
+      if (typeof picked !== "string" || !picked.trim()) return;
+      if (picked === status.root) {
+        setBusyMsg("新路径与当前路径相同");
+        window.setTimeout(() => setBusyMsg(""), 2000);
+        return;
+      }
+
+      const hasContent =
+        status.content_count + status.cache_count > 0 ||
+        (status.total_size_bytes ?? 0) > 0;
+      let moveFiles = false;
+      if (hasContent) {
+        moveFiles = await confirmDialog(
+          `当前知识库已有内容（${status.content_count} 篇资料 / ${status.cache_count} 条缓存，共 ${formatBytes(status.total_size_bytes ?? 0)}）。\n\n是否把文件一并迁移到 ${picked}？\n\n· 选择「迁移」：移动文件，完成后旧目录若为空则自动删除。\n· 选择「不迁移」：只把新目录设为空知识库，旧文件仍保留在原处。`,
+          { title: "迁移知识库文件", okLabel: "迁移", cancelLabel: "不迁移" },
+        );
+      }
+
+      setBusy(true);
+      setBusyMsg(moveFiles ? "迁移中…" : "绑定新目录…");
+      if (moveFiles) {
+        const r: KbRelocateResult = await relocateLocalKb(status.root, picked);
+        onKbRootChange(picked);
+        onKbEnabledChange(true);
+        setBusyMsg(
+          `迁移完成：${r.moved_files} 个文件 / ${formatBytes(r.moved_bytes)}`,
+        );
+      } else {
+        const r = await createLocalKb(picked);
+        onKbRootChange(picked);
+        onKbEnabledChange(true);
+        setBusyMsg(
+          r.reused_existing
+            ? `已绑定到新目录(补 ${r.dirs_created} 个子目录)`
+            : `已绑定到新目录`,
+        );
+      }
+      await refresh();
+    } catch (e) {
+      setError(formatErr(e));
+    } finally {
+      setBusy(false);
+      window.setTimeout(() => setBusyMsg(""), 5000);
     }
   }
 
@@ -2521,6 +2574,16 @@ function LocalKbCard({
               >
                 <FolderOpen className="size-3.5" />
                 打开目录
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={handleRelocate}
+                disabled={busy}
+              >
+                <FolderOpen className="size-3.5" />
+                更换落盘目录…
               </Button>
               <HoverHint hint="导入同事的元典缓存资料包,自动查重合并;只合并元典缓存,不碰你的笔记/案件/客户">
                 <Button
@@ -2697,7 +2760,7 @@ function LocalKbCard({
               type="text"
               value={kbRoot ?? ""}
               onChange={(e) => onKbRootChange(e.target.value || null)}
-              placeholder="~/Documents/知识库"
+              placeholder="~/Documents/案件知识库"
               className={cn(inputCls, "font-mono")}
             />
           </Field>

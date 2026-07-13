@@ -20,8 +20,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; frame-src 'self' asset: http://asset.localhost; worker-src 'self' blob:; object-src 'none'; base-uri 'self'",
-      "devCsp": "default-src 'self' http://localhost:1420 ws://localhost:1421; script-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:1420; style-src 'self' 'unsafe-inline' http://localhost:1420; img-src 'self' asset: http://asset.localhost data: blob: http://localhost:1420; font-src 'self' data: http://localhost:1420; connect-src 'self' ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1421; frame-src 'self' asset: http://asset.localhost; worker-src 'self' blob: http://localhost:1420; object-src 'none'; base-uri 'self'",
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost https://ipapi.co https://ipwho.is https://api.open-meteo.com; frame-src 'self' asset: http://asset.localhost; worker-src 'self' blob:; object-src 'none'; base-uri 'self'",
+      "devCsp": "default-src 'self' http://localhost:1420 ws://localhost:1421; script-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:1420; style-src 'self' 'unsafe-inline' http://localhost:1420; img-src 'self' asset: http://asset.localhost data: blob: http://localhost:1420; font-src 'self' data: http://localhost:1420; connect-src 'self' ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1421 https://ipapi.co https://ipwho.is https://api.open-meteo.com; frame-src 'self' asset: http://asset.localhost; worker-src 'self' blob: http://localhost:1420; object-src 'none'; base-uri 'self'",
       "assetProtocol": {
         "enable": true,
         "scope": []

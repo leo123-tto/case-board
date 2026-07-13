@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   X,
   Loader2,
@@ -273,6 +273,28 @@ export function SettingsModal({
   const handleClose = () => {
     if (onClose) onClose();
   };
+  // 微信群二维码 hover 状态 + 关闭延迟 timer:
+  // 之前用 Tailwind group-hover:block + pointer-events-none,鼠标移到 300x300 浮层
+  // (在父 60x60 bounding box 外)→ 父不 hover → 浮层瞬间消失 → 鼠标重新在缩略图
+  // → hover 触发 → 闪屏循环。改用 React state 控制 + 浮层 pointer-events-auto
+  // + 外层 onMouseLeave 延迟 200ms,鼠标从缩略图移到浮层有缓冲。
+  const [qrHover, setQrHover] = useState(false);
+  const qrCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleQrEnter = useCallback(() => {
+    if (qrCloseTimerRef.current) {
+      clearTimeout(qrCloseTimerRef.current);
+      qrCloseTimerRef.current = null;
+    }
+    setQrHover(true);
+  }, []);
+  const handleQrLeave = useCallback(() => {
+    qrCloseTimerRef.current = setTimeout(() => setQrHover(false), 200);
+  }, []);
+  useEffect(() => {
+    return () => {
+      if (qrCloseTimerRef.current) clearTimeout(qrCloseTimerRef.current);
+    };
+  }, []);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -819,21 +841,42 @@ export function SettingsModal({
               {/* ── 通用:微信扫码加群(缩略图悬停放大;托管 lawtools.top,过期换图不必重新发版) ── */}
               {tab === "general" && (
                   <Section title="微信扫码加群" fill>
-                    <div className="flex items-center gap-3">
-                      <div className="group relative shrink-0">
+                    {/*
+                      之前用 Tailwind group-hover:block + pointer-events-none,鼠标从
+                      60x60 缩略图移到 300x300 浮层(top-full 在父外)→ 父 .group 不
+                      再 hover → 浮层瞬间隐藏 → 闪屏循环。pointer-events-none 让
+                      浮层对鼠标透明,无法维持 hover。
+                      改用 React state 控制 + 浮层 pointer-events-auto + 缩略图 wrapper
+                      和浮层都 onMouseEnter + 外层 onMouseLeave 延迟 200ms,鼠标从
+                      缩略图移到浮层有缓冲。
+                    */}
+                    <div
+                      className="flex items-start gap-3"
+                      onMouseLeave={handleQrLeave}
+                    >
+                      <div
+                        className="relative shrink-0"
+                        onMouseEnter={handleQrEnter}
+                      >
                         <GroupQrCode
                           size={60}
                           className="cursor-pointer rounded border border-border"
                         />
-                        {/* 悬停放大浮层:向下展开,z 高于下方卡片,不挡鼠标 */}
-                        <div className="pointer-events-none absolute left-0 top-full z-50 mt-2 hidden group-hover:block">
-                          <GroupQrCode
-                            size={300}
-                            className="rounded-md border border-border shadow-xl"
-                          />
-                        </div>
+                        {/* 悬停放大浮层:React state 控制,pointer-events-auto 让
+                            浮层接收 hover 维持 onMouseEnter 状态。 */}
+                        {qrHover && (
+                          <div
+                            className="absolute left-0 top-full z-50 mt-2"
+                            onMouseEnter={handleQrEnter}
+                          >
+                            <GroupQrCode
+                              size={300}
+                              className="rounded-md border border-border shadow-xl"
+                            />
+                          </div>
+                        )}
                       </div>
-                      <p className="text-xs text-muted-foreground">
+                      <p className="pt-2 text-xs text-muted-foreground">
                         鼠标悬停二维码放大,微信扫码进群 —— 反馈、提需求、看更新。
                       </p>
                     </div>

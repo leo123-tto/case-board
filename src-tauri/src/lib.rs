@@ -25,6 +25,7 @@ pub mod llm;
 pub mod local_kb;
 pub mod memory_vault;
 pub mod native_location;
+pub mod weather;
 pub mod proc_util;
 // 私人专属功能 Rust 侧(双轨发布模型)。开源仓此文件为桩(命令返回 Err),照样编译。
 pub mod case_bundle;
@@ -6846,6 +6847,7 @@ pub fn run() {
             chat_dashboard_assistant,
             native_location::get_native_location,
             native_location::open_location_privacy_settings,
+            weather::get_weather_info,
             save_settings,
             update_home_case_order,
             detect_local_readiness,

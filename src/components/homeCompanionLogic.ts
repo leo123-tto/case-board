@@ -85,7 +85,6 @@ export function weatherSummaryForGreeting(
 
 export function weatherDisplaySummary(cached: CachedWeatherLike | null): string | null {
   if (!cached) return null;
-  if (cached.source === "网络定位") return "定位未确认，天气未更新";
   const summary = cached.summary?.trim();
   return summary || null;
 }
@@ -99,9 +98,10 @@ export interface WeatherStatusMessageInput {
 
 export function weatherStatusMessage(input: WeatherStatusMessageInput): string | null {
   const { value, error, weatherFeedsGreeting, weatherNeedsRefresh } = input;
-  if (value?.source === "网络定位") {
-    return locationIssueLabel(extractLocationIssue(value.detail) ?? error) ?? "定位未确认";
-  }
+  // 2026-07-13 PR 修复:不再用 source === "网络定位" 触发"定位未确认" UI
+  // — Rust 后端 IP 定位成功后 source 固定是"网络定位",这是合法 source,
+  // 不是 issue;只有 detail 里真有"系统定位失败:" marker 才是 issue
+  if (value && extractLocationIssue(value.detail)) return "定位未确认";
   if (value && !weatherFeedsGreeting) return "旧天气缓存";
   if (value && weatherNeedsRefresh) return "正在刷新";
   if (error && value) return "使用缓存";
@@ -184,18 +184,6 @@ function extractLocationIssue(detail: string | null | undefined): string | null 
     .map((part) => part.replace(/^WebView\s*定位也失败[:：]\s*/, "").trim())
     .filter(Boolean);
   return parts.find(isActionableLocationIssue) ?? parts[0] ?? null;
-}
-
-function locationIssueLabel(issue: string | null | undefined): string | null {
-  const value = issue?.trim();
-  if (!value) return null;
-  if (value.includes("定位权限未开启")) return "定位权限未开启";
-  if (value.includes("定位服务未开启")) return "定位服务未开启";
-  if (value.includes("定位服务受限")) return "定位服务受限";
-  if (value.includes("定位超时")) return "定位授权超时";
-  if (value.includes("not_determined") || value.includes("NotDetermined")) return "等待定位授权";
-  if (value.includes("授权")) return "等待定位授权";
-  return value;
 }
 
 function isActionableLocationIssue(issue: string): boolean {

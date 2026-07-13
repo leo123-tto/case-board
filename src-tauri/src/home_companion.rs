@@ -163,13 +163,44 @@ pub(crate) fn build_home_greeting_prompt(input: &HomeGreetingInput, memories: &[
          6. 必须匹配时间段:上午不要说“今天辛苦了”“早点休息”“明天状态会更好”;夜间优先提醒早点休息。\n\
          7. 天气只作事实参考;天气未更新、不可信或没有明确降雨/降温/高温时,不要提天气、带伞、添衣或路况。\n\
          8. 如果要提提醒,只能泛泛说“提醒区扫一眼”,不要判断今天有没有开庭。\n\
-         9. 不要鸡汤味太重,要克制、稳、轻。",
+         9. 不要鸡汤味太重,要克制、稳、轻。\n\
+         10. 2026-07-13 防推理暴露:不要输出任何 thinking / reasoning / chain-of-thought / self-talk 文字(如 “The user wants me to...”、“I need to...”、“Let me...”、“I will...”、“考虑中...”“我的思路是…”)。如果你是 reasoning 类模型,请只输出最终一句中文,不要把推理过程泄漏到 content。",
         input.local_date.trim()
     )
 }
 
 pub(crate) fn clean_greeting(raw: &str) -> String {
-    let mut line = raw
+    // 2026-07-13:先剥 reasoning 类模型的 <think>...</think> 标签(Deepeek R1 / Claude
+    // extended thinking 等)以及整段被换行包住的 thinking 块。防止 thinking 文本
+    // 泄漏到最终问候里(像 "The user wants me to act as a 'kanban assistant'." 这种
+    // 英文 self-talk 被前端直接渲染)。
+    let mut stripped = raw.to_string();
+    while let Some(start) = stripped.find("<think>") {
+        if let Some(end) = stripped[start + 7..].find("</think>") {
+            let end_abs = start + 7 + end + 8;
+            stripped.replace_range(start..end_abs, "");
+        } else {
+            // 没有 </think> 闭合,剥到结尾(避免 thinking 没结束卡住整段)
+            stripped.replace_range(start..stripped.len(), "");
+            break;
+        }
+    }
+    // Anthropic 风格:content 里有时是 "<reasoning>...<\/reasoning>" 或
+    // "<ant_thinking>...<\/ant_thinking>" — 同样剥。
+    for marker in ["<reasoning>", "<ant_thinking>", "<reflection>"] {
+        while let Some(start) = stripped.find(marker) {
+            let end_tag = format!("</{}>", &marker[1..]);
+            if let Some(end) = stripped[start + marker.len()..].find(&end_tag) {
+                let end_abs = start + marker.len() + end + end_tag.len();
+                stripped.replace_range(start..end_abs, "");
+            } else {
+                stripped.replace_range(start..stripped.len(), "");
+                break;
+            }
+        }
+    }
+
+    let mut line = stripped
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("")
@@ -177,7 +208,28 @@ pub(crate) fn clean_greeting(raw: &str) -> String {
         .trim_matches(['"', '\'', '“', '”', '‘', '’'])
         .to_string();
 
+    // 2026-07-13:剥英文 self-talk / thinking 前缀。LLM 有时把整段 "The user wants me
+    // to act as a 'kanban assistant'..." 直接输出。剥掉直到第一个中文标点 / 中文字
+    // 或者换行(下面 .lines().find() 已经只取第一行,这里再保险一次)。
     for prefix in [
+        "The user wants me to",
+        "The user is asking",
+        "The user asked",
+        "I need to",
+        "I will",
+        "I should",
+        "I'll",
+        "Let me",
+        "I can",
+        "Sure, ",
+        "Sure!",
+        "Sure.",
+        "Here is",
+        "Here's",
+        "考虑中:",
+        "我的思路:",
+        "我的思路是:",
+        "首先",
         "作为AI，",
         "作为 AI，",
         "作为AI,",
@@ -186,7 +238,7 @@ pub(crate) fn clean_greeting(raw: &str) -> String {
         "问候:",
     ] {
         if let Some(rest) = line.strip_prefix(prefix) {
-            line = rest.trim().to_string();
+            line = rest.trim_start_matches(|c: char| c == ' ' || c == ',' || c == '，' || c == '。' || c == '.').to_string();
         }
     }
 
@@ -230,11 +282,26 @@ pub(crate) fn safe_home_greeting(raw: &str, input: &HomeGreetingInput) -> String
         || is_unsafe_schedule_claim(&cleaned)
         || is_inconsistent_time_claim(&cleaned, input.time_of_day.as_deref())
         || is_unsupported_weather_claim(&cleaned, input.weather_summary.as_deref())
+        // 2026-07-13:LLM(尤其 reasoning 类)有时把整段英文 self-talk 输出到
+        // content 字段(例如 "The user wants me to act as a 'kanban assistant'.")。
+        // 剥前缀后还是 ≥50% ASCII,说明 LLM 没遵循中文指令 → 用 fallback 中文模板。
+        || is_mostly_english(&cleaned)
     {
         fallback_greeting(input.display_name.as_deref(), input.time_of_day.as_deref())
     } else {
         cleaned
     }
+}
+
+/// 2026-07-13:detect LLM 输出整段英文(常见于 reasoning model 把 thinking
+/// 暴露成 content)。ASCII 字符占比 ≥50% 视为英文 → fallback 中文模板。
+fn is_mostly_english(text: &str) -> bool {
+    let total = text.chars().count();
+    if total < 4 {
+        return false;
+    }
+    let ascii_count = text.chars().filter(|c| c.is_ascii()).count();
+    ascii_count * 2 >= total
 }
 
 fn is_prompt_leak(text: &str) -> bool {

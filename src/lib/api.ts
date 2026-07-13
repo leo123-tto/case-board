@@ -219,6 +219,28 @@ export function getNativeLocation(timeoutMs?: number): Promise<NativeLocation> {
   return invoke<NativeLocation>("get_native_location", { timeoutMs: timeoutMs ?? null });
 }
 
+/** 2026-07-13:首页看板助手 — 天气 + 位置(由 Rust 后端 reqwest fetch,绕过 webview CSP / fetch 限制) */
+export interface WeatherInfo {
+  source: string;
+  label: string | null;
+  summary: string;
+  detail: string;
+  warning: string | null;
+  current_temp: number | null;
+  temp_min: number | null;
+  temp_max: number | null;
+  precipitation_probability: number;
+  precipitation_sum: number;
+  current_precipitation: number;
+  weather_code: number | null;
+  latitude: number;
+  longitude: number;
+}
+
+export function getWeatherInfo(): Promise<WeatherInfo> {
+  return invoke<WeatherInfo>("get_weather_info");
+}
+
 /** 打开系统定位服务隐私设置,让用户手动授权案件看板。 */
 export function openLocationPrivacySettings(): Promise<void> {
   return invoke<void>("open_location_privacy_settings");

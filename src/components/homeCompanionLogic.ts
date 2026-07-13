@@ -62,7 +62,11 @@ export function shouldRefreshWeather(cached: CachedWeatherLike | null, now = new
 
 export function isUsableCachedWeather(cached: CachedWeatherLike | null, now = new Date()): boolean {
   if (!cached) return false;
-  if (cached.source !== "系统定位") return false;
+  // 2026-07-13 PR 修复:接受 source === "网络定位" 也 usable。
+  // Rust 后端 IP 定位成功 source 固定是"网络定位",这是合法 source;
+  // 只有 detail 真的含 "系统定位失败:" marker 才是真 fallback。
+  if (cached.source !== "系统定位" && cached.source !== "网络定位") return false;
+  if (cached.detail?.includes("系统定位失败")) return false;
   return !shouldRefreshWeather(cached, now);
 }
 
@@ -167,8 +171,12 @@ function reminderBucket(items: string[]): string {
   return "none";
 }
 
-function isNetworkFallbackWeather(cached: CachedWeatherLike): boolean {
-  return cached.source === "网络定位" || Boolean(cached.detail?.includes("系统定位失败"));
+export function isNetworkFallbackWeather(cached: CachedWeatherLike): boolean {
+  // 2026-07-13 PR 修复:用 && 不是 ||。
+  // Rust 后端 IP 定位成功 source 固定是"网络定位",detail 不含失败 marker,
+  // 这种成功 case 不应该被当作 fallback。
+  // 只有 source 是网络定位 + detail 真的含 "系统定位失败:" marker 才是 fallback。
+  return cached.source === "网络定位" && Boolean(cached.detail?.includes("系统定位失败"));
 }
 
 function extractLocationIssue(detail: string | null | undefined): string | null {

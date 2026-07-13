@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils";
 import {
   buildGreetingCacheKey,
   isDisplayableCachedWeather,
+  isNetworkFallbackWeather,
   isGreetingTextCompatible,
   isStaleIso,
   shouldShowLocationSettingsAction,
@@ -294,7 +295,7 @@ export function HomeCompanionStrip({
           <span
             className="inline-flex items-center gap-1"
             title={
-              weather.value?.source === "网络定位"
+              weather.value && isNetworkFallbackWeather(weather.value)
                 ? "系统定位失败，未使用网络估算天气"
                 : weather.value?.detail ?? undefined
             }

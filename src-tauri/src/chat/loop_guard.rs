@@ -9,6 +9,14 @@
 //!
 //! 任何一个 cap 触发 → 返回 `LoopGuardViolation`,agent_loop 终止本轮并把信息塞回 LLM 让它
 //! 收尾(或者直接 abort,看上层策略)。
+//!
+//! **2026-07-14 idle 缩放**:`idle_timeout` 已不再固定 180s,改为跟随任务
+//! `max_duration` 自动缩放(max_duration / 3,下限 180s,上限 max_duration 自身)。
+//! 之前固定 180s 在思考模型(MiniMax M3 / deepseek-v4-pro)上会被误判「读流卡死」:
+//! 思考 + 生成大 CaseGraph JSON 阶段常连续 5-10 分钟不吐 token,reqwest.read_timeout
+//! 在 180s 时强行断流,返回 `error decoding response body` 把好流截掉。VisualizeCase
+//! 的 max_duration 是 1800s,缩放后 idle = 600s(10 分钟)够用且不会让真卡死的请求
+//! 拖太久。
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -29,7 +37,6 @@ pub const DEFAULT_REASONING_TOKENS_DEFAULT: u64 = 64_000;
 pub const DEFAULT_REASONING_TOKENS_COMPLEX: u64 = 192_000;
 pub const DEFAULT_REASONING_TOKENS_DEEP_ANALYSIS: u64 = 256_000;
 const MIN_CHAT_LOOP_TIMEOUT_SECS: u64 = 60;
-const MIN_CHAT_LOOP_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// 5 条 cap 中触发哪一条。
 #[derive(Debug, Clone, Serialize, Error)]
@@ -88,8 +95,9 @@ impl LoopGuardConfig {
         } else {
             configured_iters
         };
-        let idle_secs = DEFAULT_CHAT_LOOP_IDLE_TIMEOUT_SECS
-            .max(MIN_CHAT_LOOP_IDLE_TIMEOUT_SECS)
+        let idle_secs = max_duration_secs
+            .saturating_div(3)
+            .max(DEFAULT_CHAT_LOOP_IDLE_TIMEOUT_SECS)
             .min(max_duration_secs);
         Self {
             max_iters,
@@ -203,5 +211,44 @@ impl LoopGuard {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Settings;
+
+    /// 2026-07-14:idle 缩放回归测试。固定 180s 在思考模型上被 5-10 分钟思考 + 大 JSON
+    /// 生成阶段吃光,reqwest.read_timeout 误判读流卡死(error decoding response body)。
+    /// 新公式 `max(max_duration/3, 180)`,min(max_duration) 让 idle 跟任务时长缩放。
+    #[test]
+    fn idle_scales_with_max_duration() {
+        // 复杂任务(max_duration=1800)→ max(1800/3=600, 180)=600 → min(600, 1800)=600
+        let s = Settings::default();
+        let guard = LoopGuard::from_settings_for_task(&s, TaskType::VisualizeCase);
+        assert_eq!(
+            guard.idle_timeout_secs(),
+            600,
+            "VisualizeCase max_duration=1800s 缩放后 idle 应该是 600s;实际 {}s",
+            guard.idle_timeout_secs()
+        );
+    }
+
+    #[test]
+    fn freechat_idle_keeps_old_floor() {
+        // FreeChat max_duration=300 → 300/3=100 → max(100, 180)=180 → min(180, 300)=180
+        // 不应缩短老用户已习惯的 180s idle
+        let s = Settings::default();
+        let guard = LoopGuard::from_settings_for_task(&s, TaskType::FreeChat);
+        assert_eq!(guard.idle_timeout_secs(), 180);
+    }
+
+    #[test]
+    fn deep_analysis_idle_gets_max_window() {
+        // DeepAnalysis max_duration=2700 → 2700/3=900 → max(900, 180)=900 → min(900, 2700)=900
+        let s = Settings::default();
+        let guard = LoopGuard::from_settings_for_task(&s, TaskType::DeepAnalysis);
+        assert_eq!(guard.idle_timeout_secs(), 900);
     }
 }

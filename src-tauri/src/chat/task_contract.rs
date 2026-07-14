@@ -149,6 +149,11 @@ impl TaskContract {
                     // 2026-07-14:修 LLM 在正文伪造「已确认/已收到用户多选」绕过 ask_user 的 bug。
                     // 工具不调、正文却声称已选 = 既不真正拿授权又误导律师,质量门必须拦住。
                     "禁止在正文中伪造用户已选择视图：必须真正调用 ask_user 发起多选并收到用户回复后，才能在正文说「已收到/已确认/已选择」；本轮若未调 ask_user，正文只能写引导语让用户看到选项卡片，绝不能默认全选或多选",
+                    // 2026-07-14:修 LLM 在阶段二正文里把 CaseGraph 节点/边/视图结构全复述一遍
+                    // 导致 MiniMax M 系列 32K 输出上限被吃光,工具 save_case_visualization /
+                    // apply_case_visual_update 还没调就被 finish_reason=length 截断。规则:
+                    // 写可视化时正文只写一句进度,结构放工具参数(JSON 不占 output token)。
+                    "阶段二禁止在正文复述 CaseGraph 结构：调用 save_case_visualization / apply_case_visual_update 时，正文只写一句进度描述（如「正在写入 N 张视图到工作区」），立即调工具；节点/边/视图结构、事实状态标注纪律、已读文档 id 等都放进工具参数，绝不抄进正文",
                 ],
             },
             TaskType::DeepAnalysis => Self {

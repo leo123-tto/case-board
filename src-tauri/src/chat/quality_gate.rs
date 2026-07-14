@@ -41,6 +41,23 @@ pub fn evaluate_task_quality(input: QualityGateInput<'_>) -> QualityGateReport {
         input.tool_calls,
     ));
 
+    // 2026-07-14:VisualizeCase 专项 — 文本级反伪造检测。LLM 可能不调 ask_user
+    // 但在正文里写「已确认/已收到你的多选/全选」伪造用户授权;若已发出通用
+    // 「既未发起视图多选,也未创建或更新工作区」警告,这里把它升级为更尖锐的
+    // 专门警告,直接点出"伪造"问题,让律师一眼看清根因。
+    if contract.task == TaskType::VisualizeCase
+        && !has_successful_tool(input.tool_calls, "ask_user")
+        && !has_successful_tool(input.tool_calls, "save_case_visualization")
+        && !has_successful_tool(input.tool_calls, "apply_case_visual_update")
+        && looks_like_fake_user_confirmation(input.content)
+    {
+        warnings.retain(|w| w != "案情可视化任务既未发起视图多选，也未创建或更新工作区。");
+        warnings.push(
+            "案情可视化任务伪造了用户授权:正文里出现「已确认/已收到多选/全选/你已选择」类措辞,但本轮没有真正调用 ask_user 工具发起选项式追问。用户实际并未从选项卡片里点选,所有「已选/全选」均为模型伪造。请改用 ask_user 让用户真正选择;在用户点选前不得在正文声称「已收到/已确认/全选」。"
+                .into(),
+        );
+    }
+
     let incomplete = task_output_incomplete(input.task, input.content);
     if incomplete {
         warnings.push(
@@ -276,4 +293,182 @@ fn looks_like_final_analysis(content: &str) -> bool {
         || text.contains("请求权")
         || text.contains("三阶层")
         || text.chars().count() >= 800
+}
+
+/// 2026-07-14:VisualizeCase 专项 — 检测 LLM 是否在正文里伪造「用户已选择/已确认」。
+///
+/// 真实合法选择只能来自本轮真正调起 `ask_user` 工具并收到用户答复。LLM 在没有
+/// 调过 `ask_user` 的情况下,在正文里写「已确认/已收到多选/全选/你已选择」类
+/// 措辞 = 伪造用户授权,既骗律师又破坏任务契约。质量门会专门拦这一组合。
+///
+/// 故意只覆盖「声称用户已选」的措辞;不拦 AI 在多选问题里写「请选择」之类的
+/// 正常引导语,也不拦 AI 在多选问题中给「建议全选」类选项描述(那个写在
+/// ask_user 参数里,不是正文)。
+fn looks_like_fake_user_confirmation(content: &str) -> bool {
+    let text = content.trim();
+    if text.is_empty() {
+        return false;
+    }
+    // 「声称已收到/已确认/全选/多选结果/你已选择」类措辞,任一命中即视为伪造。
+    const PHRASES: &[&str] = &[
+        "已确认收到",
+        "已收到你的多选",
+        "已收到你的选择",
+        "已收到你选择",
+        "已确认你的多选",
+        "已确认你的选择",
+        "已确认你选择",
+        "已收到选择",
+        "已确认选择",
+        "你的多选结果",
+        "你的多选结果为",
+        "你的选择是",
+        "你已选择",
+        "你已勾选",
+        "你已确认",
+        "我看到你选择了",
+        "我看到你勾选了",
+        "你选择的是",
+        "已选定为",
+        "已选定了",
+    ];
+    PHRASES.iter().any(|p| text.contains(p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(tool: &str, success: bool) -> ToolCallRecord {
+        ToolCallRecord {
+            tool: tool.to_string(),
+            args: serde_json::json!({}),
+            kb_hit: false,
+            credits_used: 0,
+            success,
+            error_short: None,
+            started_at_ms: 0,
+            finished_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn fake_confirmation_patterns_are_detected() {
+        assert!(looks_like_fake_user_confirmation(
+            "已确认收到你的多选结果 1+2+3+4 全选。"
+        ));
+        assert!(looks_like_fake_user_confirmation(
+            "你已选择时间线、关系图、证据矩阵、思维导图。"
+        ));
+        assert!(looks_like_fake_user_confirmation(
+            "我看到你选择了 4 张视图,正在生成..."
+        ));
+        assert!(looks_like_fake_user_confirmation(
+            "你的多选结果: 1、2、3、4。"
+        ));
+    }
+
+    #[test]
+    fn normal_guidance_text_is_not_flagged() {
+        // 引导语(让用户选)不应被误判
+        assert!(!looks_like_fake_user_confirmation(
+            "为把这份内容写准确,我先和你确认几点 👇"
+        ));
+        assert!(!looks_like_fake_user_confirmation("请选择要生成的视图"));
+        assert!(!looks_like_fake_user_confirmation(
+            "下面请你选择(可多选,建议全选)—— 4 张图覆盖了..."
+        ));
+        // 空内容 / 不相关文本
+        assert!(!looks_like_fake_user_confirmation(""));
+        assert!(!looks_like_fake_user_confirmation("已收到其他类型反馈"));
+    }
+
+    #[test]
+    fn visualize_case_without_any_tool_but_with_fake_text_fires_specific_warning() {
+        let input = QualityGateInput {
+            task: TaskType::VisualizeCase,
+            content: "已确认收到你的多选结果 1+2+3+4 全选,正在生成 4 张视图。",
+            citations: &[],
+            tool_calls: &[],
+            ask_user_present: false,
+            artifact_doc_id: None,
+        };
+        let report = evaluate_task_quality(input);
+        assert!(!report.passed);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("伪造")),
+            "应当点出伪造问题;实际 warnings: {:?}",
+            report.warnings
+        );
+        // 旧的通用警告不应再出现,被替换为更尖锐的版本
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w == "案情可视化任务既未发起视图多选，也未创建或更新工作区。"),
+            "通用警告应被替换;实际 warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn visualize_case_without_tools_and_no_fake_text_keeps_generic_warning() {
+        let input = QualityGateInput {
+            task: TaskType::VisualizeCase,
+            content: "为把这份内容写准确,我先和你确认几点 👇",
+            citations: &[],
+            tool_calls: &[],
+            ask_user_present: false,
+            artifact_doc_id: None,
+        };
+        let report = evaluate_task_quality(input);
+        assert!(!report.passed);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w == "案情可视化任务既未发起视图多选，也未创建或更新工作区。"),
+            "没有伪造措辞时应保留通用警告;实际 warnings: {:?}",
+            report.warnings
+        );
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("伪造")),
+            "无伪造措辞时不应触发伪造警告;实际 warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn visualize_case_with_ask_user_tool_passes() {
+        let calls = [rec("ask_user", true)];
+        let input = QualityGateInput {
+            task: TaskType::VisualizeCase,
+            content: "为把这份内容写准确,我先和你确认几点 👇",
+            citations: &[],
+            tool_calls: &calls,
+            ask_user_present: true,
+            artifact_doc_id: None,
+        };
+        let report = evaluate_task_quality(input);
+        assert!(report.passed, "ask_user 路径应 pass;warnings: {:?}", report.warnings);
+    }
+
+    #[test]
+    fn visualize_case_with_save_tool_passes() {
+        let calls = [rec("save_case_visualization", true)];
+        let input = QualityGateInput {
+            task: TaskType::VisualizeCase,
+            content: "已生成 4 张视图并直接加入工作台,可在工作台查看。",
+            citations: &[],
+            tool_calls: &calls,
+            ask_user_present: false,
+            artifact_doc_id: None,
+        };
+        let report = evaluate_task_quality(input);
+        assert!(
+            report.passed,
+            "save 工具调用路径应 pass;warnings: {:?}",
+            report.warnings
+        );
+    }
 }

@@ -143,9 +143,8 @@ impl TaskContract {
                 ask_user_policy: AskUserPolicy::RequiredBeforeFinal,
                 artifact_policy: ArtifactPolicy::Optional,
                 success_criteria: &[
-                    "首次点击必须先分析本案适合的可视化角度，并通过一次多选让律师决定",
-                    "用户选择前不得写入工作区；选择后只生成所选视图",
-                    "已有工作区在用户完成选择后直接应用，不能再次要求审核底层节点或关系",
+                    "首次点击先分析后一次多选；用户选择前不写入，选择后只生成所选视图",
+                    "正文不复述工具参数、不伪造授权或工具结果；已有工作区直接安全合并",
                 ],
             },
             TaskType::DeepAnalysis => Self {

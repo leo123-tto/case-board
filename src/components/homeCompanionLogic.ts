@@ -85,7 +85,6 @@ export function weatherSummaryForGreeting(
 
 export function weatherDisplaySummary(cached: CachedWeatherLike | null): string | null {
   if (!cached) return null;
-  if (cached.source === "网络定位") return "定位未确认，天气未更新";
   const summary = cached.summary?.trim();
   return summary || null;
 }

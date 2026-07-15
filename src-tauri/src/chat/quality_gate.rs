@@ -41,6 +41,16 @@ pub fn evaluate_task_quality(input: QualityGateInput<'_>) -> QualityGateReport {
         input.tool_calls,
     ));
 
+    if input.task == TaskType::VisualizeCase
+        && looks_like_fake_visualization_authorization(input.content)
+        && !has_successful_visualization_transition(input.tool_calls)
+    {
+        warnings.push(
+            "伪造用户授权风险: 正文声称用户已确认或授权，但本轮没有真实的多选确认或可视化写入结果。"
+                .into(),
+        );
+    }
+
     let incomplete = task_output_incomplete(input.task, input.content);
     if incomplete {
         warnings.push(
@@ -238,6 +248,29 @@ fn has_successful_tool(tool_calls: &[ToolCallRecord], name: &str) -> bool {
     tool_calls
         .iter()
         .any(|call| call.success && call.tool == name)
+}
+
+fn looks_like_fake_visualization_authorization(content: &str) -> bool {
+    [
+        "用户已确认",
+        "用户已经确认",
+        "用户已同意",
+        "用户已经同意",
+        "已获用户同意",
+        "用户已授权",
+    ]
+    .iter()
+    .any(|marker| content.contains(marker))
+}
+
+fn has_successful_visualization_transition(tool_calls: &[ToolCallRecord]) -> bool {
+    [
+        "ask_user",
+        "save_case_visualization",
+        "apply_case_visual_update",
+    ]
+    .iter()
+    .any(|name| has_successful_tool(tool_calls, name))
 }
 
 fn looks_like_legal_output(content: &str) -> bool {

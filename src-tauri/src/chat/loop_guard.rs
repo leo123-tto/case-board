@@ -22,6 +22,8 @@ pub const DEFAULT_CHAT_LOOP_TIMEOUT_DEFAULT_SECS: u64 = 300;
 pub const DEFAULT_CHAT_LOOP_TIMEOUT_COMPLEX_SECS: u64 = 1_800;
 pub const DEFAULT_CHAT_LOOP_TIMEOUT_DEEP_ANALYSIS_SECS: u64 = 2_700;
 pub const DEFAULT_CHAT_LOOP_IDLE_TIMEOUT_SECS: u64 = 180;
+pub const DEFAULT_CHAT_RESPONSE_READ_TIMEOUT_VISUALIZE_SECS: u64 = 600;
+pub const DEFAULT_CHAT_RESPONSE_READ_TIMEOUT_DEEP_ANALYSIS_SECS: u64 = 900;
 pub const DEFAULT_CHAT_LOOP_MAX_ITERS_DEFAULT: u32 = 16;
 pub const DEFAULT_CHAT_LOOP_MAX_ITERS_COMPLEX: u32 = 48;
 pub const DEFAULT_CHAT_LOOP_MAX_ITERS_DEEP_ANALYSIS: u32 = 64;
@@ -51,6 +53,7 @@ pub struct LoopGuardConfig {
     pub max_iters: u32,
     pub max_duration: Duration,
     pub idle_timeout: Duration,
+    pub response_read_timeout: Duration,
     pub max_reasoning_tokens: u64,
 }
 
@@ -91,10 +94,18 @@ impl LoopGuardConfig {
         let idle_secs = DEFAULT_CHAT_LOOP_IDLE_TIMEOUT_SECS
             .max(MIN_CHAT_LOOP_IDLE_TIMEOUT_SECS)
             .min(max_duration_secs);
+        let response_read_timeout_secs = match task {
+            TaskType::VisualizeCase => DEFAULT_CHAT_RESPONSE_READ_TIMEOUT_VISUALIZE_SECS,
+            TaskType::DeepAnalysis | TaskType::CriminalDeepAnalysis => {
+                DEFAULT_CHAT_RESPONSE_READ_TIMEOUT_DEEP_ANALYSIS_SECS
+            }
+            _ => idle_secs,
+        };
         Self {
             max_iters,
             max_duration: Duration::from_secs(max_duration_secs),
             idle_timeout: Duration::from_secs(idle_secs),
+            response_read_timeout: Duration::from_secs(response_read_timeout_secs),
             max_reasoning_tokens,
         }
     }
@@ -108,6 +119,7 @@ pub struct LoopGuard {
     max_duration: Duration,
     last_progress_at: Instant,
     idle_timeout: Duration,
+    response_read_timeout: Duration,
     reasoning_tokens: u64,
     max_reasoning_tokens: u64,
 }
@@ -122,6 +134,7 @@ impl LoopGuard {
             max_duration: cfg.max_duration,
             last_progress_at: Instant::now(),
             idle_timeout: cfg.idle_timeout,
+            response_read_timeout: cfg.response_read_timeout,
             reasoning_tokens: 0,
             max_reasoning_tokens: cfg.max_reasoning_tokens,
         }
@@ -138,6 +151,11 @@ impl LoopGuard {
 
     pub fn idle_timeout_secs(&self) -> u64 {
         self.idle_timeout.as_secs()
+    }
+
+    /// 单次流响应允许的最长读空闲。仅思考型重任务放宽，通用 idle cap 不变。
+    pub fn response_read_timeout_secs(&self) -> u64 {
+        self.response_read_timeout.as_secs()
     }
 
     /// 收到新的 token / reasoning / 工具结果时更新最近进展时间。

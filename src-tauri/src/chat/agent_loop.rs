@@ -980,7 +980,9 @@ async fn stream_one_request(
     // "error decoding response body";read_timeout 只在流真正卡死(两次读间隔超时)才触发。
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(guard.idle_timeout_secs().max(30)))
+        .read_timeout(Duration::from_secs(
+            guard.response_read_timeout_secs().max(30),
+        ))
         .build()
         .map_err(|e| AgentLoopError::Network(e.to_string()))?;
 

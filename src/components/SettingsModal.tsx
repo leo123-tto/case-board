@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   X,
   Loader2,
@@ -273,6 +273,24 @@ export function SettingsModal({
   const handleClose = () => {
     if (onClose) onClose();
   };
+  const [qrHover, setQrHover] = useState(false);
+  const qrCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleQrEnter = useCallback(() => {
+    if (qrCloseTimerRef.current) {
+      clearTimeout(qrCloseTimerRef.current);
+      qrCloseTimerRef.current = null;
+    }
+    setQrHover(true);
+  }, []);
+  const handleQrLeave = useCallback(() => {
+    qrCloseTimerRef.current = setTimeout(() => setQrHover(false), 200);
+  }, []);
+  useEffect(
+    () => () => {
+      if (qrCloseTimerRef.current) clearTimeout(qrCloseTimerRef.current);
+    },
+    [],
+  );
   const [settings, setSettings] = useState<Settings | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -819,21 +837,25 @@ export function SettingsModal({
               {/* ── 通用:微信扫码加群(缩略图悬停放大;托管 lawtools.top,过期换图不必重新发版) ── */}
               {tab === "general" && (
                   <Section title="微信扫码加群" fill>
-                    <div className="flex items-center gap-3">
-                      <div className="group relative shrink-0">
+                    <div className="flex items-start gap-3" onMouseLeave={handleQrLeave}>
+                      <div className="relative shrink-0" onMouseEnter={handleQrEnter}>
                         <GroupQrCode
                           size={60}
                           className="cursor-pointer rounded border border-border"
                         />
-                        {/* 悬停放大浮层:向下展开,z 高于下方卡片,不挡鼠标 */}
-                        <div className="pointer-events-none absolute left-0 top-full z-50 mt-2 hidden group-hover:block">
-                          <GroupQrCode
-                            size={300}
-                            className="rounded-md border border-border shadow-xl"
-                          />
-                        </div>
+                        {qrHover && (
+                          <div
+                            className="absolute left-0 top-full z-50 mt-2"
+                            onMouseEnter={handleQrEnter}
+                          >
+                            <GroupQrCode
+                              size={300}
+                              className="rounded-md border border-border shadow-xl"
+                            />
+                          </div>
+                        )}
                       </div>
-                      <p className="text-xs text-muted-foreground">
+                      <p className="pt-2 text-xs text-muted-foreground">
                         鼠标悬停二维码放大,微信扫码进群 —— 反馈、提需求、看更新。
                       </p>
                     </div>
@@ -857,7 +879,7 @@ export function SettingsModal({
                   >
                     <Field
                       label="访问令牌"
-                      hint="选填。填了即自动成为另一家 OCR 的备用线路;免费额度 2 万页/天"
+                      hint="选为主力时必填；作为备用时选填。免费额度 2 万页/天"
                     >
                       <div className="flex items-center gap-2">
                         <input
@@ -921,7 +943,10 @@ export function SettingsModal({
                     title="MinerU"
                     link={{ label: "点这里申请 token", href: "https://mineru.net/apiManage/token" }}
                   >
-                    <Field label="API Token">
+                    <Field
+                      label="API Token"
+                      hint="选为主力时必填；作为备用时选填"
+                    >
                       <div className="flex items-center gap-2">
                         <input
                           type="password"
@@ -935,7 +960,7 @@ export function SettingsModal({
                               updateField("mineru_verified_at", null);
                             }
                           }}
-                          placeholder="eyJ0eXBl..."
+                          placeholder="eyJ0eXBl... 或 sk-..."
                           className={cn(inputCls, "flex-1")}
                           autoComplete="off"
                         />
@@ -976,7 +1001,7 @@ export function SettingsModal({
               {tab === "models" && (
                   <Section
                     title="云端 OCR 主力"
-                    desc="MinerU 与 PaddleOCR 谁当主力:主力失败、排队超时或额度用完时,自动切到另一家,无需手动干预。"
+                    desc="只需填写并验证主力 OCR；备用线路选填。备用已配置时，主力失败、排队超时或额度用完会自动切换。"
                   >
                     <Field label="选择主力">
                       <select

@@ -34,6 +34,7 @@ import { EmptyState } from "@/modules/litigation/components/EmptyState";
 import { ProgressBanner } from "@/modules/litigation/components/ProgressBanner";
 import { confirmDialog } from "@/lib/dialog";
 import { useFeatureFlag } from "@/lib/featureFlags";
+import { primaryOcrIssues } from "@/lib/ocrSettings";
 import {
   checkForUpdate,
   deleteCase,
@@ -462,15 +463,7 @@ function MainApp() {
     type Issue = { label: string; reason: "missing" | "unverified" };
     const issues: Issue[] = [];
 
-    {
-      const filled = !!s.mineru_api_key?.trim();
-      const verified = !!s.mineru_verified_at;
-      if (!filled) {
-        issues.push({ label: "MinerU API Token(云端 OCR)", reason: "missing" });
-      } else if (!verified) {
-        issues.push({ label: "MinerU API Token(云端 OCR)", reason: "unverified" });
-      }
-    }
+    issues.push(...primaryOcrIssues(s));
     {
       // 2026-06-15/16:按云端后端校验对应的 key,与后端 effective_cloud_llm_backend 三选一对齐
       // (minimax / 通用兼容 glm·mimo·custom / 其余回落 DeepSeek)。各后端 key 字段独立。

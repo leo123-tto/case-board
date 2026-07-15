@@ -2,6 +2,7 @@
 //!
 //! 单一职责:把案件元数据落库 / 读出来。文档相关的操作在 [`super::documents`]。
 
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
@@ -411,6 +412,167 @@ pub async fn patch_user_override_field(
         Ok(()) => {
             sqlx::query("COMMIT").execute(&mut *conn).await?;
             Ok(())
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CalendarEventOverrideInput {
+    pub source_key: String,
+    pub row_key: Option<String>,
+    pub date: Option<String>,
+    pub title: Option<String>,
+    pub note: Option<String>,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// 原子合并首页日历的人工编辑/隐藏，保留同案其它 user_overrides 内容。
+pub async fn update_calendar_event_override(
+    pool: &SqlitePool,
+    id: &str,
+    input: CalendarEventOverrideInput,
+) -> Result<Option<String>, sqlx::Error> {
+    let source_key = input.source_key.trim();
+    if source_key.is_empty() {
+        return Err(sqlx::Error::Protocol("日程来源标识不能为空".into()));
+    }
+    if let Some(date) = input.date.as_deref() {
+        if NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d").is_err() {
+            return Err(sqlx::Error::Protocol(
+                "日程日期不是有效的 YYYY-MM-DD".into(),
+            ));
+        }
+    }
+    if !input.hidden
+        && input
+            .title
+            .as_deref()
+            .is_some_and(|title| title.trim().is_empty())
+    {
+        return Err(sqlx::Error::Protocol("日程名称不能为空".into()));
+    }
+
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let result = async {
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT user_overrides_json FROM cases WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or(sqlx::Error::RowNotFound)?;
+        let mut overrides = match current.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => serde_json::from_str::<serde_json::Value>(raw).map_err(|error| {
+                sqlx::Error::Protocol(format!("user_overrides_json 已损坏，拒绝覆盖: {}", error))
+            })?,
+            None => serde_json::json!({}),
+        };
+        let root = overrides.as_object_mut().ok_or_else(|| {
+            sqlx::Error::Protocol("user_overrides_json 不是对象，拒绝覆盖".into())
+        })?;
+
+        if let Some(row_key) = input.row_key.as_deref() {
+            if input.hidden {
+                let deleted_value = root
+                    .entry("deleted_rows")
+                    .or_insert_with(|| serde_json::json!({}));
+                let deleted = deleted_value.as_object_mut().ok_or_else(|| {
+                    sqlx::Error::Protocol("user_overrides_json.deleted_rows 不是对象".into())
+                })?;
+                let rows_value = deleted
+                    .entry("agg_key_dates")
+                    .or_insert_with(|| serde_json::json!([]));
+                let rows = rows_value.as_array_mut().ok_or_else(|| {
+                    sqlx::Error::Protocol("deleted_rows.agg_key_dates 不是数组".into())
+                })?;
+                if !rows.iter().any(|value| value.as_str() == Some(row_key)) {
+                    rows.push(serde_json::Value::String(row_key.to_string()));
+                }
+            } else {
+                let fields_value = root
+                    .entry("fields")
+                    .or_insert_with(|| serde_json::json!({}));
+                let fields = fields_value.as_object_mut().ok_or_else(|| {
+                    sqlx::Error::Protocol("user_overrides_json.fields 不是对象".into())
+                })?;
+                for (inner, value) in [
+                    ("date", input.date.as_deref()),
+                    ("event_type", input.title.as_deref()),
+                ] {
+                    if let Some(value) = value {
+                        fields.insert(
+                            format!("agg_key_dates.{{{row_key}}}.{inner}"),
+                            serde_json::Value::String(value.trim().to_string()),
+                        );
+                    }
+                }
+                fields.insert(
+                    format!("agg_key_dates.{{{row_key}}}.note"),
+                    input
+                        .note
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| serde_json::Value::String(value.to_string()))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+        } else {
+            let calendar_value = root
+                .entry("calendar_events")
+                .or_insert_with(|| serde_json::json!({}));
+            let calendar = calendar_value.as_object_mut().ok_or_else(|| {
+                sqlx::Error::Protocol("user_overrides_json.calendar_events 不是对象".into())
+            })?;
+            let mut value = serde_json::Map::new();
+            if input.hidden {
+                value.insert("hidden".into(), serde_json::Value::Bool(true));
+            } else {
+                if let Some(date) = input.date.as_deref() {
+                    value.insert("date".into(), serde_json::Value::String(date.trim().into()));
+                }
+                if let Some(title) = input.title.as_deref() {
+                    value.insert(
+                        "title".into(),
+                        serde_json::Value::String(title.trim().into()),
+                    );
+                }
+                value.insert(
+                    "note".into(),
+                    input
+                        .note
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| serde_json::Value::String(value.to_string()))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            calendar.insert(source_key.to_string(), serde_json::Value::Object(value));
+        }
+
+        let next_json = serde_json::to_string(&overrides).map_err(|error| {
+            sqlx::Error::Protocol(format!("序列化 user_overrides_json 失败: {}", error))
+        })?;
+        sqlx::query(
+            "UPDATE cases SET user_overrides_json = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(&next_json)
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+        Ok::<_, sqlx::Error>(Some(next_json))
+    }
+    .await;
+    match result {
+        Ok(json) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok(json)
         }
         Err(error) => {
             let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;

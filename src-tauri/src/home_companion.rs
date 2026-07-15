@@ -163,13 +163,15 @@ pub(crate) fn build_home_greeting_prompt(input: &HomeGreetingInput, memories: &[
          6. 必须匹配时间段:上午不要说“今天辛苦了”“早点休息”“明天状态会更好”;夜间优先提醒早点休息。\n\
          7. 天气只作事实参考;天气未更新、不可信或没有明确降雨/降温/高温时,不要提天气、带伞、添衣或路况。\n\
          8. 如果要提提醒,只能泛泛说“提醒区扫一眼”,不要判断今天有没有开庭。\n\
-         9. 不要鸡汤味太重,要克制、稳、轻。",
+         9. 不要鸡汤味太重,要克制、稳、轻。\n\
+         10. 不要输出任何 thinking / reasoning / chain-of-thought / self-talk；思考模型也只输出最终一句中文。",
         input.local_date.trim()
     )
 }
 
 pub(crate) fn clean_greeting(raw: &str) -> String {
-    let mut line = raw
+    let stripped = strip_reasoning_blocks(raw);
+    let mut line = stripped
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("")
@@ -230,11 +232,40 @@ pub(crate) fn safe_home_greeting(raw: &str, input: &HomeGreetingInput) -> String
         || is_unsafe_schedule_claim(&cleaned)
         || is_inconsistent_time_claim(&cleaned, input.time_of_day.as_deref())
         || is_unsupported_weather_claim(&cleaned, input.weather_summary.as_deref())
+        || is_mostly_latin_text(&cleaned)
     {
         fallback_greeting(input.display_name.as_deref(), input.time_of_day.as_deref())
     } else {
         cleaned
     }
+}
+
+fn strip_reasoning_blocks(raw: &str) -> String {
+    let mut stripped = raw.to_string();
+    for tag in ["think", "reasoning", "ant_thinking", "reflection"] {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        while let Some(start) = stripped.find(&open) {
+            let content_start = start + open.len();
+            if let Some(end) = stripped[content_start..].find(&close) {
+                let end = content_start + end + close.len();
+                stripped.replace_range(start..end, "");
+            } else {
+                stripped.truncate(start);
+                break;
+            }
+        }
+    }
+    stripped
+}
+
+fn is_mostly_latin_text(text: &str) -> bool {
+    let latin = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let cjk = text
+        .chars()
+        .filter(|c| matches!(*c, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}'))
+        .count();
+    latin >= 8 && latin > cjk.saturating_mul(2)
 }
 
 fn is_prompt_leak(text: &str) -> bool {

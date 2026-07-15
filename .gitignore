@@ -56,11 +56,22 @@ _legacy_codex/
 
 # Claude / Agent 工作上下文(只给 Claude session 看,不公开)
 CLAUDE.md
+# ↑ 备注:AGENTS.md 默认忽略,下面加 ! 规则放开 fork 私有扩展(只对本 fork 生效)
 AGENTS.md
 
 # 项目内部讨论 / 决策记录 / 方法论 / 分发交接文档
 # (可能含客户名 / 决策过程 / 敏感产品策略;作者本地保留)
 docs/
+
+# ───────────────────────────────────────────────────────────────
+# Fork 私有扩展:贡献工作流(只在本 fork 生效,upstream 看不到)
+# ───────────────────────────────────────────────────────────────
+# 放开:本 fork 的协作者指南
+!AGENTS.md
+# 放开:本 fork 的贡献工作流文档(AGENTS.md 引用,要在仓库内可访问)
+!docs/
+!docs/**
+!docs/**/*
 
 # FleetView / Claude Code 本地 session 状态
 .clawhub/

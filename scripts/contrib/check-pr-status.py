@@ -19,6 +19,14 @@ import time
 import urllib.error
 import urllib.request
 
+# Windows PowerShell 默认 GBK 编码,中文输出会乱码
+# 在 Python 端强制 UTF-8,确保 PowerShell / Windows Terminal 都能正常显示
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except (AttributeError, OSError):
+    pass
+
 UPSTREAM_OWNER = "leo123-tto"
 UPSTREAM_REPO = "case-board"
 

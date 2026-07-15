@@ -36,6 +36,7 @@ pub mod telemetry;
 pub mod ticktick;
 pub mod update;
 pub mod verify;
+pub mod weather;
 pub mod yuandian;
 
 use std::path::{Path, PathBuf};
@@ -1699,6 +1700,17 @@ async fn list_calendar_events(
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<Vec<db::calendar_events::CalendarEvent>, String> {
     db::calendar_events::list_all(pool.inner())
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn update_calendar_event(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+    upd: db::calendar_events::UpdateCalendarEvent,
+) -> Result<db::calendar_events::CalendarEvent, String> {
+    db::calendar_events::update(pool.inner(), &id, upd)
         .await
         .map_err(db_err)
 }
@@ -4709,6 +4721,17 @@ async fn update_case_overrides(
         .map_err(db_err)
 }
 
+#[tauri::command]
+async fn update_case_calendar_event_override(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    input: cases_db::CalendarEventOverrideInput,
+) -> Result<Option<String>, String> {
+    cases_db::update_calendar_event_override(pool.inner(), &case_id, input)
+        .await
+        .map_err(db_err)
+}
+
 /// 显式清空首次 AI 识别和人工确认的代理立场。其它用户编辑保持不变。
 /// 清空后可重新人工选择,或点「重新分析」让 AI 重新识别并再次锁定。
 #[tauri::command]
@@ -6846,6 +6869,7 @@ pub fn run() {
             chat_dashboard_assistant,
             native_location::get_native_location,
             native_location::open_location_privacy_settings,
+            weather::get_weather_info,
             save_settings,
             update_home_case_order,
             detect_local_readiness,
@@ -6884,6 +6908,7 @@ pub fn run() {
             organize_case_log,
             add_calendar_event,
             list_calendar_events,
+            update_calendar_event,
             delete_calendar_event,
             fetch_feishu_calendar,
             find_feishu_case_path,
@@ -6922,6 +6947,7 @@ pub fn run() {
             delete_express_track,
             update_workflow_status,
             update_case_overrides,
+            update_case_calendar_event_override,
             reset_case_our_side,
             get_deepseek_balance,
             collect_feedback_diagnostic,

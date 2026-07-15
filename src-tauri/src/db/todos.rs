@@ -16,6 +16,7 @@ pub struct Todo {
     pub done_at: Option<String>,
     /// 2026-06-14:可选"重要日期"(ISO "YYYY-MM-DD")。Some → 该待办汇入首页日程日历。
     pub due_date: Option<String>,
+    pub note: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -35,6 +36,9 @@ pub struct UpdateTodo {
     /// Some("YYYY-MM-DD") 改日期;Some("") 清空日期;None 不动。
     #[serde(default)]
     pub due_date: Option<String>,
+    /// Some(text) 改备注；Some("") 清空；None 不动。
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// 跨案件未完成待办(首页汇总用)—— 扁平结构带 case_name,
@@ -46,6 +50,7 @@ pub struct OpenTodoRow {
     pub case_name: String,
     pub title: String,
     pub due_date: Option<String>,
+    pub note: Option<String>,
     pub created_at: String,
 }
 
@@ -80,7 +85,7 @@ pub async fn list_by_case(pool: &SqlitePool, case_id: &str) -> Result<Vec<Todo>,
 /// 跨案件所有未完成待办(首页汇总),按案件分组、组内创建倒序。
 pub async fn list_open(pool: &SqlitePool) -> Result<Vec<OpenTodoRow>, sqlx::Error> {
     sqlx::query_as::<_, OpenTodoRow>(
-        "SELECT t.id, t.case_id, c.name AS case_name, t.title, t.due_date, t.created_at \
+        "SELECT t.id, t.case_id, c.name AS case_name, t.title, t.due_date, t.note, t.created_at \
          FROM case_todos t JOIN cases c ON t.case_id = c.id \
          WHERE t.done = 0 \
          ORDER BY c.name ASC, t.created_at DESC",
@@ -94,6 +99,8 @@ pub async fn update(pool: &SqlitePool, id: &str, upd: &UpdateTodo) -> Result<u64
     // due_date:None=不动;""=清空(NULL);"YYYY-MM-DD"=设置。用 CASE 区分三态。
     let due_changed = upd.due_date.is_some();
     let due_val = upd.due_date.as_deref().filter(|s| !s.trim().is_empty());
+    let note_changed = upd.note.is_some();
+    let note_val = upd.note.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let r = sqlx::query(
         "UPDATE case_todos SET \
          title = COALESCE(?, title), \
@@ -103,6 +110,7 @@ pub async fn update(pool: &SqlitePool, id: &str, upd: &UpdateTodo) -> Result<u64
              WHEN ? = 0 THEN NULL \
              ELSE done_at END, \
          due_date = CASE WHEN ? THEN ? ELSE due_date END, \
+         note = CASE WHEN ? THEN ? ELSE note END, \
          updated_at = datetime('now') \
          WHERE id = ?",
     )
@@ -112,6 +120,8 @@ pub async fn update(pool: &SqlitePool, id: &str, upd: &UpdateTodo) -> Result<u64
     .bind(upd.done)
     .bind(due_changed)
     .bind(due_val)
+    .bind(note_changed)
+    .bind(note_val)
     .bind(id)
     .execute(pool)
     .await?;

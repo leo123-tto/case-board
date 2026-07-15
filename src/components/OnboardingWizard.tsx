@@ -550,7 +550,7 @@ function ConfigPage(props: {
               if (props.mineruStatus !== "idle") props.resetMineru();
             }}
             password
-            placeholder="eyJ0eXBl..."
+            placeholder="eyJ0eXBl... 或 sk-..."
           />
           <VerifyRow
             label="验证 Token"

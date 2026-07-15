@@ -273,11 +273,6 @@ export function SettingsModal({
   const handleClose = () => {
     if (onClose) onClose();
   };
-  // 微信群二维码 hover 状态 + 关闭延迟 timer:
-  // 之前用 Tailwind group-hover:block + pointer-events-none,鼠标移到 300x300 浮层
-  // (在父 60x60 bounding box 外)→ 父不 hover → 浮层瞬间消失 → 鼠标重新在缩略图
-  // → hover 触发 → 闪屏循环。改用 React state 控制 + 浮层 pointer-events-auto
-  // + 外层 onMouseLeave 延迟 200ms,鼠标从缩略图移到浮层有缓冲。
   const [qrHover, setQrHover] = useState(false);
   const qrCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleQrEnter = useCallback(() => {
@@ -290,11 +285,12 @@ export function SettingsModal({
   const handleQrLeave = useCallback(() => {
     qrCloseTimerRef.current = setTimeout(() => setQrHover(false), 200);
   }, []);
-  useEffect(() => {
-    return () => {
+  useEffect(
+    () => () => {
       if (qrCloseTimerRef.current) clearTimeout(qrCloseTimerRef.current);
-    };
-  }, []);
+    },
+    [],
+  );
   const [settings, setSettings] = useState<Settings | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -838,32 +834,37 @@ export function SettingsModal({
                   </Section>
               )}
 
+              {tab === "general" && (
+                  <Section title="首页天气" fill>
+                    <Field
+                      label="天气城市"
+                      hint="自动定位不准确时,手动指定城市名(如:南通)"
+                    >
+                      <input
+                        type="text"
+                        value={settings.weather_city ?? ""}
+                        onChange={(e) =>
+                          updateField(
+                            "weather_city",
+                            e.target.value || null,
+                          )
+                        }
+                        placeholder="自动定位"
+                        className={inputCls}
+                      />
+                    </Field>
+                  </Section>
+              )}
+
               {/* ── 通用:微信扫码加群(缩略图悬停放大;托管 lawtools.top,过期换图不必重新发版) ── */}
               {tab === "general" && (
                   <Section title="微信扫码加群" fill>
-                    {/*
-                      之前用 Tailwind group-hover:block + pointer-events-none,鼠标从
-                      60x60 缩略图移到 300x300 浮层(top-full 在父外)→ 父 .group 不
-                      再 hover → 浮层瞬间隐藏 → 闪屏循环。pointer-events-none 让
-                      浮层对鼠标透明,无法维持 hover。
-                      改用 React state 控制 + 浮层 pointer-events-auto + 缩略图 wrapper
-                      和浮层都 onMouseEnter + 外层 onMouseLeave 延迟 200ms,鼠标从
-                      缩略图移到浮层有缓冲。
-                    */}
-                    <div
-                      className="flex items-start gap-3"
-                      onMouseLeave={handleQrLeave}
-                    >
-                      <div
-                        className="relative shrink-0"
-                        onMouseEnter={handleQrEnter}
-                      >
+                    <div className="flex items-start gap-3" onMouseLeave={handleQrLeave}>
+                      <div className="relative shrink-0" onMouseEnter={handleQrEnter}>
                         <GroupQrCode
                           size={60}
                           className="cursor-pointer rounded border border-border"
                         />
-                        {/* 悬停放大浮层:React state 控制,pointer-events-auto 让
-                            浮层接收 hover 维持 onMouseEnter 状态。 */}
                         {qrHover && (
                           <div
                             className="absolute left-0 top-full z-50 mt-2"
@@ -900,7 +901,7 @@ export function SettingsModal({
                   >
                     <Field
                       label="访问令牌"
-                      hint="选填。填了即自动成为另一家 OCR 的备用线路;免费额度 2 万页/天"
+                      hint="选为主力时必填；作为备用时选填。免费额度 2 万页/天"
                     >
                       <div className="flex items-center gap-2">
                         <input
@@ -964,7 +965,10 @@ export function SettingsModal({
                     title="MinerU"
                     link={{ label: "点这里申请 token", href: "https://mineru.net/apiManage/token" }}
                   >
-                    <Field label="API Token">
+                    <Field
+                      label="API Token"
+                      hint="选为主力时必填；作为备用时选填"
+                    >
                       <div className="flex items-center gap-2">
                         <input
                           type="password"
@@ -978,7 +982,7 @@ export function SettingsModal({
                               updateField("mineru_verified_at", null);
                             }
                           }}
-                          placeholder="eyJ0eXBl..."
+                          placeholder="eyJ0eXBl... 或 sk-..."
                           className={cn(inputCls, "flex-1")}
                           autoComplete="off"
                         />
@@ -1019,7 +1023,7 @@ export function SettingsModal({
               {tab === "models" && (
                   <Section
                     title="云端 OCR 主力"
-                    desc="MinerU 与 PaddleOCR 谁当主力:主力失败、排队超时或额度用完时,自动切到另一家,无需手动干预。"
+                    desc="只需填写并验证主力 OCR；备用线路选填。备用已配置时，主力失败、排队超时或额度用完会自动切换。"
                   >
                     <Field label="选择主力">
                       <select

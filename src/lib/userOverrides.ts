@@ -55,6 +55,16 @@ export interface UserOverrides {
    * @example ["当事人联系人", "办案时间轴", "案件基本信息"]
    */
   section_order?: string[];
+
+  /** 首页日历中无法映射到 agg_key_dates 的派生事件人工覆盖。 */
+  calendar_events?: Record<string, CalendarEventOverride>;
+}
+
+export interface CalendarEventOverride {
+  date?: string;
+  title?: string;
+  note?: string | null;
+  hidden?: boolean;
 }
 
 /** 空的 overlay 对象 — 老案件 user_overrides_json = null 时用这个 */
@@ -142,7 +152,8 @@ export function serializeOverrides(o: UserOverrides | null | undefined): string 
     (o.fields && Object.keys(o.fields).length > 0) ||
     (o.hidden_sections && o.hidden_sections.length > 0) ||
     (o.deleted_rows && Object.keys(o.deleted_rows).length > 0) ||
-    (o.section_order && o.section_order.length > 0);
+    (o.section_order && o.section_order.length > 0) ||
+    (o.calendar_events && Object.keys(o.calendar_events).length > 0);
   if (!hasContent) return null;
   return JSON.stringify(o);
 }

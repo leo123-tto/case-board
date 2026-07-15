@@ -44,6 +44,7 @@ import {
   addCalendarEvent,
   type CalendarEvent,
   deleteCalendarEvent,
+  deleteTodo,
   getCaseWithDocs,
   getSettings,
   listCalendarEvents,
@@ -51,6 +52,8 @@ import {
   type OpenTodoRow,
   readTextFile,
   updateHomeCaseOrder,
+  updateCalendarEvent,
+  updateCaseCalendarEventOverride,
   updateTodo,
   updateWorkflowStatus,
 } from "@/lib/api";
@@ -68,6 +71,10 @@ import { parseJsonArray } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { CalendarBoard } from "./CalendarBoard";
+import {
+  CalendarEventActions,
+  type CalendarEventEditInput,
+} from "./CalendarEventActions";
 import { DashboardAssistantCard } from "./DashboardAssistantCard";
 import { buildDashboardAssistantContext } from "./dashboardAssistantContext";
 import { countOpenCaseRows, isOpenCaseStatus } from "./homeCaseCounts";
@@ -92,6 +99,7 @@ import {
   buildImportantCaseReminders,
   diffDays,
   eventUrgency,
+  formatReminderCountdown,
   isPreservationOrUnsealDoc,
   parseDate,
   PRESERVATION_RE,
@@ -178,6 +186,9 @@ export function HomeView({
   const [openTodos, setOpenTodos] = useState<OpenTodoRow[]>([]);
   // 独立日历日程(不绑案件,日历右键添加)
   const [manualEvents, setManualEvents] = useState<CalendarEvent[]>([]);
+  const [calendarOverrideJsonByCase, setCalendarOverrideJsonByCase] = useState<
+    Record<string, string | null>
+  >({});
   // 日程日历功能开关(默认关闭,设置里手动开)
   const [calendarEnabled, setCalendarEnabled] = useState(false);
   // 飞书日历开关(法律工具→飞书日历卡里开;开了用飞书月历替代本地日程卡)
@@ -212,13 +223,58 @@ export function HomeView({
       alert(`添加日程失败:${e}`);
     }
   };
-  const handleDeleteCalendarEvent = async (id: string) => {
-    try {
-      await deleteCalendarEvent(id);
-      setManualEvents((prev) => prev.filter((e) => e.id !== id));
-    } catch (e) {
-      alert(`删除日程失败:${e}`);
+  const handleEditCalendarEvent = async (
+    event: UpcomingEvent,
+    input: CalendarEventEditInput,
+  ) => {
+    if (event.kind === "manual" && event.id) {
+      const updated = await updateCalendarEvent(event.id, input);
+      setManualEvents((prev) => prev.map((row) => (row.id === updated.id ? updated : row)));
+      return;
     }
+    if (event.kind === "todo" && event.id) {
+      await updateTodo(event.id, {
+        title: input.title,
+        due_date: input.date,
+        note: input.note,
+      });
+      setOpenTodos((prev) =>
+        prev.map((row) =>
+          row.id === event.id
+            ? { ...row, title: input.title, due_date: input.date, note: input.note }
+            : row,
+        ),
+      );
+      return;
+    }
+    const nextJson = await updateCaseCalendarEventOverride({
+      caseId: event.caseId,
+      sourceKey: event.sourceKey,
+      rowKey: event.rowKey ?? null,
+      date: input.date,
+      title: input.title,
+      note: input.note,
+    });
+    setCalendarOverrideJsonByCase((prev) => ({ ...prev, [event.caseId]: nextJson }));
+  };
+  const handleDeleteCalendarEvent = async (event: UpcomingEvent) => {
+    if (event.kind === "manual" && event.id) {
+      await deleteCalendarEvent(event.id);
+      setManualEvents((prev) => prev.filter((row) => row.id !== event.id));
+      return;
+    }
+    if (event.kind === "todo" && event.id) {
+      await deleteTodo(event.id);
+      setOpenTodos((prev) => prev.filter((row) => row.id !== event.id));
+      return;
+    }
+    const nextJson = await updateCaseCalendarEventOverride({
+      caseId: event.caseId,
+      sourceKey: event.sourceKey,
+      rowKey: event.rowKey ?? null,
+      hidden: true,
+    });
+    setCalendarOverrideJsonByCase((prev) => ({ ...prev, [event.caseId]: nextJson }));
   };
 
   useEffect(() => {
@@ -371,8 +427,20 @@ export function HomeView({
   const activeCases = defaultSorted
     .filter(({ status }) => isOpenCaseStatus(status.id) && status.id !== "mediated")
     .map(({ caseData }) => caseData);
+  const activeCasesForReminders = activeCases.map((caseData) =>
+    Object.prototype.hasOwnProperty.call(calendarOverrideJsonByCase, caseData.id)
+      ? { ...caseData, user_overrides_json: calendarOverrideJsonByCase[caseData.id] }
+      : caseData,
+  );
+  const calendarCases = defaultSorted
+    .filter(({ status }) => isOpenCaseStatus(status.id))
+    .map(({ caseData }) =>
+      Object.prototype.hasOwnProperty.call(calendarOverrideJsonByCase, caseData.id)
+        ? { ...caseData, user_overrides_json: calendarOverrideJsonByCase[caseData.id] }
+        : caseData,
+    );
   const upcomingEventsBase = buildImportantCaseReminders(
-    activeCases,
+    activeCasesForReminders,
     docsByCase,
     preservationTextInfo,
   );
@@ -417,7 +485,7 @@ export function HomeView({
     .map(upcomingEventKey)
     .join("||");
   const calendarEvents = [
-    ...buildCaseCalendarEvents(activeCases, docsByCase, preservationTextInfo),
+    ...buildCaseCalendarEvents(calendarCases, docsByCase, preservationTextInfo),
     ...buildTodoEvents(openTodos),
     ...buildManualEvents(manualEvents),
   ];
@@ -704,6 +772,7 @@ export function HomeView({
                 events={calendarEvents}
                 onPickCase={openEvent}
                 onAddEvent={handleAddCalendarEvent}
+                onEditEvent={handleEditCalendarEvent}
                 onDeleteEvent={handleDeleteCalendarEvent}
               />
             </div>
@@ -1744,8 +1813,7 @@ function EventRow({
         : isPreserv
           ? ShieldAlert
           : AlertTriangle;
-  const countdown =
-    e.daysFromNow === 0 ? "今天" : e.daysFromNow > 0 ? `${e.daysFromNow}天` : `逾期${-e.daysFromNow}天`;
+  const countdown = formatReminderCountdown(e.daysFromNow);
 
   if (variant === "compact") {
     const cdCls =
@@ -1925,12 +1993,14 @@ function CalendarPanel({
   events,
   onPickCase,
   onAddEvent,
+  onEditEvent,
   onDeleteEvent,
 }: {
   events: UpcomingEvent[];
   onPickCase: (event: UpcomingEvent) => void;
   onAddEvent: (date: string, title: string) => void | Promise<void>;
-  onDeleteEvent: (id: string) => void | Promise<void>;
+  onEditEvent: (event: UpcomingEvent, input: CalendarEventEditInput) => Promise<void>;
+  onDeleteEvent: (event: UpcomingEvent) => Promise<void>;
 }) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -1969,7 +2039,12 @@ function CalendarPanel({
     .sort((a, b) => a.daysFromNow - b.daysFromNow);
 
   // 右键某天 → 菜单 →「添加日程」(独立日程,不绑案件)
-  const [menu, setMenu] = useState<{ date: string; x: number; y: number } | null>(null);
+  const [dateMenu, setDateMenu] = useState<{ date: string; x: number; y: number } | null>(null);
+  const [eventMenu, setEventMenu] = useState<{
+    event: UpcomingEvent;
+    x: number;
+    y: number;
+  } | null>(null);
   const [addDate, setAddDate] = useState<string | null>(null);
   const [addInput, setAddInput] = useState("");
   const submitAdd = async () => {
@@ -2033,17 +2108,23 @@ function CalendarPanel({
               暂无近期日程(开庭 / 到期日由案件分析自动汇总到这里)
             </p>
           ) : (
-            summaryEvents.map((event, index) => {
+            summaryEvents.map((event) => {
               const isManual = event.kind === "manual";
-              const countdown =
-                event.daysFromNow === 0
-                  ? "D-DAY"
-                  : event.daysFromNow > 0
-                    ? `D-${event.daysFromNow}`
-                    : `逾期${-event.daysFromNow}天`;
+              const countdown = formatReminderCountdown(event.daysFromNow);
               return (
                 <div
-                  key={`${event.id ?? event.caseId}-${event.date}-${index}`}
+                  key={event.sourceKey}
+                  onContextMenu={(contextEvent) => {
+                    contextEvent.preventDefault();
+                    contextEvent.stopPropagation();
+                    setDateMenu(null);
+                    setEventMenu({
+                      event,
+                      x: contextEvent.clientX,
+                      y: contextEvent.clientY,
+                    });
+                  }}
+                  title="右键编辑或删除日程"
                   className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-muted/60"
                 >
                   <button
@@ -2058,22 +2139,13 @@ function CalendarPanel({
                       {event.date.slice(5)}
                     </span>
                     <span className="shrink-0 font-medium text-foreground">{event.type}</span>
-                    <span className="truncate text-muted-foreground">{event.caseName}</span>
+                    <span className="truncate text-muted-foreground">
+                      {[event.caseName, event.note].filter(Boolean).join(" · ")}
+                    </span>
                     <span className="ml-auto shrink-0 font-mono text-caption text-muted-foreground">
                       {countdown}
                     </span>
                   </button>
-                  {isManual && event.id && (
-                    <button
-                      type="button"
-                      onClick={() => void onDeleteEvent(event.id!)}
-                      aria-label="删除日程"
-                      title="删除日程"
-                      className="shrink-0 rounded p-0.5 text-muted-foreground transition hover:bg-destructive/10 hover:text-destructive"
-                    >
-                      <Trash2 className="size-3.5" />
-                    </button>
-                  )}
                 </div>
               );
             })
@@ -2101,7 +2173,8 @@ function CalendarPanel({
               onContextMenu={(e) => {
                 e.preventDefault();
                 setSelectedDate(key);
-                setMenu({ date: key, x: e.clientX, y: e.clientY });
+                setEventMenu(null);
+                setDateMenu({ date: key, x: e.clientX, y: e.clientY });
               }}
               title="左键看当天日程 · 右键添加日程"
               className={cn(
@@ -2186,22 +2259,33 @@ function CalendarPanel({
           </p>
         ) : (
           <ul className="space-y-1.5">
-            {selectedEvents.map((event, index) => {
+            {selectedEvents.map((event) => {
               const isManual = event.kind === "manual";
-              const countdown =
-                event.daysFromNow === 0
-                  ? "D-DAY"
-                  : event.daysFromNow > 0
-                    ? `D-${event.daysFromNow}`
-                    : `逾期${-event.daysFromNow}天`;
+              const countdown = formatReminderCountdown(event.daysFromNow);
               return (
                 <li
-                  key={`${event.id ?? event.caseId}-${event.date}-${index}`}
+                  key={event.sourceKey}
+                  onContextMenu={(contextEvent) => {
+                    contextEvent.preventDefault();
+                    contextEvent.stopPropagation();
+                    setDateMenu(null);
+                    setEventMenu({
+                      event,
+                      x: contextEvent.clientX,
+                      y: contextEvent.clientY,
+                    });
+                  }}
+                  title="右键编辑或删除日程"
                   className="group flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-muted/60"
                 >
                   <span className={cn("size-2 shrink-0 rounded-full", calendarDotClass(event))} />
                   {isManual ? (
-                    <span className="flex-1 font-medium text-foreground">{event.type}</span>
+                    <div className="min-w-0 flex-1">
+                      <span className="font-medium text-foreground">{event.type}</span>
+                      {event.note && (
+                        <span className="ml-2 truncate text-muted-foreground">{event.note}</span>
+                      )}
+                    </div>
                   ) : (
                       <button
                         type="button"
@@ -2209,23 +2293,14 @@ function CalendarPanel({
                         className="flex flex-1 items-center gap-2 overflow-hidden text-left"
                       >
                       <span className="shrink-0 font-medium text-foreground">{event.type}</span>
-                      <span className="truncate text-muted-foreground">{event.caseName}</span>
+                      <span className="truncate text-muted-foreground">
+                        {[event.caseName, event.note].filter(Boolean).join(" · ")}
+                      </span>
                     </button>
                   )}
                   <span className="ml-auto shrink-0 font-mono text-caption text-muted-foreground">
                     {countdown}
                   </span>
-                  {isManual && event.id && (
-                    <button
-                      type="button"
-                      onClick={() => void onDeleteEvent(event.id!)}
-                      aria-label="删除日程"
-                      title="删除日程"
-                      className="shrink-0 rounded p-0.5 text-muted-foreground transition hover:bg-destructive/10 hover:text-destructive"
-                    >
-                      <Trash2 className="size-3.5" />
-                    </button>
-                  )}
                 </li>
               );
             })}
@@ -2236,28 +2311,37 @@ function CalendarPanel({
       )}
 
       {/* 右键某天弹出的菜单:点「添加日程」→ 打开当天添加输入 */}
-      {menu && (
+      {dateMenu && (
         <>
-          <div className="fixed inset-0 z-40" onClick={() => setMenu(null)} />
+          <div className="fixed inset-0 z-40" onClick={() => setDateMenu(null)} />
           <div
             className="fixed z-50 overflow-hidden rounded-md border border-border bg-card shadow-lg"
-            style={{ left: menu.x, top: menu.y }}
+            style={{ left: dateMenu.x, top: dateMenu.y }}
           >
             <button
               type="button"
               onClick={() => {
-                setSelectedDate(menu.date);
-                setAddDate(menu.date);
+                setSelectedDate(dateMenu.date);
+                setAddDate(dateMenu.date);
                 setAddInput("");
-                setMenu(null);
+                setDateMenu(null);
               }}
               className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-sky-50 dark:hover:bg-sky-950/30"
             >
               <Plus className="size-3.5 text-sky-600" />
-              在 {menu.date.slice(5)} 添加日程
+              在 {dateMenu.date.slice(5)} 添加日程
             </button>
           </div>
         </>
+      )}
+      {eventMenu && (
+        <CalendarEventActions
+          event={eventMenu.event}
+          position={{ x: eventMenu.x, y: eventMenu.y }}
+          onClose={() => setEventMenu(null)}
+          onEdit={(input) => onEditEvent(eventMenu.event, input)}
+          onDelete={() => onDeleteEvent(eventMenu.event)}
+        />
       )}
     </section>
   );
@@ -2461,10 +2545,12 @@ function buildTodoEvents(todos: OpenTodoRow[]): UpcomingEvent[] {
       date: t.due_date,
       daysFromNow: diffDays(d, now),
       type: t.title,
-      note: null,
+      note: t.note,
       caseName: t.case_name,
       caseId: t.case_id,
       court: null,
+      id: t.id,
+      sourceKey: `todo:${t.id}`,
     });
   }
   return out;
@@ -2482,11 +2568,12 @@ function buildManualEvents(rows: CalendarEvent[]): UpcomingEvent[] {
       date: e.date,
       daysFromNow: diffDays(d, now),
       type: e.title,
-      note: null,
+      note: e.note,
       caseName: "",
       caseId: "",
       court: null,
       id: e.id,
+      sourceKey: `manual:${e.id}`,
     });
   }
   return out;

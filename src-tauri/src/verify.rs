@@ -43,13 +43,17 @@ impl VerifyResult {
 ///   - 200 / 404 + 业务错误码("task not found" 等)→ token 通过认证
 ///
 /// 用户的 bogus task id 全 0,MinerU 一定查不到,只能返回 token 错或业务"未找到"。
+fn is_supported_mineru_token(token: &str) -> bool {
+    token.starts_with("eyJ") || token.starts_with("sk-")
+}
+
 pub async fn verify_mineru_key(token: &str) -> VerifyResult {
     let token = token.trim();
     if token.is_empty() {
         return VerifyResult::fail("Token 为空");
     }
-    if !token.starts_with("eyJ") {
-        return VerifyResult::fail("格式不像 MinerU JWT token(应以 eyJ 开头)");
+    if !is_supported_mineru_token(token) {
+        return VerifyResult::fail("格式不像 MinerU token(应以 eyJ 或 sk- 开头)");
     }
 
     let client = match reqwest::Client::builder()

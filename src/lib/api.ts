@@ -219,6 +219,24 @@ export function getNativeLocation(timeoutMs?: number): Promise<NativeLocation> {
   return invoke<NativeLocation>("get_native_location", { timeoutMs: timeoutMs ?? null });
 }
 
+export interface WeatherRequest {
+  latitude?: number | null;
+  longitude?: number | null;
+  warning?: string | null;
+}
+
+export interface WeatherInfo {
+  source: "系统定位" | "网络定位";
+  label: string | null;
+  summary: string;
+  detail: string;
+}
+
+/** 首页天气统一由 Rust 请求，避免 Windows WebView 的 CSP/跨域差异。 */
+export function getWeatherInfo(request?: WeatherRequest): Promise<WeatherInfo> {
+  return invoke<WeatherInfo>("get_weather_info", { request: request ?? null });
+}
+
 /** 打开系统定位服务隐私设置,让用户手动授权案件看板。 */
 export function openLocationPrivacySettings(): Promise<void> {
   return invoke<void>("open_location_privacy_settings");
@@ -759,6 +777,7 @@ export interface Todo {
   done_at: string | null;
   /** 2026-06-14:可选"重要日期"(ISO "YYYY-MM-DD");有则汇入首页日程日历 */
   due_date: string | null;
+  note: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -770,6 +789,7 @@ export interface OpenTodoRow {
   case_name: string;
   title: string;
   due_date: string | null;
+  note: string | null;
   created_at: string;
 }
 
@@ -791,7 +811,7 @@ export function listOpenTodos(): Promise<OpenTodoRow[]> {
 
 export function updateTodo(
   id: string,
-  upd: { title?: string; done?: number; due_date?: string | null },
+  upd: { title?: string; done?: number; due_date?: string | null; note?: string | null },
 ): Promise<number> {
   return invoke<number>("update_todo", { id, upd });
 }
@@ -809,6 +829,7 @@ export interface CalendarEvent {
   date: string; // "YYYY-MM-DD"
   title: string;
   created_at: string;
+  note: string | null;
 }
 
 export function addCalendarEvent(e: {
@@ -820,6 +841,13 @@ export function addCalendarEvent(e: {
 
 export function listCalendarEvents(): Promise<CalendarEvent[]> {
   return invoke<CalendarEvent[]>("list_calendar_events", {});
+}
+
+export function updateCalendarEvent(
+  id: string,
+  upd: { date: string; title: string; note: string | null },
+): Promise<CalendarEvent> {
+  return invoke<CalendarEvent>("update_calendar_event", { id, upd });
 }
 
 export function deleteCalendarEvent(id: string): Promise<number> {
@@ -1203,6 +1231,29 @@ export function updateCaseOverrides(
   overridesJson: string | null,
 ): Promise<void> {
   return invoke<void>("update_case_overrides", { caseId, overridesJson });
+}
+
+export function updateCaseCalendarEventOverride(input: {
+  caseId: string;
+  sourceKey: string;
+  rowKey?: string | null;
+  date?: string | null;
+  title?: string | null;
+  note?: string | null;
+  hidden?: boolean;
+}): Promise<string | null> {
+  const { caseId, ...patch } = input;
+  return invoke<string | null>("update_case_calendar_event_override", {
+    caseId,
+    input: {
+      source_key: patch.sourceKey,
+      row_key: patch.rowKey ?? null,
+      date: patch.date ?? null,
+      title: patch.title ?? null,
+      note: patch.note ?? null,
+      hidden: patch.hidden ?? false,
+    },
+  });
 }
 
 /** 清空首次 AI 识别 + 人工确认的我方代理立场,其它用户编辑不动。 */

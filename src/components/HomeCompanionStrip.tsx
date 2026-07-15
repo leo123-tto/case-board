@@ -9,8 +9,11 @@ import poseWriting from "@/assets/caseboard-companion/caseboard-companion-pose-w
 import {
   generateHomeGreeting,
   getNativeLocation,
+  getWeatherInfo,
   openLocationPrivacySettings,
   type HomeGreetingResponse,
+  type WeatherInfo,
+  type WeatherRequest,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import {
@@ -30,8 +33,6 @@ import {
 const GREETING_KEY_PREFIX = "caseboard:home-companion:greeting:v2:";
 const WEATHER_KEY_PREFIX = "caseboard:home-companion:weather:v2:";
 const GEOLOCATION_TIMEOUT_MS = 8000;
-const WEATHER_FETCH_TIMEOUT_MS = 5000;
-const IP_LOCATION_TIMEOUT_MS = 3500;
 const GREETING_CACHE_TTL_MS = 1000 * 60 * 90;
 
 interface CachedGreeting {
@@ -48,12 +49,9 @@ interface CachedWeather {
   location_label?: string | null;
 }
 
-interface WeatherLocation {
+interface SystemWeatherLocation {
   latitude: number;
   longitude: number;
-  source: "system" | "network";
-  label: string | null;
-  warning: string | null;
 }
 
 type CompanionMode = "urgent" | "caseload" | "briefcase" | "writing" | "neutral";
@@ -217,9 +215,15 @@ export function HomeCompanionStrip({
     async (forceGreetingRefresh = false) => {
       setWeather((prev) => ({ status: "locating", value: prev.value, error: null }));
       try {
-        const location = await resolveWeatherLocation();
+        let request: WeatherRequest;
+        try {
+          const location = await getSystemLocation();
+          request = { latitude: location.latitude, longitude: location.longitude };
+        } catch (error) {
+          request = { warning: weatherErrorMessage(error) };
+        }
         setWeather((prev) => ({ status: "fetching", value: prev.value, error: null }));
-        const next = await fetchWeather(location);
+        const next = weatherInfoToCache(await getWeatherInfo(request));
         if (isDisplayableCachedWeather(next)) writeCachedWeather(todayLocalIso(), next);
         setWeather({ status: "idle", value: next, error: null });
         void refreshGreeting({
@@ -301,7 +305,7 @@ export function HomeCompanionStrip({
             className="inline-flex items-center gap-1"
             title={
               weather.value?.source === "网络定位"
-                ? "系统定位失败，未使用网络估算天气"
+                ? "系统定位失败，当前显示网络估算天气；该天气不会用于 AI 问候"
                 : weather.value?.detail ?? undefined
             }
           >
@@ -502,29 +506,12 @@ function getCurrentPositionWithTimeout(timeoutMs: number): Promise<GeolocationPo
   });
 }
 
-async function resolveWeatherLocation(): Promise<WeatherLocation> {
-  try {
-    return await getSystemLocation();
-  } catch (error) {
-    const systemError = weatherErrorMessage(error);
-    try {
-      const fallback = await getIpApproximateLocation();
-      return { ...fallback, warning: systemError };
-    } catch (fallbackError) {
-      throw new Error(`${systemError}; 网络定位也失败: ${weatherErrorMessage(fallbackError)}`);
-    }
-  }
-}
-
-async function getSystemLocation(): Promise<WeatherLocation> {
+async function getSystemLocation(): Promise<SystemWeatherLocation> {
   try {
     const location = await getNativeLocation(GEOLOCATION_TIMEOUT_MS);
     return {
       latitude: location.latitude,
       longitude: location.longitude,
-      source: "system",
-      label: null,
-      warning: null,
     };
   } catch (nativeError) {
     try {
@@ -532,9 +519,6 @@ async function getSystemLocation(): Promise<WeatherLocation> {
       return {
         latitude: position.coords.latitude,
         longitude: position.coords.longitude,
-        source: "system",
-        label: null,
-        warning: null,
       };
     } catch (webError) {
       throw new Error(
@@ -544,71 +528,14 @@ async function getSystemLocation(): Promise<WeatherLocation> {
   }
 }
 
-async function getIpApproximateLocation(): Promise<WeatherLocation> {
-  const ipapi = await fetchJsonWithTimeout<IpApiLocation>(
-    "https://ipapi.co/json/",
-    IP_LOCATION_TIMEOUT_MS,
-  ).catch(() => null);
-  if (typeof ipapi?.latitude === "number" && typeof ipapi.longitude === "number") {
-    return {
-      latitude: ipapi.latitude,
-      longitude: ipapi.longitude,
-      source: "network",
-      label: [ipapi.city, ipapi.region].filter(Boolean).join(" · ") || null,
-      warning: null,
-    };
-  }
-
-  const ipwho = await fetchJsonWithTimeout<IpWhoLocation>(
-    "https://ipwho.is/",
-    IP_LOCATION_TIMEOUT_MS,
-  );
-  if (ipwho.success !== false && typeof ipwho.latitude === "number" && typeof ipwho.longitude === "number") {
-    return {
-      latitude: ipwho.latitude,
-      longitude: ipwho.longitude,
-      source: "network",
-      label: [ipwho.city, ipwho.region].filter(Boolean).join(" · ") || null,
-      warning: null,
-    };
-  }
-  throw new Error(ipwho.message || "网络定位返回无经纬度");
-}
-
-async function fetchWeather(location: WeatherLocation): Promise<CachedWeather> {
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), WEATHER_FETCH_TIMEOUT_MS);
-  try {
-    const params = new URLSearchParams({
-      latitude: location.latitude.toFixed(4),
-      longitude: location.longitude.toFixed(4),
-      current: "temperature_2m,precipitation,rain,showers,weather_code",
-      daily:
-        "temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,rain_sum",
-      timezone: "auto",
-      forecast_days: "1",
-    });
-    const response = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, {
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error(`天气返回 ${response.status}`);
-    const data = (await response.json()) as OpenMeteoDailyResponse;
-    return parseWeather(data, location);
-  } finally {
-    window.clearTimeout(timer);
-  }
-}
-
-async function fetchJsonWithTimeout<T>(url: string, timeoutMs: number): Promise<T> {
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, { signal: controller.signal });
-    if (!response.ok) throw new Error(`请求返回 ${response.status}`);
-    return (await response.json()) as T;
-  } finally {
-    window.clearTimeout(timer);
-  }
+function weatherInfoToCache(info: WeatherInfo): CachedWeather {
+  return {
+    summary: info.summary,
+    detail: info.detail,
+    generated_at: new Date().toISOString(),
+    source: info.source,
+    location_label: info.label,
+  };
 }
 
 function weatherErrorMessage(error: unknown): string {
@@ -622,77 +549,4 @@ function weatherErrorMessage(error: unknown): string {
   if (error instanceof DOMException && error.name === "AbortError") return "天气请求超时";
   if (error instanceof Error) return error.message;
   return "天气获取失败";
-}
-
-interface OpenMeteoDailyResponse {
-  current?: {
-    temperature_2m?: number;
-    precipitation?: number;
-    rain?: number;
-    showers?: number;
-    weather_code?: number;
-  };
-  daily?: {
-    temperature_2m_max?: number[];
-    temperature_2m_min?: number[];
-    precipitation_probability_max?: number[];
-    precipitation_sum?: number[];
-    rain_sum?: number[];
-  };
-}
-
-interface IpApiLocation {
-  latitude?: number;
-  longitude?: number;
-  city?: string;
-  region?: string;
-}
-
-interface IpWhoLocation {
-  success?: boolean;
-  latitude?: number;
-  longitude?: number;
-  city?: string;
-  region?: string;
-  message?: string;
-}
-
-function parseWeather(data: OpenMeteoDailyResponse, location: WeatherLocation): CachedWeather {
-  const daily = data.daily ?? {};
-  const current = data.current ?? {};
-  const currentTemp = current.temperature_2m;
-  const currentPrecipitation = current.precipitation ?? current.rain ?? current.showers ?? 0;
-  const max = daily.temperature_2m_max?.[0];
-  const min = daily.temperature_2m_min?.[0];
-  const probability = daily.precipitation_probability_max?.[0] ?? 0;
-  const precipitation = daily.precipitation_sum?.[0] ?? daily.rain_sum?.[0] ?? 0;
-  const hasCurrentRain = currentPrecipitation > 0.1 || isRainWeatherCode(current.weather_code);
-  const hasRain = hasCurrentRain || precipitation > 0.1 || probability >= 30;
-  const dayTemp =
-    typeof min === "number" && typeof max === "number" ? `${Math.round(min)}-${Math.round(max)}°C` : null;
-  const currentText = typeof currentTemp === "number" ? `现在 ${Math.round(currentTemp)}°C` : null;
-  const rainText = hasCurrentRain ? "正在下雨" : hasRain ? "可能有雨" : "少雨";
-  const sourceText = location.source === "system" ? "系统定位" : "网络定位";
-  const placeText = location.label || sourceText;
-  const locationText = location.label ? ` · ${location.label}` : "";
-  const warningText = location.warning ? ` · 系统定位失败: ${location.warning}` : "";
-  const summary = [placeText, currentText, dayTemp ? `今日 ${dayTemp}` : null, rainText]
-    .filter(Boolean)
-    .join(" · ");
-  return {
-    summary: summary || `${sourceText} · 天气未更新`,
-    detail: `${sourceText}${locationText}${warningText} · 当前降水 ${currentPrecipitation.toFixed(1)}mm · 降雨概率 ${Math.round(probability)}% · 预计降雨 ${precipitation.toFixed(1)}mm`,
-    generated_at: new Date().toISOString(),
-    source: sourceText,
-    location_label: location.label,
-  };
-}
-
-function isRainWeatherCode(code: number | undefined): boolean {
-  if (typeof code !== "number") return false;
-  return (
-    (code >= 51 && code <= 67) ||
-    (code >= 80 && code <= 82) ||
-    (code >= 95 && code <= 99)
-  );
 }

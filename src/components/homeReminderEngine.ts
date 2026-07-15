@@ -7,6 +7,13 @@ import type {
   Preservation,
 } from "@/lib/types";
 import { parseJsonArray } from "@/lib/types";
+import {
+  getFieldOverride,
+  isRowDeleted,
+  parseOverrides,
+  rowKeyOf,
+  subtableFieldPath,
+} from "@/lib/userOverrides";
 import type {
   PreservationSchedule,
   PreservationTextInfo,
@@ -32,6 +39,8 @@ export interface HomeReminderEvent {
   courtContacts?: CourtContact[];
   sourceDoc?: Document;
   id?: string;
+  sourceKey: string;
+  rowKey?: string;
 }
 
 export const PRESERVATION_RE = /保全|续封|查封|冻结|续冻/;
@@ -48,6 +57,8 @@ interface HearingCandidate {
   date: string;
   note: string | null;
   sourceDoc?: Document;
+  sourceKey: string;
+  rowKey: string;
 }
 
 interface PreservationCandidate {
@@ -102,7 +113,16 @@ export function buildCaseCalendarEvents(
       includeNonPreservationDeadlines: true,
     }),
   );
-  return events.sort((a, b) => a.date.localeCompare(b.date));
+  const unique = new Map<string, HomeReminderEvent>();
+  for (const event of events) {
+    if (!unique.has(event.sourceKey)) unique.set(event.sourceKey, event);
+  }
+  return [...unique.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
+export function formatReminderCountdown(daysFromNow: number): string {
+  if (daysFromNow === 0) return "今天";
+  return daysFromNow > 0 ? `${daysFromNow}天` : `逾期${-daysFromNow}天`;
 }
 
 function buildCaseReminderEvents(
@@ -120,53 +140,66 @@ function buildCaseReminderEvents(
   const partySummary = buildPartySummary(plaintiffs, defendants);
   const judges = parseJsonArray(c.agg_judges);
   const courtContacts = parseCourtContacts(c.agg_court_contacts);
+  const hearingEvents: HomeReminderEvent[] = resolveHearings(c, docs, now, options).map((item) => ({
+    kind: "hearing",
+    date: item.date,
+    daysFromNow: diffDays(parseDate(item.date)!, now),
+    type: item.event,
+    note: item.note,
+    caseName,
+    caseId: c.id,
+    caseNo,
+    partySummary,
+    court,
+    judges,
+    courtContacts,
+    sourceDoc: item.sourceDoc,
+    sourceKey: item.sourceKey,
+    rowKey: item.rowKey,
+  }));
+  const preservationEvents = resolvePreservations(c, docs, textInfoByDoc, now, options)
+    .map((item): HomeReminderEvent | null => {
+      const sourceKey = preservationSourceKey(c.id, item);
+      return applyDerivedCalendarOverride(c, {
+        kind: "deadline",
+        date: item.expiresAt,
+        daysFromNow: diffDays(parseDate(item.expiresAt)!, now),
+        type: item.type,
+        note: item.targetLabel,
+        caseName,
+        caseId: c.id,
+        caseNo,
+        partySummary,
+        court,
+        judges,
+        courtContacts,
+        sourceDoc: item.sourceDoc,
+        sourceKey,
+      }, now);
+    })
+    .filter((event): event is HomeReminderEvent => event !== null);
+  const deadlineEvents: HomeReminderEvent[] = options.includeNonPreservationDeadlines
+    ? resolveNonPreservationDeadlines(c, now, options).map((kd) => ({
+        kind: "deadline",
+        date: kd.date,
+        daysFromNow: diffDays(parseDate(kd.date)!, now),
+        type: kd.event,
+        note: kd.note,
+        caseName,
+        caseId: c.id,
+        caseNo,
+        partySummary,
+        court,
+        judges,
+        courtContacts,
+        sourceKey: kd.sourceKey,
+        rowKey: kd.rowKey,
+      }))
+    : [];
   return [
-    ...resolveHearings(c, docs, now, options).map((item) => ({
-      kind: "hearing" as const,
-      date: item.date,
-      daysFromNow: diffDays(parseDate(item.date)!, now),
-      type: item.event,
-      note: item.note,
-      caseName,
-      caseId: c.id,
-      caseNo,
-      partySummary,
-      court,
-      judges,
-      courtContacts,
-      sourceDoc: item.sourceDoc,
-    })),
-    ...resolvePreservations(c, docs, textInfoByDoc, now, options).map((item) => ({
-      kind: "deadline" as const,
-      date: item.expiresAt,
-      daysFromNow: diffDays(parseDate(item.expiresAt)!, now),
-      type: item.type,
-      note: item.targetLabel,
-      caseName,
-      caseId: c.id,
-      caseNo,
-      partySummary,
-      court,
-      judges,
-      courtContacts,
-      sourceDoc: item.sourceDoc,
-    })),
-    ...(options.includeNonPreservationDeadlines
-      ? resolveNonPreservationDeadlines(c, now, options).map((kd) => ({
-          kind: "deadline" as const,
-          date: kd.expires_at!,
-          daysFromNow: diffDays(parseDate(kd.expires_at!)!, now),
-          type: kd.event ?? "到期",
-          note: kd.note ?? null,
-          caseName,
-          caseId: c.id,
-          caseNo,
-          partySummary,
-          court,
-          judges,
-          courtContacts,
-        }))
-      : []),
+    ...hearingEvents,
+    ...preservationEvents,
+    ...deadlineEvents,
   ];
 }
 
@@ -184,6 +217,8 @@ function resolveHearings(
         date: kd.date!,
         note: kd.note ?? null,
         sourceDoc: doc,
+        rowKey: rowKeyOf("agg_key_dates", kd),
+        sourceKey: "",
       })),
   );
   const source = docCandidates.length > 0 ? docCandidates : readKeyDates(c)
@@ -193,14 +228,19 @@ function resolveHearings(
       date: kd.date!,
       note: kd.note ?? null,
       sourceDoc: findHearingSourceDoc(docs, kd.date),
+      rowKey: rowKeyOf("agg_key_dates", kd),
+      sourceKey: "",
     }));
 
   const latestBySession = new Map<string, HearingCandidate>();
-  for (const candidate of source) {
+  for (const rawCandidate of source) {
+    const sourceKey = `hearing:${c.id}:${rawCandidate.sourceDoc?.id ?? "agg"}:${rawCandidate.rowKey}`;
+    const candidate = applyKeyDateOverride(c, { ...rawCandidate, sourceKey });
+    if (!candidate) continue;
     const d = parseDate(candidate.date);
     if (!d) continue;
     const days = diffDays(d, now);
-    if (options.onlyReminderWindow && (days < 0 || days > 365)) continue;
+    if (days < 0 || (options.onlyReminderWindow && days > 365)) continue;
     const key = hearingSessionKey(candidate);
     const prev = latestBySession.get(key);
     if (!prev || hearingAuthorityScore(candidate) >= hearingAuthorityScore(prev)) {
@@ -236,15 +276,28 @@ function resolveNonPreservationDeadlines(
   c: Case,
   now: Date,
   options: BuildOptions,
-): Array<{ event?: string | null; note?: string | null; expires_at?: string | null }> {
-  return readKeyDates(c).filter((kd) => {
-    if (!kd.expires_at || PRESERVATION_RE.test(kd.event ?? "")) return false;
-    const d = parseDate(kd.expires_at);
-    if (!d) return false;
-    const days = diffDays(d, now);
-    if (options.onlyReminderWindow) return days >= -30 && days <= 365;
-    return true;
-  });
+): HearingCandidate[] {
+  const out: HearingCandidate[] = [];
+  for (const kd of readKeyDates(c)) {
+    if (PRESERVATION_RE.test(kd.event ?? "")) continue;
+    const date = kd.expires_at ?? (/还款|分期/.test(kd.event ?? "") ? kd.date : null);
+    if (!date) continue;
+    const rowKey = rowKeyOf("agg_key_dates", kd);
+    const candidate = applyKeyDateOverride(c, {
+      event: kd.event ?? "到期",
+      date,
+      note: kd.note ?? null,
+      rowKey,
+      sourceKey: `deadline:${c.id}:agg:${rowKey}`,
+    });
+    if (!candidate) continue;
+    const parsed = parseDate(candidate.date);
+    if (!parsed) continue;
+    const days = diffDays(parsed, now);
+    if (options.onlyReminderWindow && (days < -30 || days > 365)) continue;
+    out.push(candidate);
+  }
+  return out;
 }
 
 function collectPreservationCandidates(
@@ -414,6 +467,76 @@ function preservationTargetKeyFromText(value: string | null | undefined): string
     .replace(/[，。；;:：、,.]/g, "")
     .trim();
   return normalized || null;
+}
+
+function preservationSourceKey(caseId: string, item: PreservationCandidate): string {
+  return [
+    "preservation",
+    caseId,
+    item.sourceDoc?.id ?? "agg",
+    item.startedAt,
+    item.type,
+    item.targetKey ?? item.targetLabel ?? "",
+  ].join(":");
+}
+
+function applyKeyDateOverride(
+  c: Case,
+  candidate: HearingCandidate,
+): HearingCandidate | null {
+  const overrides = parseOverrides(c.user_overrides_json);
+  if (isRowDeleted(overrides, "agg_key_dates", candidate.rowKey)) return null;
+
+  const dateOverride = getFieldOverride(
+    overrides,
+    subtableFieldPath("agg_key_dates", candidate.rowKey, "date"),
+  );
+  const titleOverride = getFieldOverride(
+    overrides,
+    subtableFieldPath("agg_key_dates", candidate.rowKey, "event_type"),
+  );
+  const noteOverride = getFieldOverride(
+    overrides,
+    subtableFieldPath("agg_key_dates", candidate.rowKey, "note"),
+  );
+  if (dateOverride === null) return null;
+  const date = dateOverride === undefined ? candidate.date : dateOverride.trim();
+  if (!date) return null;
+  const event =
+    titleOverride === undefined || titleOverride === null || !titleOverride.trim()
+      ? candidate.event
+      : titleOverride.trim();
+  const note =
+    noteOverride === undefined
+      ? candidate.note
+      : noteOverride === null || !noteOverride.trim()
+        ? null
+        : noteOverride.trim();
+  return { ...candidate, date, event, note };
+}
+
+function applyDerivedCalendarOverride(
+  c: Case,
+  event: HomeReminderEvent,
+  now: Date,
+): HomeReminderEvent | null {
+  const override = parseOverrides(c.user_overrides_json).calendar_events?.[event.sourceKey];
+  if (!override) return event;
+  if (override.hidden) return null;
+  const date = override.date?.trim() || event.date;
+  const parsed = parseDate(date);
+  if (!parsed) return null;
+  const type = override.title?.trim() || event.type;
+  const note = Object.prototype.hasOwnProperty.call(override, "note")
+    ? override.note?.trim() || null
+    : event.note;
+  return {
+    ...event,
+    date,
+    type,
+    note,
+    daysFromNow: diffDays(parsed, now),
+  };
 }
 
 function hearingSessionKey(candidate: HearingCandidate): string {

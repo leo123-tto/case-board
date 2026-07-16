@@ -1,21 +1,20 @@
 //! 首页天气后端。
 //!
 //! HTTP 请求统一放在 Rust 侧，避免 Windows WebView 的 CSP 与跨域差异。
-//! 前端能拿到系统定位时优先使用；拿不到时才退回 IP 粗略定位。
+//! 定位策略:手动城市 > IP 定位(不再使用系统定位,因为很多桌面系统不支持)。
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-const IP_LOCATION_URL: &str = "https://ipwho.is/";
+const IP_LOCATION_URL: &str = "http://ip-api.com/json/?lang=zh-CN";
 const WEATHER_URL: &str = "https://api.open-meteo.com/v1/forecast";
 const REQUEST_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WeatherRequest {
-    latitude: Option<f64>,
-    longitude: Option<f64>,
-    warning: Option<String>,
+    #[serde(alias = "city_name")]
+    city_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,12 +27,25 @@ pub struct WeatherInfo {
 
 #[derive(Debug, Deserialize)]
 struct IpLocation {
-    success: Option<bool>,
+    status: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    city: Option<String>,
+    region_name: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeocodingResult {
     latitude: Option<f64>,
     longitude: Option<f64>,
-    city: Option<String>,
-    region: Option<String>,
-    message: Option<String>,
+    name: Option<String>,
+    admin1: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeocodingResponse {
+    results: Option<Vec<GeocodingResult>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -65,7 +77,6 @@ struct ResolvedLocation {
     longitude: f64,
     source: &'static str,
     label: Option<String>,
-    warning: Option<String>,
 }
 
 #[tauri::command]
@@ -109,56 +120,97 @@ async fn resolve_location(
     client: &reqwest::Client,
     request: WeatherRequest,
 ) -> Result<ResolvedLocation, String> {
-    match (request.latitude, request.longitude) {
-        (Some(latitude), Some(longitude)) => {
-            validate_coordinates(latitude, longitude)?;
-            Ok(ResolvedLocation {
-                latitude,
-                longitude,
-                source: "系统定位",
-                label: None,
-                warning: None,
-            })
-        }
-        (Some(_), None) | (None, Some(_)) => Err("系统定位返回的经纬度不完整".to_string()),
-        (None, None) => {
-            let response = client
-                .get(IP_LOCATION_URL)
-                .send()
-                .await
-                .map_err(|error| format!("网络定位请求失败: {error}"))?
-                .error_for_status()
-                .map_err(|error| format!("网络定位服务返回错误: {error}"))?
-                .json::<IpLocation>()
-                .await
-                .map_err(|error| format!("网络定位数据解析失败: {error}"))?;
-            if response.success == Some(false) {
-                return Err(response
-                    .message
-                    .unwrap_or_else(|| "网络定位失败".to_string()));
-            }
-            let latitude = response
-                .latitude
-                .ok_or_else(|| "网络定位返回无纬度".to_string())?;
-            let longitude = response
-                .longitude
-                .ok_or_else(|| "网络定位返回无经度".to_string())?;
-            validate_coordinates(latitude, longitude)?;
-            let label = [response.city, response.region]
-                .into_iter()
-                .flatten()
-                .map(|part| part.trim().to_string())
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join(" · ");
-            Ok(ResolvedLocation {
-                latitude,
-                longitude,
-                source: "网络定位",
-                label: (!label.is_empty()).then_some(label),
-                warning: request.warning.filter(|value| !value.trim().is_empty()),
-            })
-        }
+    if let Some(city_name) = request.city_name.filter(|s| !s.trim().is_empty()) {
+        return resolve_location_by_city(client, city_name.trim().to_string()).await;
+    }
+
+    let response = client
+        .get(IP_LOCATION_URL)
+        .send()
+        .await
+        .map_err(|error| format!("网络定位请求失败: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("网络定位服务返回错误: {error}"))?
+        .json::<IpLocation>()
+        .await
+        .map_err(|error| format!("网络定位数据解析失败: {error}"))?;
+    if response.status.as_deref() != Some("success") {
+        return Err(response
+            .message
+            .unwrap_or_else(|| "网络定位失败".to_string()));
+    }
+    let latitude = response
+        .lat
+        .ok_or_else(|| "网络定位返回无纬度".to_string())?;
+    let longitude = response
+        .lon
+        .ok_or_else(|| "网络定位返回无经度".to_string())?;
+    validate_coordinates(latitude, longitude)?;
+    let label = [response.city, response.region_name]
+        .into_iter()
+        .flatten()
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    Ok(ResolvedLocation {
+        latitude,
+        longitude,
+        source: "网络定位",
+        label: (!label.is_empty()).then_some(label),
+    })
+}
+
+async fn resolve_location_by_city(
+    client: &reqwest::Client,
+    city_name: String,
+) -> Result<ResolvedLocation, String> {
+    let geocoding_url = "https://geocoding-api.open-meteo.com/v1/search";
+    let geocoding_response = client
+        .get(geocoding_url)
+        .query(&[
+            ("name", city_name.clone()),
+            ("count", "1".to_string()),
+            ("language", "zh".to_string()),
+            ("format", "json".to_string()),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("地理编码请求失败: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("地理编码服务返回错误: {error}"))?
+        .json::<GeocodingResponse>()
+        .await
+        .map_err(|error| format!("地理编码数据解析失败: {error}"))?;
+
+    let results = geocoding_response.results.ok_or_else(|| "地理编码无结果".to_string())?;
+    let result = results.first().ok_or_else(|| format!("未找到城市: {city_name}"))?;
+
+    let latitude = result.latitude.ok_or_else(|| "地理编码返回无纬度".to_string())?;
+    let longitude = result.longitude.ok_or_else(|| "地理编码返回无经度".to_string())?;
+    validate_coordinates(latitude, longitude)?;
+
+    let label = build_city_label(result.name.as_deref(), result.admin1.as_deref());
+
+    Ok(ResolvedLocation {
+        latitude,
+        longitude,
+        source: "手动定位",
+        label,
+    })
+}
+
+fn build_city_label(name: Option<&str>, admin1: Option<&str>) -> Option<String> {
+    let parts: Vec<&str> = [name, admin1]
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
     }
 }
 
@@ -220,16 +272,10 @@ fn build_weather_info(data: OpenMeteoResponse, location: ResolvedLocation) -> We
         .as_ref()
         .map(|label| format!(" · {label}"))
         .unwrap_or_default();
-    let warning_detail = location
-        .warning
-        .as_ref()
-        .map(|warning| format!(" · 系统定位失败: {warning}"))
-        .unwrap_or_default();
     let detail = format!(
-        "{}{}{} · 当前降水 {:.1}mm · 降雨概率 {:.0}% · 预计降雨 {:.1}mm",
+        "{}{} · 当前降水 {:.1}mm · 降雨概率 {:.0}% · 预计降雨 {:.1}mm",
         location.source,
         label_detail,
-        warning_detail,
         current_precipitation,
         probability,
         precipitation

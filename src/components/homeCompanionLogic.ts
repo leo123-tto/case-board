@@ -1,5 +1,4 @@
 export const WEATHER_REUSE_WINDOW_MS = 1000 * 60 * 5;
-export const NETWORK_LOCATION_RETRY_MS = 1000 * 60 * 5;
 export const WEATHER_CACHE_MAX_AGE_MS = 1000 * 60 * 30;
 
 export interface GreetingCacheKeyInput {
@@ -56,13 +55,12 @@ export function shouldRefreshWeather(cached: CachedWeatherLike | null, now = new
   const age = now.getTime() - generatedAt;
   if (age < -WEATHER_REUSE_WINDOW_MS) return true;
   if (age > WEATHER_CACHE_MAX_AGE_MS) return true;
-  if (isNetworkFallbackWeather(cached)) return age > NETWORK_LOCATION_RETRY_MS;
   return age > WEATHER_REUSE_WINDOW_MS;
 }
 
 export function isUsableCachedWeather(cached: CachedWeatherLike | null, now = new Date()): boolean {
   if (!cached) return false;
-  if (cached.source !== "系统定位") return false;
+  if (!cached.source) return false;
   return !shouldRefreshWeather(cached, now);
 }
 
@@ -98,31 +96,10 @@ export interface WeatherStatusMessageInput {
 
 export function weatherStatusMessage(input: WeatherStatusMessageInput): string | null {
   const { value, error, weatherFeedsGreeting, weatherNeedsRefresh } = input;
-  if (value?.source === "网络定位") {
-    return locationIssueLabel(extractLocationIssue(value.detail) ?? error) ?? "定位未确认";
-  }
   if (value && !weatherFeedsGreeting) return "旧天气缓存";
   if (value && weatherNeedsRefresh) return "正在刷新";
   if (error && value) return "使用缓存";
   return error;
-}
-
-export function shouldShowLocationSettingsAction(
-  cached: CachedWeatherLike | null,
-  error: string | null,
-): boolean {
-  const issue = `${extractLocationIssue(cached?.detail) ?? ""} ${error ?? ""}`;
-  if (!issue.trim()) return false;
-  return [
-    "权限未开启",
-    "定位服务未开启",
-    "定位服务受限",
-    "定位超时",
-    "等待定位授权",
-    "授权未完成",
-    "not_determined",
-    "NotDetermined",
-  ].some((needle) => issue.includes(needle));
 }
 
 export function isGreetingConsistentWithPeriod(
@@ -164,50 +141,6 @@ function reminderBucket(items: string[]): string {
   if (items.some((item) => item.includes("紧急"))) return "urgent";
   if (items.some((item) => item.trim())) return "some";
   return "none";
-}
-
-function isNetworkFallbackWeather(cached: CachedWeatherLike): boolean {
-  return cached.source === "网络定位" || Boolean(cached.detail?.includes("系统定位失败"));
-}
-
-function extractLocationIssue(detail: string | null | undefined): string | null {
-  const value = detail?.trim();
-  if (!value) return null;
-  const marker = "系统定位失败:";
-  const index = value.indexOf(marker);
-  if (index < 0) return null;
-  const rest = value.slice(index + marker.length).trim();
-  if (!rest) return null;
-  const parts = rest
-    .split(/[;；]/)
-    .map((part) => part.replace(/^WebView\s*定位也失败[:：]\s*/, "").trim())
-    .filter(Boolean);
-  return parts.find(isActionableLocationIssue) ?? parts[0] ?? null;
-}
-
-function locationIssueLabel(issue: string | null | undefined): string | null {
-  const value = issue?.trim();
-  if (!value) return null;
-  if (value.includes("定位权限未开启")) return "定位权限未开启";
-  if (value.includes("定位服务未开启")) return "定位服务未开启";
-  if (value.includes("定位服务受限")) return "定位服务受限";
-  if (value.includes("定位超时")) return "定位授权超时";
-  if (value.includes("not_determined") || value.includes("NotDetermined")) return "等待定位授权";
-  if (value.includes("授权")) return "等待定位授权";
-  return value;
-}
-
-function isActionableLocationIssue(issue: string): boolean {
-  return [
-    "权限未开启",
-    "定位服务未开启",
-    "定位服务受限",
-    "定位超时",
-    "等待定位授权",
-    "授权未完成",
-    "not_determined",
-    "NotDetermined",
-  ].some((needle) => issue.includes(needle));
 }
 
 function isInconsistentTimeText(text: string, period: string): boolean {

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { emit } from "@tauri-apps/api/event";
 import {
   X,
   Loader2,
@@ -638,11 +639,16 @@ export function SettingsModal({
     setSaving(true);
     setError(null);
     try {
-      await saveSettings(prepareSettingsForSave(settings));
+      const newSettings = prepareSettingsForSave(settings);
+      const weatherCityChanged = newSettings.weather_city !== settings.weather_city;
+      await saveSettings(newSettings);
       for (const [name, value] of Object.entries(featureFlagDraft)) {
         setFeatureFlag(name as FeatureFlagName, value);
       }
       setDirty(false);
+      if (weatherCityChanged) {
+        void emit("weather_city_changed");
+      }
       // 2026-05-27 · 两种模式都要通知父组件 settings 已经变了,父组件据此重判依赖项
       // (如 DeepSeek 余额 chip 是否显示)。修复同事场景:onboarding 选"稍后再配置"
       // 进 page 模式补填 key,保存后 chip 不出现 —— 因为 page 模式只显示 toast、不触发

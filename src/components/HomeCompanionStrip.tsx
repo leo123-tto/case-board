@@ -6,11 +6,11 @@ import poseChecklist from "@/assets/caseboard-companion/caseboard-companion-pose
 import poseFiles from "@/assets/caseboard-companion/caseboard-companion-pose-files-2026-06-28.png";
 import poseNeutral from "@/assets/caseboard-companion/caseboard-companion-pose-neutral-2026-06-28.png";
 import poseWriting from "@/assets/caseboard-companion/caseboard-companion-pose-writing-2026-06-28.png";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   generateHomeGreeting,
-  getNativeLocation,
+  getSettings,
   getWeatherInfo,
-  openLocationPrivacySettings,
   type HomeGreetingResponse,
   type WeatherInfo,
   type WeatherRequest,
@@ -21,7 +21,6 @@ import {
   isDisplayableCachedWeather,
   isGreetingTextCompatible,
   isStaleIso,
-  shouldShowLocationSettingsAction,
   shouldRefreshWeather,
   timeOfDay,
   todayLocalIso,
@@ -32,7 +31,6 @@ import {
 
 const GREETING_KEY_PREFIX = "caseboard:home-companion:greeting:v2:";
 const WEATHER_KEY_PREFIX = "caseboard:home-companion:weather:v2:";
-const GEOLOCATION_TIMEOUT_MS = 8000;
 const GREETING_CACHE_TTL_MS = 1000 * 60 * 90;
 
 interface CachedGreeting {
@@ -45,13 +43,8 @@ interface CachedWeather {
   summary: string;
   detail: string;
   generated_at: string;
-  source?: "系统定位" | "网络定位";
+  source?: "网络定位" | "手动定位";
   location_label?: string | null;
-}
-
-interface SystemWeatherLocation {
-  latitude: number;
-  longitude: number;
 }
 
 type CompanionMode = "urgent" | "caseload" | "briefcase" | "writing" | "neutral";
@@ -215,12 +208,14 @@ export function HomeCompanionStrip({
     async (forceGreetingRefresh = false) => {
       setWeather((prev) => ({ status: "locating", value: prev.value, error: null }));
       try {
-        let request: WeatherRequest;
+        let request: WeatherRequest | undefined;
         try {
-          const location = await getSystemLocation();
-          request = { latitude: location.latitude, longitude: location.longitude };
-        } catch (error) {
-          request = { warning: weatherErrorMessage(error) };
+          const settings = await getSettings();
+          const manualCity = settings.weather_city?.trim();
+          if (manualCity) {
+            request = { cityName: manualCity };
+          }
+        } catch {
         }
         setWeather((prev) => ({ status: "fetching", value: prev.value, error: null }));
         const next = weatherInfoToCache(await getWeatherInfo(request));
@@ -251,6 +246,19 @@ export function HomeCompanionStrip({
     return () => window.clearTimeout(id);
   }, [localDate, refreshWeather, weather.value?.generated_at]);
 
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    listen("weather_city_changed", () => {
+      clearCachedWeather();
+      void refreshWeather(true);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [refreshWeather]);
+
   const handleManualRefresh = useCallback(() => {
     void refreshWeather(true);
   }, [refreshWeather]);
@@ -270,16 +278,11 @@ export function HomeCompanionStrip({
     weatherFeedsGreeting,
     weatherNeedsRefresh,
   });
-  const showLocationSettingsAction = shouldShowLocationSettingsAction(weather.value, weather.error);
   const companionPose = pickCompanionPose({
     mode: companionMode,
     weatherBusy,
     greetingRefreshing,
   });
-
-  const handleOpenLocationSettings = useCallback(() => {
-    void openLocationPrivacySettings();
-  }, []);
 
   return (
     <div className="mt-3 flex max-w-2xl items-start gap-2.5 text-sm text-muted-foreground">
@@ -303,11 +306,7 @@ export function HomeCompanionStrip({
         <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
           <span
             className="inline-flex items-center gap-1"
-            title={
-              weather.value?.source === "网络定位"
-                ? "系统定位失败，当前显示网络估算天气；该天气不会用于 AI 问候"
-                : weather.value?.detail ?? undefined
-            }
+            title={weather.value?.detail ?? undefined}
           >
             <CloudSun className="size-3" />
             {weatherLabel}
@@ -335,16 +334,6 @@ export function HomeCompanionStrip({
             <RefreshCw className={weatherBusy || greetingRefreshing ? "size-3 animate-spin" : "size-3"} />
             <span className="sr-only">刷新看板助手</span>
           </button>
-          {showLocationSettingsAction && (
-            <button
-              type="button"
-              className="rounded border border-border bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground transition hover:bg-muted hover:text-foreground"
-              title="打开系统定位服务设置"
-              onClick={handleOpenLocationSettings}
-            >
-              开启定位
-            </button>
-          )}
         </div>
         {dailyBrief && (
           <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
@@ -476,6 +465,16 @@ function writeCachedWeather(today: string, value: CachedWeather): void {
   writeJson(WEATHER_KEY_PREFIX + today, value);
 }
 
+function clearCachedWeather(): void {
+  try {
+    Object.keys(localStorage)
+      .filter((key) => key.startsWith(WEATHER_KEY_PREFIX))
+      .forEach((key) => localStorage.removeItem(key));
+  } catch {
+    /* ignore */
+  }
+}
+
 function readJson<T>(key: string): T | null {
   try {
     const raw = localStorage.getItem(key);
@@ -490,41 +489,6 @@ function writeJson(key: string, value: unknown): void {
     localStorage.setItem(key, JSON.stringify(value));
   } catch {
     /* UI cache only */
-  }
-}
-
-function getCurrentPositionWithTimeout(timeoutMs: number): Promise<GeolocationPosition> {
-  if (!navigator.geolocation) {
-    return Promise.reject(new Error("当前环境不支持定位"));
-  }
-  return new Promise((resolve, reject) => {
-    navigator.geolocation.getCurrentPosition(resolve, reject, {
-      enableHighAccuracy: true,
-      maximumAge: 1000 * 60 * 5,
-      timeout: timeoutMs,
-    });
-  });
-}
-
-async function getSystemLocation(): Promise<SystemWeatherLocation> {
-  try {
-    const location = await getNativeLocation(GEOLOCATION_TIMEOUT_MS);
-    return {
-      latitude: location.latitude,
-      longitude: location.longitude,
-    };
-  } catch (nativeError) {
-    try {
-      const position = await getCurrentPositionWithTimeout(GEOLOCATION_TIMEOUT_MS);
-      return {
-        latitude: position.coords.latitude,
-        longitude: position.coords.longitude,
-      };
-    } catch (webError) {
-      throw new Error(
-        `${weatherErrorMessage(nativeError)}; WebView 定位也失败: ${weatherErrorMessage(webError)}`,
-      );
-    }
   }
 }
 

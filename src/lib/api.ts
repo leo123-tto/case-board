@@ -207,26 +207,12 @@ export function getSettings(): Promise<Settings> {
   return invoke<Settings>("get_settings");
 }
 
-export interface NativeLocation {
-  latitude: number;
-  longitude: number;
-  accuracy?: number | null;
-  authorization_status?: string;
-}
-
-/** macOS 原生 CoreLocation:用于 Tauri WebView 不弹系统定位授权时的首页天气定位。 */
-export function getNativeLocation(timeoutMs?: number): Promise<NativeLocation> {
-  return invoke<NativeLocation>("get_native_location", { timeoutMs: timeoutMs ?? null });
-}
-
 export interface WeatherRequest {
-  latitude?: number | null;
-  longitude?: number | null;
-  warning?: string | null;
+  cityName?: string | null;
 }
 
 export interface WeatherInfo {
-  source: "系统定位" | "网络定位";
+  source: "网络定位" | "手动定位";
   label: string | null;
   summary: string;
   detail: string;
@@ -235,11 +221,6 @@ export interface WeatherInfo {
 /** 首页天气统一由 Rust 请求，避免 Windows WebView 的 CSP/跨域差异。 */
 export function getWeatherInfo(request?: WeatherRequest): Promise<WeatherInfo> {
   return invoke<WeatherInfo>("get_weather_info", { request: request ?? null });
-}
-
-/** 打开系统定位服务隐私设置,让用户手动授权案件看板。 */
-export function openLocationPrivacySettings(): Promise<void> {
-  return invoke<void>("open_location_privacy_settings");
 }
 
 /** 写入用户设置(全量覆盖)。 */

@@ -198,6 +198,10 @@ pub struct Settings {
     /// 不好用可关掉,不影响其他功能。`#[serde(default)]` → 老 settings.json 缺此字段时为 false。
     pub home_calendar_enabled: bool,
 
+    /// 2026-07-15:天气城市手动覆盖。当自动定位不准确时,用户可手动指定城市名(如"南通"),
+    /// 后端会使用该城市名进行地理编码获取天气。空值表示使用自动定位。
+    pub weather_city: Option<String>,
+
     // ===== 2026-06-17 飞书日历(整合外部贡献 PR #9,gcheng-001;精简为只读日历)=====
     /// 飞书日历总开关。默认关闭;启用后复用本机 lark-cli 的登录态,不在 CaseBoard 保存飞书 token。
     /// 配好并打开后,首页显示飞书日历月历视图(替代本地"日程日历"卡片)。

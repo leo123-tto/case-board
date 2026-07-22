@@ -10,6 +10,14 @@ on:
         description: "Release tag to build, for example v0.4.15"
         required: true
         type: string
+      build_scope:
+        description: "Build all platforms, or only the missing Intel package"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - intel-only
 
 permissions:
   contents: read
@@ -23,6 +31,9 @@ jobs:
     name: Verify trusted release source
     if: github.repository == 'leo123-tto/case-board'
     runs-on: ubuntu-latest
+    outputs:
+      mac_matrix: ${{ steps.select_platforms.outputs.mac_matrix }}
+      build_windows: ${{ steps.select_platforms.outputs.build_windows }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,29 +75,34 @@ jobs:
             done < <(git diff --name-only "$TAG_SHA"..HEAD)
           fi
 
+      - name: Select requested platforms
+        id: select_platforms
+        shell: bash
+        env:
+          BUILD_SCOPE: ${{ inputs.build_scope }}
+        run: |
+          set -euo pipefail
+          case "$BUILD_SCOPE" in
+            all)
+              echo 'mac_matrix={"include":[{"label":"Apple Silicon","runner":"macos-15","release_arch":"aarch64","file_arch":"aarch64","rust_target":"aarch64-apple-darwin","pi_target":"bun-darwin-arm64","expected_macho":"arm64","bundle_root":"target/release/bundle"},{"label":"Intel","runner":"macos-15-intel","release_arch":"x86_64","file_arch":"x64","rust_target":"x86_64-apple-darwin","pi_target":"bun-darwin-x64-baseline","expected_macho":"x86_64","bundle_root":"target/x86_64-apple-darwin/release/bundle"}]}' >> "$GITHUB_OUTPUT"
+              echo 'build_windows=true' >> "$GITHUB_OUTPUT"
+              ;;
+            intel-only)
+              echo 'mac_matrix={"include":[{"label":"Intel","runner":"macos-15-intel","release_arch":"x86_64","file_arch":"x64","rust_target":"x86_64-apple-darwin","pi_target":"bun-darwin-x64-baseline","expected_macho":"x86_64","bundle_root":"target/x86_64-apple-darwin/release/bundle"}]}' >> "$GITHUB_OUTPUT"
+              echo 'build_windows=false' >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "unsupported build_scope: $BUILD_SCOPE" >&2
+              exit 1
+              ;;
+          esac
+
   build-macos:
     name: Build macOS ${{ matrix.label }}
     needs: verify-release
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - label: Apple Silicon
-            runner: macos-15
-            release_arch: aarch64
-            file_arch: aarch64
-            rust_target: aarch64-apple-darwin
-            pi_target: bun-darwin-arm64
-            expected_macho: arm64
-            bundle_root: target/release/bundle
-          - label: Intel
-            runner: macos-15-intel
-            release_arch: x86_64
-            file_arch: x64
-            rust_target: x86_64-apple-darwin
-            pi_target: bun-darwin-x64-baseline
-            expected_macho: x86_64
-            bundle_root: target/x86_64-apple-darwin/release/bundle
+      matrix: ${{ fromJSON(needs.verify-release.outputs.mac_matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -187,6 +203,7 @@ jobs:
   build-windows:
     name: Build Windows x64
     needs: verify-release
+    if: needs.verify-release.outputs.build_windows == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

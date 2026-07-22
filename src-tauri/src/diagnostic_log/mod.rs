@@ -28,8 +28,9 @@ static FILE_LOG_SENDER: OnceLock<mpsc::SyncSender<(String, String)>> = OnceLock:
 ///
 /// 内部用,生产代码请用 `dlog!()` 宏。
 pub fn push_log(line: String) {
-    // 先脱敏(路径里可能含当事人姓名)
-    let safe = crate::feedback::sanitize_paths(&line);
+    // 诊断日志只能保留单行摘要。LLM JSON 解析错误等多行详情可能包含案件正文，
+    // 既不能写入持久日志，也不能进入用户反馈。
+    let safe = crate::feedback::sanitize_runtime_log_entry(&line);
     eprintln!("{}", safe);
     let ts = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S%.3f")

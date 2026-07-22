@@ -34,9 +34,8 @@ pub enum KbStatus {
         cache_count: u64,
         /// 按前缀粗分类:`{"法规": 156, "案例": 89, "企业": 242, "其他": 0}`
         cache_breakdown: serde_json::Value,
-        /// 可检索内容篇数 —— 跟 search 实际覆盖范围一致(raw/notes + wiki/sources +
-        /// wiki/topics + gap-log,不含 yuandian-cache)。跟 `cache_count` 是两回事:
-        /// 前者是用户整理的资料,后者是元典查询缓存。
+        /// 可参与本地词法检索的文稿数，不含元典缓存、迁移收件箱、归档和技术目录。
+        /// 跟 `cache_count` 是两回事：前者是知识库材料，后者是元典查询缓存。
         content_count: u64,
         /// 整个 KB root 总占用(bytes),null = 求和失败
         total_size_bytes: Option<u64>,
@@ -138,8 +137,8 @@ fn read_index_stats(kb: &LocalKb) -> (u64, serde_json::Value) {
     (count, serde_json::to_value(breakdown).unwrap_or_default())
 }
 
-/// 数可检索内容篇数。范围跟 `search::default_scopes` 一致：整根 KB 的 `.md/.txt`，
-/// 排除元典缓存与技术目录；自建分类也计入。
+/// 数可参与词法检索的内容篇数：整根 KB 的 `.md/.txt`，排除元典缓存、
+/// 迁移收件箱、归档和技术目录；自建分类仍计入宽口径搜索。
 /// 给 Settings 卡片区分"已检索内容"和"元典缓存",避免只显缓存数误导用户。
 fn count_content_files(root: &std::path::Path) -> u64 {
     use walkdir::WalkDir;
@@ -161,7 +160,15 @@ fn count_content_files(root: &std::path::Path) -> u64 {
             || rel.split('/').any(|seg| {
                 matches!(
                     seg,
-                    ".git" | "node_modules" | "target" | "dist" | "__MACOSX"
+                    "_inbox"
+                        | "_deprecated"
+                        | "00_ARCHIVE"
+                        | "archive"
+                        | ".git"
+                        | "node_modules"
+                        | "target"
+                        | "dist"
+                        | "__MACOSX"
                 )
             })
         {

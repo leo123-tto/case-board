@@ -43,6 +43,7 @@ import type {
   MemoryCandidate,
   SaveMemoryNoteInput,
   NewCaseInstance,
+  PiThinkingLevel,
   Settings,
   UpdateInfo,
   VerifyResult,
@@ -207,6 +208,264 @@ export function getSettings(): Promise<Settings> {
   return invoke<Settings>("get_settings");
 }
 
+export type ResearchProvider = "exa" | "firecrawl";
+
+export interface ResearchCredentialStatus {
+  provider: ResearchProvider;
+  configured: boolean;
+  verified_at: string | null;
+  last_error_kind: string | null;
+}
+
+export interface FirecrawlCreditUsage {
+  total: number;
+  used: number;
+  remaining: number;
+}
+
+export interface ResearchVerificationResult {
+  provider: ResearchProvider;
+  ok: boolean;
+  verified_at: string;
+  credit_usage: FirecrawlCreditUsage | null;
+  message: string;
+}
+
+export function getNetworkResearchStatuses(): Promise<ResearchCredentialStatus[]> {
+  return invoke<ResearchCredentialStatus[]>("get_network_research_statuses");
+}
+
+export function saveNetworkResearchKey(provider: ResearchProvider, key: string): Promise<void> {
+  return invoke<void>("save_network_research_key", { provider, key });
+}
+
+export function verifyNetworkResearchProvider(
+  provider: ResearchProvider,
+): Promise<ResearchVerificationResult> {
+  return invoke<ResearchVerificationResult>("verify_network_research_provider", { provider });
+}
+
+export function removeNetworkResearchKey(provider: ResearchProvider): Promise<void> {
+  return invoke<void>("remove_network_research_key", { provider });
+}
+
+export interface PiRuntimeStatus {
+  state: "available" | "missing" | "incompatible" | "unhealthy";
+  available: boolean;
+  source: "app_data" | "bundled" | "development" | null;
+  installed_version: string | null;
+  sidecar_version: string | null;
+  pi_sdk_version: string | null;
+  protocol_version: number;
+  platform: string | null;
+  arch: string | null;
+  error_category: string | null;
+  message: string | null;
+}
+
+/** 无凭据检测 Pi Runtime 二进制、协议和 SDK 版本。 */
+export function getPiRuntimeStatus(): Promise<PiRuntimeStatus> {
+  return invoke<PiRuntimeStatus>("get_pi_runtime_status");
+}
+
+export interface PiModelSummary {
+  id: string;
+  name: string;
+  api: string;
+  reasoning: boolean;
+  thinking_levels: PiThinkingLevel[];
+  context_window: number;
+  max_tokens: number;
+  input: string[];
+}
+
+export interface PiProviderSummary {
+  id: string;
+  name: string;
+  auth_types: Array<"api_key" | "oauth">;
+  models: PiModelSummary[];
+}
+
+export interface PiProviderCatalog {
+  providers: PiProviderSummary[];
+}
+
+export interface PiCredentialStatus {
+  provider_id: string;
+  configured: boolean;
+  credential_type: "api_key" | "oauth" | null;
+  expires_at_ms: number | null;
+}
+
+export type PiProviderAuthEvent =
+  | {
+      type: "prompt";
+      auth_session_id: string;
+      prompt_id: string;
+      prompt_type: "text" | "secret" | "select" | "manual_code";
+      message: string;
+      placeholder: string | null;
+      options: Array<{ id: string; label: string; description: string | null }> | null;
+    }
+  | {
+      type: "info";
+      auth_session_id: string;
+      message: string;
+      links: Array<{ url: string; label: string | null }> | null;
+    }
+  | {
+      type: "url";
+      auth_session_id: string;
+      url: string;
+      instructions: string | null;
+      opened: boolean;
+    }
+  | {
+      type: "device_code";
+      auth_session_id: string;
+      user_code: string;
+      verification_uri: string;
+      interval_seconds: number | null;
+      expires_in_seconds: number | null;
+    }
+  | { type: "progress"; auth_session_id: string; message: string }
+  | {
+      type: "success";
+      auth_session_id: string;
+      provider_id: string;
+      credential_type: "api_key" | "oauth";
+    }
+  | { type: "error"; auth_session_id: string; message: string }
+  | { type: "cancelled"; auth_session_id: string };
+
+export function getPiProviderCatalog(): Promise<PiProviderCatalog> {
+  return invoke<PiProviderCatalog>("get_pi_provider_catalog");
+}
+
+export function getPiCredentialStatus(providerId: string): Promise<PiCredentialStatus> {
+  return invoke<PiCredentialStatus>("get_pi_credential_status", { providerId });
+}
+
+export function beginPiProviderAuth(
+  providerId: string,
+  authType: "api_key" | "oauth",
+  loginMethod?: string,
+): Promise<string> {
+  return invoke<string>("begin_pi_provider_auth", {
+    providerId,
+    authType,
+    loginMethod: loginMethod ?? null,
+  });
+}
+
+export function respondPiProviderAuth(
+  authSessionId: string,
+  promptId: string,
+  value: string,
+): Promise<void> {
+  return invoke<void>("respond_pi_provider_auth", { authSessionId, promptId, value });
+}
+
+export function cancelPiProviderAuth(authSessionId: string): Promise<void> {
+  return invoke<void>("cancel_pi_provider_auth", { authSessionId });
+}
+
+export function removePiProviderCredential(providerId: string): Promise<void> {
+  return invoke<void>("remove_pi_provider_credential", { providerId });
+}
+
+export interface PiProviderVerificationResult {
+  ok: boolean;
+  message: string;
+  provider_id: string;
+  model_id: string;
+  credential_type: string | null;
+  latency_ms: number;
+}
+
+export function verifyPiProvider(
+  providerId: string,
+  modelId: string,
+  thinkingLevel: PiThinkingLevel | null,
+): Promise<PiProviderVerificationResult> {
+  return invoke<PiProviderVerificationResult>("verify_pi_provider", {
+    providerId,
+    modelId,
+    thinkingLevel,
+  });
+}
+
+export function openAgentRuntimeLogDirectory(): Promise<void> {
+  return invoke<void>("open_agent_runtime_log_directory");
+}
+
+export interface LegalSkillSummary {
+  name: string;
+  description: string;
+  source: "builtin" | "imported" | string;
+  version: string;
+  sha256: string;
+  removable: boolean;
+}
+
+export function listLegalSkills(): Promise<LegalSkillSummary[]> {
+  return invoke<LegalSkillSummary[]>("list_legal_skills");
+}
+
+export function importLegalSkill(path: string): Promise<LegalSkillSummary> {
+  return invoke<LegalSkillSummary>("import_legal_skill", { path });
+}
+
+export function readLegalSkillContent(name: string): Promise<string> {
+  return invoke<string>("read_legal_skill_content", { name });
+}
+
+export function removeLegalSkill(name: string): Promise<void> {
+  return invoke<void>("remove_legal_skill", { name });
+}
+
+export interface PiRuntimeUpdateInfo {
+  state: "not_published" | "update_available" | "up_to_date" | "error";
+  published: boolean;
+  current_version: string | null;
+  bundled_version: string;
+  latest_version: string | null;
+  pi_sdk_version: string | null;
+  has_update: boolean;
+  asset_size: number | null;
+  released_at: string | null;
+  notes: string | null;
+  message: string | null;
+}
+
+export interface PiRuntimeInstallResult {
+  state: "installed" | "rolled_back";
+  version: string | null;
+  message: string;
+}
+
+export interface PiRuntimeUpdateProgress {
+  stage: "manifest" | "download" | "verify" | "health" | "activate" | "complete";
+  message: string;
+}
+
+/** 用户在 Pi 设置卡片中主动检查；原生 Runtime 不会后台请求更新源。 */
+export function checkPiRuntimeUpdate(): Promise<PiRuntimeUpdateInfo> {
+  return invoke<PiRuntimeUpdateInfo>("check_pi_runtime_update");
+}
+
+export function installPiRuntimeUpdate(
+  expectedVersion: string,
+): Promise<PiRuntimeInstallResult> {
+  return invoke<PiRuntimeInstallResult>("install_pi_runtime_update", {
+    expectedVersion,
+  });
+}
+
+export function rollbackPiRuntime(): Promise<PiRuntimeInstallResult> {
+  return invoke<PiRuntimeInstallResult>("rollback_pi_runtime");
+}
+
 export interface NativeLocation {
   latitude: number;
   longitude: number;
@@ -220,13 +479,14 @@ export function getNativeLocation(timeoutMs?: number): Promise<NativeLocation> {
 }
 
 export interface WeatherRequest {
+  cityName?: string | null;
   latitude?: number | null;
   longitude?: number | null;
   warning?: string | null;
 }
 
 export interface WeatherInfo {
-  source: "系统定位" | "网络定位";
+  source: "系统定位" | "手动城市" | "网络定位";
   label: string | null;
   summary: string;
   detail: string;
@@ -482,6 +742,16 @@ export function exportMdDocx(
   savePath: string,
 ): Promise<string> {
   return invoke<string>("export_md_docx", { mdPath, title, savePath });
+}
+
+/** 两个 Milkdown 编辑工作区共用的忠实排版导出。 */
+export function exportEditorDocument(
+  mdPath: string,
+  title: string,
+  format: "docx" | "html",
+  savePath: string,
+): Promise<string> {
+  return invoke<string>("export_editor_document", { mdPath, title, format, savePath });
 }
 
 /**
@@ -1172,12 +1442,19 @@ export function saveFeedbackMd(
   return invoke<string>("save_feedback_md", { info, description });
 }
 
+export interface FeedbackScreenshotUpload {
+  filename: string;
+  mimeType: string;
+  dataBase64: string;
+}
+
 /** 用户确认后,把脱敏反馈上传到作者的 Supabase 私有收件箱。 */
 export function uploadFeedbackReport(
   info: FeedbackDiagnostic,
   description: string,
+  screenshots: FeedbackScreenshotUpload[] = [],
 ): Promise<void> {
-  return invoke<void>("upload_feedback_report", { info, description });
+  return invoke<void>("upload_feedback_report", { info, description, screenshots });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1485,6 +1762,7 @@ export type CaseChatTaskType =
 export interface ChatMessage {
   id: string;
   case_id: string;
+  conversation_id: string | null;
   /** 'user' | 'assistant' */
   role: string;
   content: string;
@@ -1532,7 +1810,19 @@ export interface AskQuestion {
   max_selections?: number;
 }
 
+export interface ChatActivity {
+  runtime: "native" | "pi" | string;
+  phase: "run" | "turn" | "tool";
+  status: "started" | "completed" | "failed" | "cancelled";
+  sequence: number;
+  turn: number | null;
+  tool: string | null;
+  elapsed_ms: number | null;
+  error_category: string | null;
+}
+
 export type ChatStreamEvent =
+  | { kind: "activity"; activity: ChatActivity }
   | { kind: "delta"; text: string }
   | {
       /** V0.3 · thinking 模型推理增量 — 前端显示「深度推理中…(N 字)」进度,不进正文 */
@@ -1561,6 +1851,7 @@ export type ChatStreamEvent =
 export interface CaseChatResult {
   user_message_id: string;
   assistant_message_id: string;
+  conversation_id: string;
   model: string | null;
   prompt_tokens: number | null;
   completion_tokens: number | null;
@@ -1582,8 +1873,10 @@ export interface CaseChatResult {
 
 export interface CaseChatInput {
   case_id: string;
+  conversation_id?: string | null;
   user_message: string;
   task_type: CaseChatTaskType | null;
+  skill_name?: string | null;
   /** 前端事先生成的 uuid,作为流式 channel 名后缀 + assistant_message_id */
   message_id: string;
   /**
@@ -1615,11 +1908,68 @@ export function caseChat(input: CaseChatInput): Promise<CaseChatResult> {
 /** 取案件聊天历史(升序;不传 limit = 全部)。 */
 export function listChatHistory(
   caseId: string,
+  conversationId?: string | null,
   limit?: number,
 ): Promise<ChatMessage[]> {
   return invoke<ChatMessage[]>("list_chat_history", {
     caseId,
+    conversationId: conversationId ?? null,
     limit: limit ?? null,
+  });
+}
+
+export interface CaseChatConversation {
+  id: string;
+  case_id: string;
+  title: string;
+  title_is_manual: number;
+  last_message_at: string | null;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+}
+
+export function listCaseChatConversations(caseId: string): Promise<CaseChatConversation[]> {
+  return invoke<CaseChatConversation[]>("list_case_chat_conversations", { caseId });
+}
+
+export function ensureCaseChatConversation(caseId: string): Promise<CaseChatConversation> {
+  return invoke<CaseChatConversation>("ensure_case_chat_conversation", { caseId });
+}
+
+export function createCaseChatConversation(
+  caseId: string,
+  title: string | null = null,
+): Promise<CaseChatConversation> {
+  return invoke<CaseChatConversation>("create_case_chat_conversation", { caseId, title });
+}
+
+export function renameCaseChatConversation(
+  caseId: string,
+  conversationId: string,
+  title: string,
+): Promise<CaseChatConversation> {
+  return invoke<CaseChatConversation>("rename_case_chat_conversation", {
+    caseId,
+    conversationId,
+    title,
+  });
+}
+
+export function selectCaseChatConversation(
+  caseId: string,
+  conversationId: string,
+): Promise<void> {
+  return invoke<void>("select_case_chat_conversation", { caseId, conversationId });
+}
+
+export function archiveCaseChatConversation(
+  caseId: string,
+  conversationId: string,
+): Promise<CaseChatConversation> {
+  return invoke<CaseChatConversation>("archive_case_chat_conversation", {
+    caseId,
+    conversationId,
   });
 }
 
@@ -1632,9 +1982,21 @@ export function cancelChat(messageId: string): Promise<boolean> {
   return invoke<boolean>("cancel_chat", { messageId });
 }
 
+export function steerCaseChat(input: {
+  messageId: string;
+  caseId: string;
+  conversationId: string;
+  content: string;
+}): Promise<string> {
+  return invoke<string>("steer_case_chat", input);
+}
+
 /** 清空某案件下全部聊天记录(用户主动)。返回删除条数。 */
-export function clearChatHistory(caseId: string): Promise<number> {
-  return invoke<number>("clear_chat_history", { caseId });
+export function clearChatHistory(caseId: string, conversationId?: string | null): Promise<number> {
+  return invoke<number>("clear_chat_history", {
+    caseId,
+    conversationId: conversationId ?? null,
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1650,7 +2012,7 @@ export type KbStatus =
       cache_count: number;
       /** `{"法规": 156, "案例": 89, "企业": 242, "其他": 0}` */
       cache_breakdown: Record<string, number>;
-      /** 可检索内容篇数(raw/notes + wiki/sources + wiki/topics + gap-log),跟 cache_count 是两回事 */
+      /** 可参与词法检索的文稿数；不含元典缓存、迁移收件箱、归档和技术目录 */
       content_count: number;
       total_size_bytes: number | null;
       /** RFC3339 时间戳,null = 还没写过任何缓存 */
@@ -1811,6 +2173,10 @@ export interface KbIndexStats {
   files: number;
   /** 切片(向量)数 */
   chunks: number;
+  /** 当前增量计划内的目标文件总数(含已完成) */
+  total_files: number;
+  /** 当前增量计划内的目标切片总数(含已完成) */
+  total_chunks: number;
 }
 
 /** 读语义索引现有规模(不建不改)。 */
@@ -1818,7 +2184,25 @@ export function getLocalKbIndexStats(): Promise<KbIndexStats> {
   return invoke<KbIndexStats>("get_local_kb_index_stats");
 }
 
-/** 重建/更新本地知识库语义向量索引(法条+案例+企业;增量,进度走 `kb_index_progress` 事件)。 */
+/** 人与 AI 共用的本地知识库检索/维护说明，包含当前真实绑定路径。 */
+export function getLocalKbGuide(): Promise<string> {
+  return invoke<string>("get_local_kb_guide");
+}
+
+export interface LocalKbAiEntry {
+  guide_path: string;
+  manifest_path: string;
+  agents_path: string;
+  claude_path: string;
+  instruction: string;
+}
+
+/** 安装或更新供 Codex、Claude Code、WorkBuddy 等外部 AI 读取的本地入口。 */
+export function installLocalKbAiEntry(): Promise<LocalKbAiEntry> {
+  return invoke<LocalKbAiEntry>("install_local_kb_ai_entry");
+}
+
+/** 重建/更新 raw 正文语义向量索引(法规/案例/原始材料;增量,进度走 `kb_index_progress` 事件)。 */
 export function buildLocalKbSemanticIndex(): Promise<KbIndexStats> {
   return invoke<KbIndexStats>("build_local_kb_semantic_index");
 }

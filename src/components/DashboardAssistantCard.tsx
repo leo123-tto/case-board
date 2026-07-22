@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Bot, Loader2, MessageCircle, Send, Trash2, X } from "lucide-react";
+import { Bot, FilePenLine, Loader2, MessageCircle, Send, Trash2, X } from "lucide-react";
 
 import { HomeCompanionStrip, type DailyBrief } from "@/components/HomeCompanionStrip";
+import { HomeFeatureCard, HomeFeatureCardScrollArea } from "@/components/HomeFeatureCard";
 import { Button } from "@/components/ui/button";
 import {
   chatDashboardAssistant,
@@ -32,6 +33,7 @@ export function DashboardAssistantCard({
   reminderSummaries,
   dailyBrief,
   onDailyBriefAction,
+  onOpenAiWorkspace,
 }: {
   greeting: string;
   monthLabel: string;
@@ -42,6 +44,7 @@ export function DashboardAssistantCard({
   reminderSummaries: string[];
   dailyBrief?: DailyBrief | null;
   onDailyBriefAction?: () => void;
+  onOpenAiWorkspace: () => void;
 }) {
   const [messages, setMessages] = useState<ChatItem[]>([]);
   const [input, setInput] = useState("");
@@ -135,10 +138,7 @@ export function DashboardAssistantCard({
   };
 
   return (
-    <section
-      className="relative overflow-hidden rounded-xl border border-brand/15 bg-brand-soft/55 p-5 shadow-[inset_0_1px_0_oklch(1_0_0/0.72)]"
-      aria-label="看板助手"
-    >
+    <HomeFeatureCard tone="brand" aria-label="看板助手">
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="font-mono text-caption uppercase tracking-wider text-brand">
@@ -151,18 +151,30 @@ export function DashboardAssistantCard({
             你正在办 {openCaseCount} 个案件，可以问我软件怎么用。
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setChatOpen(true)}
-          className="hidden size-9 shrink-0 items-center justify-center rounded-lg border border-brand/15 bg-background/75 text-brand transition hover:bg-background md:flex"
-          title="和看板助手聊聊"
-        >
-          <Bot className="size-4" />
-          <span className="sr-only">和看板助手聊聊</span>
-        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="border-brand/15 bg-background/75 text-brand hover:bg-background hover:text-brand"
+            onClick={onOpenAiWorkspace}
+          >
+            <FilePenLine className="size-3.5" />
+            写材料
+          </Button>
+          <button
+            type="button"
+            onClick={() => setChatOpen(true)}
+            className="hidden size-9 shrink-0 items-center justify-center rounded-lg border border-brand/15 bg-background/75 text-brand transition hover:bg-background md:flex"
+            title="和看板助手聊聊"
+          >
+            <Bot className="size-4" />
+            <span className="sr-only">和看板助手聊聊</span>
+          </button>
+        </div>
       </div>
 
-      <div>
+      <HomeFeatureCardScrollArea className="mt-2 pr-1">
         <HomeCompanionStrip
           displayName={displayName}
           activeCaseCount={activeCaseCount}
@@ -170,7 +182,7 @@ export function DashboardAssistantCard({
           dailyBrief={dailyBrief}
           onDailyBriefAction={onDailyBriefAction}
         />
-      </div>
+      </HomeFeatureCardScrollArea>
 
       <div className="mt-3 flex items-center justify-between gap-3 border-t border-brand/10 pt-3">
         <p className="text-xs text-muted-foreground">
@@ -367,6 +379,6 @@ export function DashboardAssistantCard({
           </div>,
           document.body,
         )}
-    </section>
+    </HomeFeatureCard>
   );
 }

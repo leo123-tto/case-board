@@ -28,7 +28,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use std::sync::Arc;
@@ -36,8 +36,10 @@ use std::sync::RwLock;
 
 use super::context::TaskType;
 use super::hooks::{HookChain, HookContext, HookOutcome, SessionStats};
-use super::loop_guard::{LoopGuard, LoopGuardViolation};
-use super::stream::{ChatStreamEvent, ChatUsage};
+use super::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardViolation};
+use super::stream::{
+    ChatActivity, ChatActivityPhase, ChatActivityStatus, ChatStreamEvent, ChatUsage,
+};
 use super::tools::{ToolContext, ToolError, ToolRegistry};
 use crate::llm::capability::{OutputTokenParam, ProviderCapability};
 use crate::llm::LlmConfig;
@@ -55,6 +57,92 @@ pub struct AgentLoopRequest {
     /// 给 `<CITATIONS>` 校验 `type=doc` 引用。值为 `(filename, extracted_text_path)`，
     /// 最终只懒加载真正被引用的文件，避免每轮聊天预读整案全文。
     pub case_doc_paths_for_citation_check: Vec<(String, String)>,
+    /// 调用方可为独立的长任务入口提供专属安全阀；None 继续按 task_type 使用通用策略。
+    pub loop_guard_config: Option<LoopGuardConfig>,
+    /// 独立工作区需要把每轮模型耗时作为可审计进度展示并随任务记录保存。
+    pub emit_turn_progress: bool,
+    /// 可选的工具次数预算。独立事务工作区用它限制公开联网，避免空结果反复重试。
+    pub tool_call_budget_config: Option<ToolCallBudgetConfig>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ToolCallBudgetConfig {
+    max_web_search_calls: u32,
+    max_web_fetch_calls: u32,
+    stop_web_search_after_failure: bool,
+}
+
+impl ToolCallBudgetConfig {
+    pub fn matter_workspace() -> Self {
+        Self {
+            max_web_search_calls: 3,
+            max_web_fetch_calls: 5,
+            stop_web_search_after_failure: true,
+        }
+    }
+}
+
+pub(crate) struct ToolCallBudget {
+    config: Option<ToolCallBudgetConfig>,
+    web_search_calls: u32,
+    web_fetch_calls: u32,
+    web_search_failed: bool,
+    hall_detect_attempted: bool,
+}
+
+impl ToolCallBudget {
+    pub(crate) fn new(config: Option<ToolCallBudgetConfig>) -> Self {
+        Self {
+            config,
+            web_search_calls: 0,
+            web_fetch_calls: 0,
+            web_search_failed: false,
+            hall_detect_attempted: false,
+        }
+    }
+
+    pub(crate) fn admit(&mut self, tool: &str) -> Result<(), String> {
+        if tool == "verify_legal_citations" {
+            if self.hall_detect_attempted {
+                return Err("元典幻觉核验每轮最多调用一次；首次结果无论成功、失败或超时都不得自动重复扣费。".into());
+            }
+            self.hall_detect_attempted = true;
+        }
+        let Some(config) = self.config else {
+            return Ok(());
+        };
+        match tool {
+            "web_search" => {
+                if config.stop_web_search_after_failure && self.web_search_failed {
+                    return Err("上次联网搜索失败或无结果，请停止联网并基于本地知识库、元典和已有材料收尾。".into());
+                }
+                if self.web_search_calls >= config.max_web_search_calls {
+                    return Err(format!(
+                        "本次任务最多 {} 次 web_search，已达到上限，请停止联网并基于已有结果收尾。",
+                        config.max_web_search_calls
+                    ));
+                }
+                self.web_search_calls += 1;
+            }
+            "web_fetch" => {
+                if self.web_fetch_calls >= config.max_web_fetch_calls {
+                    return Err(format!(
+                        "本次任务最多 {} 次 web_fetch，已达到上限，请停止读取网页并基于已有结果收尾。",
+                        config.max_web_fetch_calls
+                    ));
+                }
+                self.web_fetch_calls += 1;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe(&mut self, tool: &str, success: bool) {
+        if tool == "web_search" && !success {
+            self.web_search_failed = true;
+        }
+    }
 }
 
 /// agent_loop 跑完一次的回执(给 commands.rs 落库 + 反馈 MD 性能埋点)。
@@ -151,7 +239,7 @@ fn parse_ask_user_option(value: &Value) -> Option<String> {
     }
 }
 
-fn parse_ask_user_args(args: &Value) -> Vec<AskQuestion> {
+pub(crate) fn parse_ask_user_args(args: &Value) -> Vec<AskQuestion> {
     let Some(arr) = args.get("questions").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -219,12 +307,16 @@ pub struct ToolCallRecord {
     pub credits_used: u32,
     pub success: bool,
     pub error_short: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_preview: Option<Value>,
     pub started_at_ms: i64,
     pub finished_at_ms: i64,
 }
 
 #[derive(Debug, Error)]
 pub enum AgentLoopError {
+    #[error("Agent Runtime 不可用:{0}")]
+    RuntimeUnavailable(String),
     #[error("LLM 不可达:{0}")]
     Network(String),
     #[error("LLM HTTP {0}:{1}")]
@@ -258,7 +350,7 @@ struct ApiRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
-    temperature: f32,
+    temperature: f64,
     #[serde(flatten)]
     token_budget: ApiTokenBudget,
     tools: &'a [Value],
@@ -482,6 +574,7 @@ struct FinishedToolCall {
 // ============================================================================
 
 const MAX_REQUEST_RETRIES: usize = 3;
+const MAX_STREAM_RETRIES_BEFORE_OUTPUT: usize = 1;
 
 /// V0.2.2 · 达 LoopGuard 最大轮数时,发给 LLM 的"强制收尾"指令。
 /// 关键:必须保留反虚构底线 —— 没查全/没核实的东西要明说,绝不能编造法条或判例。
@@ -529,8 +622,26 @@ pub async fn run_chat_with_tools(
     ctx: ToolContext<'_>,
     tx: UnboundedSender<ChatStreamEvent>,
     mut cancel: oneshot::Receiver<()>,
+    mut steering: UnboundedReceiver<String>,
 ) -> Result<AgentLoopOutput, AgentLoopError> {
-    let mut guard = LoopGuard::from_settings_for_task(ctx.settings, req.task_type);
+    let run_started = std::time::Instant::now();
+    let mut activity_sequence = 1_u32;
+    let _ = tx.send(ChatStreamEvent::Activity {
+        activity: ChatActivity {
+            runtime: "native".into(),
+            phase: ChatActivityPhase::Run,
+            status: ChatActivityStatus::Started,
+            sequence: activity_sequence,
+            turn: None,
+            tool: None,
+            elapsed_ms: Some(0),
+            error_category: None,
+        },
+    });
+    let mut guard = req
+        .loop_guard_config
+        .map(LoopGuard::from_config)
+        .unwrap_or_else(|| LoopGuard::from_settings_for_task(ctx.settings, req.task_type));
     let mut messages = build_initial_messages(&req);
     let tool_schemas = registry.to_function_schemas();
     // V0.3.5 · 前缀缓存稳定性:被动算一次 system+tools 指纹,落 metrics 供离线看漂移(绝不改请求本身)。
@@ -539,6 +650,7 @@ pub async fn run_chat_with_tools(
     let mut full_content = String::new();
     let mut usage = ChatUsage::default();
     let mut tool_trace: Vec<ToolCallRecord> = Vec::new();
+    let mut tool_call_budget = ToolCallBudget::new(req.tool_call_budget_config);
     // V0.3 · 本轮若模型调 ask_user 发起选项式追问,拦截后存这里并 break(不派发、不回传 tool_calls)
     let mut ask_user_questions: Option<Vec<AskQuestion>> = None;
     // V0.2.2 · 成本/缓存指标各轮累加
@@ -621,6 +733,19 @@ pub async fn run_chat_with_tools(
 
         // 1) 跑一次流式请求,拿 (content_delta, tool_calls, finish_reason, usage_chunk)
         let turn_started = std::time::Instant::now();
+        activity_sequence = activity_sequence.saturating_add(1);
+        let _ = tx.send(ChatStreamEvent::Activity {
+            activity: ChatActivity {
+                runtime: "native".into(),
+                phase: ChatActivityPhase::Turn,
+                status: ChatActivityStatus::Started,
+                sequence: activity_sequence,
+                turn: Some(guard.iter_count()),
+                tool: None,
+                elapsed_ms: Some(0),
+                error_category: None,
+            },
+        });
         let one = match stream_one_request(
             &endpoint,
             config,
@@ -635,6 +760,19 @@ pub async fn run_chat_with_tools(
         {
             Ok(o) => o,
             Err(e) => {
+                activity_sequence = activity_sequence.saturating_add(1);
+                let _ = tx.send(ChatStreamEvent::Activity {
+                    activity: ChatActivity {
+                        runtime: "native".into(),
+                        phase: ChatActivityPhase::Turn,
+                        status: ChatActivityStatus::Failed,
+                        sequence: activity_sequence,
+                        turn: Some(guard.iter_count()),
+                        tool: None,
+                        elapsed_ms: Some(turn_started.elapsed().as_millis() as u64),
+                        error_category: Some("model_request".into()),
+                    },
+                });
                 // 诊断:哪一轮、跑了多久、请求多大、什么错 —— elapsed≈超时阈值=客户端超时,
                 // elapsed 很短=服务端/网关断流。落 dlog 给反馈 MD 带出来。
                 crate::dlog!(
@@ -648,6 +786,19 @@ pub async fn run_chat_with_tools(
                 return Err(e);
             }
         };
+        activity_sequence = activity_sequence.saturating_add(1);
+        let _ = tx.send(ChatStreamEvent::Activity {
+            activity: ChatActivity {
+                runtime: "native".into(),
+                phase: ChatActivityPhase::Turn,
+                status: ChatActivityStatus::Completed,
+                sequence: activity_sequence,
+                turn: Some(guard.iter_count()),
+                tool: None,
+                elapsed_ms: Some(turn_started.elapsed().as_millis() as u64),
+                error_category: None,
+            },
+        });
         // 诊断:本轮 DeepSeek 前缀缓存命中情况(优化成本的关键指标;命中价约输入价 1/120)
         let ch = one.usage_chunk.cache_hit_tokens.unwrap_or(0);
         let cm = one.usage_chunk.cache_miss_tokens.unwrap_or(0);
@@ -672,6 +823,29 @@ pub async fn run_chat_with_tools(
             cm,
             hit_pct
         );
+
+        if req.emit_turn_progress {
+            let finished_at_ms = chrono::Local::now().timestamp_millis();
+            let elapsed_ms = turn_started.elapsed().as_millis() as i64;
+            let record = ToolCallRecord {
+                tool: "__agent_round__".into(),
+                args: json!({
+                    "iteration": guard.iter_count(),
+                    "outcome": one.finish_reason.as_deref().unwrap_or("unknown"),
+                }),
+                kb_hit: false,
+                credits_used: 0,
+                success: true,
+                error_short: None,
+                result_preview: None,
+                started_at_ms: finished_at_ms.saturating_sub(elapsed_ms),
+                finished_at_ms,
+            };
+            let _ = tx.send(ChatStreamEvent::ToolCall {
+                record: record.clone(),
+            });
+            tool_trace.push(record);
+        }
 
         full_content.push_str(&one.content);
         merge_usage(&mut usage, &one.usage_chunk);
@@ -759,12 +933,31 @@ pub async fn run_chat_with_tools(
                         ));
                         continue;
                     }
+                    if let Err(reason) = tool_call_budget.admit(&fc.name) {
+                        denied.push((fc.id.clone(), fc.name.clone(), reason, fc.args.clone()));
+                        continue;
+                    }
                     match chain.run_before_tool_call(&fc.name, &fc.args, &hctx).await {
-                        HookOutcome::Continue => subtasks.push(super::parallel::Subtask {
-                            tool_call_id: fc.id.clone(),
-                            tool: fc.name.clone(),
-                            args: fc.args.clone(),
-                        }),
+                        HookOutcome::Continue => {
+                            activity_sequence = activity_sequence.saturating_add(1);
+                            let _ = tx.send(ChatStreamEvent::Activity {
+                                activity: ChatActivity {
+                                    runtime: "native".into(),
+                                    phase: ChatActivityPhase::Tool,
+                                    status: ChatActivityStatus::Started,
+                                    sequence: activity_sequence,
+                                    turn: Some(guard.iter_count()),
+                                    tool: Some(fc.name.clone()),
+                                    elapsed_ms: Some(0),
+                                    error_category: None,
+                                },
+                            });
+                            subtasks.push(super::parallel::Subtask {
+                                tool_call_id: fc.id.clone(),
+                                tool: fc.name.clone(),
+                                args: fc.args.clone(),
+                            })
+                        }
                         HookOutcome::Deny(reason) => {
                             denied.push((fc.id.clone(), fc.name.clone(), reason, fc.args.clone()));
                         }
@@ -775,6 +968,7 @@ pub async fn run_chat_with_tools(
 
                 // V0.2 D5 · after_tool_call hook 统计累加(KB 命中率 / credits 记账)
                 for sr in &sub_results {
+                    tool_call_budget.observe(&sr.tool, sr.success);
                     let rt = super::tools::ToolResult {
                         content: sr.content.clone(),
                         yuandian_credits_used: sr.credits_used,
@@ -801,11 +995,31 @@ pub async fn run_chat_with_tools(
                             credits_used: sr.credits_used,
                             success: sr.success,
                             error_short: sr.error_short.clone(),
+                            result_preview: sr.result_preview.clone(),
                             started_at_ms: sr.started_at_ms,
                             finished_at_ms: sr.finished_at_ms,
                         };
                         let _ = tx.send(ChatStreamEvent::ToolCall {
                             record: rec.clone(),
+                        });
+                        activity_sequence = activity_sequence.saturating_add(1);
+                        let _ = tx.send(ChatStreamEvent::Activity {
+                            activity: ChatActivity {
+                                runtime: "native".into(),
+                                phase: ChatActivityPhase::Tool,
+                                status: if rec.success {
+                                    ChatActivityStatus::Completed
+                                } else {
+                                    ChatActivityStatus::Failed
+                                },
+                                sequence: activity_sequence,
+                                turn: Some(guard.iter_count()),
+                                tool: Some(rec.tool.clone()),
+                                elapsed_ms: Some(
+                                    rec.finished_at_ms.saturating_sub(rec.started_at_ms) as u64,
+                                ),
+                                error_category: (!rec.success).then(|| "tool".into()),
+                            },
                         });
                         guard.note_progress();
                         tool_trace.push(rec);
@@ -826,11 +1040,25 @@ pub async fn run_chat_with_tools(
                             credits_used: 0,
                             success: false,
                             error_short: Some(reason.clone()),
+                            result_preview: None,
                             started_at_ms: now_ms,
                             finished_at_ms: now_ms,
                         };
                         let _ = tx.send(ChatStreamEvent::ToolCall {
                             record: rec.clone(),
+                        });
+                        activity_sequence = activity_sequence.saturating_add(1);
+                        let _ = tx.send(ChatStreamEvent::Activity {
+                            activity: ChatActivity {
+                                runtime: "native".into(),
+                                phase: ChatActivityPhase::Tool,
+                                status: ChatActivityStatus::Failed,
+                                sequence: activity_sequence,
+                                turn: Some(guard.iter_count()),
+                                tool: Some(rec.tool.clone()),
+                                elapsed_ms: Some(0),
+                                error_category: Some("policy".into()),
+                            },
                         });
                         guard.note_progress();
                         tool_trace.push(rec);
@@ -849,6 +1077,7 @@ pub async fn run_chat_with_tools(
                         });
                     }
                 }
+                append_pending_steering(&mut steering, &mut messages);
                 // 下一轮
                 continue;
             }
@@ -859,6 +1088,14 @@ pub async fn run_chat_with_tools(
                     "最终回答",
                     is_compat,
                 )?;
+                messages.push(ApiMessage::Plain {
+                    role: "assistant".into(),
+                    content: one.content.clone(),
+                });
+                if append_pending_steering(&mut steering, &mut messages) {
+                    guard.note_progress();
+                    continue;
+                }
                 break;
             }
             Some("length") => {
@@ -888,6 +1125,20 @@ pub async fn run_chat_with_tools(
 
     // V0.2 D5 · LLM 调用结束:走 after_llm_call hook(成本估算 + cache stats)
     chain.run_after_llm_call(&usage, &hctx).await;
+
+    activity_sequence = activity_sequence.saturating_add(1);
+    let _ = tx.send(ChatStreamEvent::Activity {
+        activity: ChatActivity {
+            runtime: "native".into(),
+            phase: ChatActivityPhase::Run,
+            status: ChatActivityStatus::Completed,
+            sequence: activity_sequence,
+            turn: Some(guard.iter_count()),
+            tool: None,
+            elapsed_ms: Some(run_started.elapsed().as_millis() as u64),
+            error_category: None,
+        },
+    });
 
     let _ = tx.send(ChatStreamEvent::Done {
         prompt_tokens: usage.prompt_tokens,
@@ -924,6 +1175,24 @@ pub async fn run_chat_with_tools(
     })
 }
 
+fn append_pending_steering(
+    steering: &mut UnboundedReceiver<String>,
+    messages: &mut Vec<ApiMessage>,
+) -> bool {
+    let mut appended = false;
+    while let Ok(content) = steering.try_recv() {
+        messages.push(ApiMessage::Plain {
+            role: "user".into(),
+            content: format!(
+                "[用户在当前任务运行中补充的引导；请保留原任务并据此继续]\n{}",
+                content.trim()
+            ),
+        });
+        appended = true;
+    }
+    appended
+}
+
 // ============================================================================
 // 内部:一次流式请求
 // ============================================================================
@@ -935,6 +1204,36 @@ struct OneStreamPass {
     tool_calls: Vec<FinishedToolCall>,
     finish_reason: Option<String>,
     usage_chunk: ChunkUsage,
+}
+
+struct StreamAttemptFailure {
+    error: AgentLoopError,
+    had_meaningful_output: bool,
+}
+
+impl StreamAttemptFailure {
+    fn new(error: AgentLoopError, had_meaningful_output: bool) -> Self {
+        Self {
+            error,
+            had_meaningful_output,
+        }
+    }
+}
+
+fn should_retry_stream_failure(
+    retries_used: usize,
+    had_meaningful_output: bool,
+    error: &AgentLoopError,
+) -> bool {
+    if retries_used >= MAX_STREAM_RETRIES_BEFORE_OUTPUT || had_meaningful_output {
+        return false;
+    }
+    matches!(
+        error,
+        AgentLoopError::Network(_)
+            | AgentLoopError::Incomplete(_)
+            | AgentLoopError::LoopGuard(LoopGuardViolation::IdleCapExceeded { .. })
+    )
 }
 
 #[derive(Default)]
@@ -988,6 +1287,7 @@ async fn stream_one_request(
 
     // 简化版 retry:整个请求最多 send 3 次(429 / 5xx / 网络错都重试)
     let mut last_err: Option<AgentLoopError> = None;
+    let mut stream_retries_used = 0usize;
     for attempt in 0..MAX_REQUEST_RETRIES {
         let mut request = client.post(endpoint).json(&body);
         if let Some(key) = &config.api_key {
@@ -1034,8 +1334,34 @@ async fn stream_one_request(
             return Err(AgentLoopError::HttpStatus(status.as_u16(), snippet));
         }
 
-        // 成功 → 解析流
-        return parse_stream(response, tx, cancel, guard).await;
+        // HTTP 200 后仍可能在 body 流中途断开。只有尚未收到任何有效 SSE payload 时才能
+        // 原样重放一次；已有正文/推理/tool delta 时重放会造成重复输出或重复调用。
+        guard.begin_stream_attempt();
+        match parse_stream(response, tx, cancel, guard).await {
+            Ok(output) => return Ok(output),
+            Err(failure)
+                if attempt + 1 < MAX_REQUEST_RETRIES
+                    && should_retry_stream_failure(
+                        stream_retries_used,
+                        failure.had_meaningful_output,
+                        &failure.error,
+                    ) =>
+            {
+                stream_retries_used += 1;
+                crate::dlog!(
+                    "agent_loop: HTTP 200 流在零有效输出时中断(attempt {}/{}):{} — 安全重试 {}/{}",
+                    attempt + 1,
+                    MAX_REQUEST_RETRIES,
+                    failure.error,
+                    stream_retries_used,
+                    MAX_STREAM_RETRIES_BEFORE_OUTPUT
+                );
+                last_err = Some(failure.error);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(failure) => return Err(failure.error),
+        }
     }
     Err(last_err.unwrap_or_else(|| AgentLoopError::Network("请求重试用尽".into())))
 }
@@ -1045,7 +1371,7 @@ async fn parse_stream(
     tx: &UnboundedSender<ChatStreamEvent>,
     cancel: &mut oneshot::Receiver<()>,
     guard: &mut LoopGuard,
-) -> Result<OneStreamPass, AgentLoopError> {
+) -> Result<OneStreamPass, StreamAttemptFailure> {
     use futures::StreamExt;
     let mut stream = response.bytes_stream();
     let mut buf = String::new();
@@ -1054,18 +1380,45 @@ async fn parse_stream(
     let mut tool_calls_map: HashMap<u32, StreamingToolCall> = HashMap::new();
     let mut finish_reason: Option<String> = None;
     let mut usage_chunk = ChunkUsage::default();
+    let mut had_meaningful_output = false;
+    let mut saw_done = false;
 
     loop {
+        let idle_remaining = guard.idle_remaining();
         tokio::select! {
             biased;
-            _ = &mut *cancel => return Err(AgentLoopError::Cancelled),
+            _ = &mut *cancel => {
+                return Err(StreamAttemptFailure::new(
+                    AgentLoopError::Cancelled,
+                    had_meaningful_output,
+                ));
+            }
+            _ = tokio::time::sleep(idle_remaining) => {
+                let error = guard.check_idle_cap().err().unwrap_or(
+                    LoopGuardViolation::IdleCapExceeded {
+                        idle_secs: guard.idle_timeout_secs(),
+                    },
+                );
+                return Err(StreamAttemptFailure::new(
+                    AgentLoopError::LoopGuard(error),
+                    had_meaningful_output,
+                ));
+            }
             chunk = stream.next() => match chunk {
                 None => break,
-                Some(Err(e)) => return Err(AgentLoopError::Network(e.to_string())),
+                Some(Err(e)) => {
+                    return Err(StreamAttemptFailure::new(
+                        AgentLoopError::Network(format_reqwest_error(&e)),
+                        had_meaningful_output,
+                    ));
+                }
                 Some(Ok(bytes)) => {
-                    guard.note_progress();
-                    guard.check_duration_cap()?;
-                    guard.check_idle_cap()?;
+                    guard.check_duration_cap().map_err(|error| {
+                        StreamAttemptFailure::new(
+                            AgentLoopError::LoopGuard(error),
+                            had_meaningful_output,
+                        )
+                    })?;
                     let s = match std::str::from_utf8(&bytes) {
                         Ok(s) => s.to_string(),
                         Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
@@ -1074,7 +1427,7 @@ async fn parse_stream(
                     while let Some(idx) = buf.find("\n\n") {
                         let raw_event = buf[..idx].to_string();
                         buf = buf[idx + 2..].to_string();
-                        if handle_sse_event(
+                        let outcome = handle_sse_event(
                             &raw_event,
                             tx,
                             &mut content,
@@ -1082,14 +1435,29 @@ async fn parse_stream(
                             &mut tool_calls_map,
                             &mut finish_reason,
                             &mut usage_chunk,
-                        ) {
-                            // 看到 [DONE]
+                        );
+                        if outcome.meaningful {
+                            had_meaningful_output = true;
+                            guard.note_progress();
+                        }
+                        if outcome.done {
+                            saw_done = true;
                             break;
                         }
+                    }
+                    if saw_done {
+                        break;
                     }
                 }
             }
         }
+    }
+
+    if !saw_done && finish_reason.is_none() {
+        return Err(StreamAttemptFailure::new(
+            AgentLoopError::Incomplete("网络流在结束前没有提供 finish_reason 或 [DONE]".into()),
+            had_meaningful_output,
+        ));
     }
 
     // 思考模型单轮可能纯推理几分钟,落日志方便诊断「是否真卡死」(连不上会先报 Network 错)。
@@ -1107,7 +1475,10 @@ async fn parse_stream(
     indexed.sort_by_key(|(i, _)| *i);
     let mut tool_calls = Vec::with_capacity(indexed.len());
     for (_, sc) in indexed {
-        tool_calls.push(sc.build()?);
+        tool_calls.push(
+            sc.build()
+                .map_err(|error| StreamAttemptFailure::new(error, had_meaningful_output))?,
+        );
     }
     Ok(OneStreamPass {
         content,
@@ -1122,7 +1493,29 @@ async fn parse_stream(
     })
 }
 
-/// 处理一条 SSE 事件,**返回 true 表示流应该结束([DONE])**。
+fn format_reqwest_error(error: &reqwest::Error) -> String {
+    use std::error::Error as _;
+
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(current) = source {
+        let text = current.to_string();
+        if !text.is_empty() && parts.last() != Some(&text) {
+            parts.push(text);
+        }
+        source = current.source();
+    }
+    parts.join(": ")
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SseEventOutcome {
+    done: bool,
+    meaningful: bool,
+}
+
+/// 处理一条 SSE 事件，分别返回“是否结束”和“是否包含真实模型进展”。
+/// `: keep-alive`、空行和无法解析的 payload 都不算真实进展。
 fn handle_sse_event(
     raw: &str,
     tx: &UnboundedSender<ChatStreamEvent>,
@@ -1131,7 +1524,8 @@ fn handle_sse_event(
     tool_calls: &mut HashMap<u32, StreamingToolCall>,
     finish_reason: &mut Option<String>,
     usage_chunk: &mut ChunkUsage,
-) -> bool {
+) -> SseEventOutcome {
+    let mut outcome = SseEventOutcome::default();
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with(':') {
@@ -1141,7 +1535,9 @@ fn handle_sse_event(
             continue;
         };
         if data == "[DONE]" {
-            return true;
+            outcome.done = true;
+            outcome.meaningful = true;
+            return outcome;
         }
         let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
             continue;
@@ -1168,6 +1564,7 @@ fn handle_sse_event(
         }
         for choice in chunk.choices {
             if let Some(fr) = choice.finish_reason {
+                outcome.meaningful = true;
                 // 只取首个非空 finish_reason:正常一次请求只出现一次;若服务端异常发多个
                 //(如先 tool_calls 后 stop),保留首个,避免工具调用信息被后续覆盖丢失 → 400。
                 if finish_reason.is_none() {
@@ -1176,11 +1573,15 @@ fn handle_sse_event(
             }
             if let Some(text) = choice.delta.content {
                 if !text.is_empty() {
+                    outcome.meaningful = true;
                     content_acc.push_str(&text);
                     let _ = tx.send(ChatStreamEvent::Delta { text });
                 }
             }
             if let Some(deltas) = choice.delta.tool_calls {
+                if !deltas.is_empty() {
+                    outcome.meaningful = true;
+                }
                 for d in deltas {
                     let idx = d.index;
                     let entry = tool_calls.entry(idx).or_default();
@@ -1188,8 +1589,9 @@ fn handle_sse_event(
                 }
             }
             // thinking 模型思维链:累积起来,本轮做工具调用时必须随 assistant 消息回传
-            // (DeepSeek 思考模式工具调用强约束)。不进 content;但发 Reasoning 事件给前端做
-            // 「深度推理中…(N 字)」进度反馈 —— 否则大上下文单轮推理几分钟里 UI 零反馈像卡死。
+            // (DeepSeek 思考模式工具调用强约束)。不进 content;仍发 Reasoning 事件给前端做
+            // 运行提示，但不把它当成可交付进展。这样模型若只空转推理、迟迟不给正文或工具
+            // 调用，LoopGuard 会中断该次流并走一次安全重试，而不是等网关数分钟后断开。
             if let Some(rc) = choice.delta.reasoning_content {
                 if !rc.is_empty() {
                     reasoning_acc.push_str(&rc);
@@ -1198,7 +1600,7 @@ fn handle_sse_event(
             }
         }
     }
-    false
+    outcome
 }
 
 // ============================================================================

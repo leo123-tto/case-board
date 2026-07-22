@@ -603,7 +603,7 @@ function ConfigPage(props: {
           <span className="text-base leading-none">🔎</span>
           <p>
             <span className="font-medium text-foreground">硅基流动</span>{" "}
-            —— 开启语义检索(按含义找材料,检索更强,免费 BAAI/bge-m3)。
+            —— 开启语义检索（按含义找材料，检索更强；会使用所配置服务的 embedding 额度）。
             <ApplyLink
               url="https://cloud.siliconflow.cn/me/account/ak"
               label="去申请"

@@ -13,16 +13,16 @@ search_cases_normal — 普通裁判文书库关键词检索(覆盖范围最广,
 - 想搜法律条文 → `search_laws`
 
 输入字段:
-- qw: 必填,中文关键词(检索全文)。**支持「+」组合关键词**,如「合同解除+违约金」表示两词都出现的案例
-- top_k: 可选,默认 20,最大 50
-
-**高级过滤未启用**(V0.2 D2-D3 当前版本):
-计划字段 court / cause / region / judge_date_range / case_no 等过滤参数,本次工具层暂不暴露,LLM 拿到全量结果后自己看 court / cause 字段筛选;若发现这是高频需求,后续版本 yuandian/mod.rs 会扩 Params struct 再开放。
+- ah / title / ay / jbdw: 可按案号、标题、案由数组、法院数组过滤
+- ssqy / fxgc / yyft / ft_search_mode: 可按涉诉企业、裁判分析、援引法条及其组合方式过滤
+- xzqh_p / wszl / ajlb / ja_start / ja_end: 可限制地域、文书种类、案件类别、结案日期
+- qw / search_mode: 全文关键词及 `and` / `or` 组合方式
+- top_k: 可选,默认 20,最大 50；所有字段均透传到元典
 
 注意事项:
-- **先查作者整理过的全库**:找类案可先用 `search_local_kb` 看作者整理过的判例 / 类案笔记(0 积分),本地没有再调本工具外查
+- **宿主强制本地优先**:Rust 会先查本地完整案号/案例 BM25，弱命中再查本地 embedding；强命中直接返回本地材料，不调用元典
+- 本地不足时可以按准确性需要组合普通、权威和案例向量检索；每轮应改变案由、事实模式、地区或裁判层级目标
 - 优先用本地缓存(案例不过期,命中即返回 0 积分；miss 调普通案例检索为 10 积分)
-- 返回字段每条带 `{id, ah(案号), title, court, cause(案由), judge_date, content(摘要), score}`
-- 命中后挑最相关 1-2 条用 `get_case_detail` 拿全文(全文里有完整裁判要旨 / 当事人 / 事实)
+- 外部付费响应按元典原始 JSON 完整交给模型，不删字段、不做 140 字截断；需要特定文书详情时再用 `get_case_detail`
 - `<CITATIONS>` 标 `type: "case"`,title 写「<court> · <ah>」,source 写元典 id
 - 一次性命中通常 20 条,LLM **不要无脑列举所有**,精选 3-5 条最相关的告诉用户

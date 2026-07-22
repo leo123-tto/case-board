@@ -12,13 +12,17 @@
 
 pub mod cache;
 pub mod experience;
+pub mod guide;
 pub mod hash;
 pub mod ingest;
 pub mod init;
+pub mod law_catalog;
+pub mod retrieval;
 pub mod search;
 pub mod semantic;
 pub mod share;
 pub mod status;
+pub mod validity;
 
 use std::path::PathBuf;
 use thiserror::Error;

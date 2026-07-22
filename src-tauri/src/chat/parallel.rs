@@ -41,8 +41,127 @@ pub struct SubtaskResult {
     pub kb_hit: bool,
     pub credits_used: u32,
     pub error_short: Option<String>,
+    /// 仅保留可向用户展示的审计摘要（公开 URL / 法规名和条号），不落整段工具正文。
+    pub result_preview: Option<Value>,
     pub started_at_ms: i64,
     pub finished_at_ms: i64,
+}
+
+fn collect_public_links(value: &Value, links: &mut Vec<Value>) {
+    if links.len() >= 10 {
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            if let Some(url) = map
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+            {
+                if !links
+                    .iter()
+                    .any(|item| item.get("url").and_then(Value::as_str) == Some(url))
+                {
+                    let title = ["title", "name", "source"]
+                        .iter()
+                        .find_map(|key| map.get(*key).and_then(Value::as_str))
+                        .unwrap_or(url);
+                    links.push(serde_json::json!({ "title": title, "url": url }));
+                }
+            }
+            for child in map.values() {
+                collect_public_links(child, links);
+                if links.len() >= 10 {
+                    break;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_public_links(item, links);
+                if links.len() >= 10 {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_law_hits(value: &Value, laws: &mut Vec<Value>) {
+    if laws.len() >= 10 {
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            if let Some(name) = map.get("fgmc").and_then(Value::as_str) {
+                let article = ["ftnum", "tid", "ft_num"]
+                    .iter()
+                    .find_map(|key| map.get(*key).and_then(Value::as_str));
+                let excerpt = map
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(|content| content.chars().take(1_200).collect::<String>());
+                let duplicate = laws.iter().any(|item| {
+                    item.get("law").and_then(Value::as_str) == Some(name)
+                        && item.get("article").and_then(Value::as_str) == article
+                });
+                if !duplicate {
+                    laws.push(serde_json::json!({
+                        "law": name,
+                        "article": article,
+                        "excerpt": excerpt,
+                    }));
+                }
+            }
+            for child in map.values() {
+                collect_law_hits(child, laws);
+                if laws.len() >= 10 {
+                    break;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_law_hits(item, laws);
+                if laws.len() >= 10 {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn tool_result_preview(tool: &str, content: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(content).ok()?;
+    if matches!(
+        tool,
+        "web_search"
+            | "web_fetch"
+            | "exa_search"
+            | "exa_contents"
+            | "exa_find_similar"
+            | "firecrawl_search"
+            | "firecrawl_scrape"
+    ) {
+        let mut links = Vec::new();
+        collect_public_links(&value, &mut links);
+        return (!links.is_empty()).then(|| serde_json::json!({ "results": links }));
+    }
+    if matches!(
+        tool,
+        "search_laws"
+            | "get_law_article"
+            | "search_regulations"
+            | "get_regulation_detail"
+            | "law_vector_search"
+    ) {
+        let mut laws = Vec::new();
+        collect_law_hits(&value, &mut laws);
+        return (!laws.is_empty()).then(|| serde_json::json!({ "laws": laws }));
+    }
+    None
 }
 
 impl SubtaskResult {
@@ -91,7 +210,7 @@ pub async fn run_parallel_subtasks(
     let ro_results = futures::future::join_all(
         ro_tasks
             .into_iter()
-            .map(|st| run_one_subtask(st, registry, ctx)),
+            .map(|st| execute_registered_tool(st, registry, ctx)),
     )
     .await;
     for (i, r) in ro_idx.into_iter().zip(ro_results) {
@@ -100,7 +219,7 @@ pub async fn run_parallel_subtasks(
 
     // mutating 串行(一个跑完再跑下一个)
     for (i, st) in muts {
-        slots[i] = Some(run_one_subtask(st, registry, ctx).await);
+        slots[i] = Some(execute_registered_tool(st, registry, ctx).await);
     }
 
     slots
@@ -109,7 +228,9 @@ pub async fn run_parallel_subtasks(
         .collect()
 }
 
-async fn run_one_subtask(
+/// 执行一次已注册工具并生成与原生并行循环完全相同的审计结果。
+/// Pi Sidecar 只负责提出调用；路径脱敏、积分、KB 命中和错误形状仍由 Rust 统一负责。
+pub async fn execute_registered_tool(
     st: Subtask,
     registry: &ToolRegistry,
     ctx: &ToolContext<'_>,
@@ -118,18 +239,22 @@ async fn run_one_subtask(
     let exec = run_tool_inner(&st.tool, &st.args, registry, ctx).await;
     let finished = chrono::Local::now().timestamp_millis();
     match exec {
-        Ok(r) => SubtaskResult {
-            tool_call_id: st.tool_call_id,
-            tool: st.tool,
-            args: st.args,
-            success: true,
-            content: r.content,
-            kb_hit: r.kb_hit,
-            credits_used: r.yuandian_credits_used,
-            error_short: None,
-            started_at_ms: started,
-            finished_at_ms: finished,
-        },
+        Ok(r) => {
+            let result_preview = tool_result_preview(&st.tool, &r.content);
+            SubtaskResult {
+                tool_call_id: st.tool_call_id,
+                tool: st.tool,
+                args: st.args,
+                success: true,
+                result_preview,
+                content: r.content,
+                kb_hit: r.kb_hit,
+                credits_used: r.yuandian_credits_used,
+                error_short: None,
+                started_at_ms: started,
+                finished_at_ms: finished,
+            }
+        }
         Err(e) => {
             let err_str = e.to_string();
             // sanitize 路径(避免泄漏 /Users/xxx 这种)— 走反馈 MD 同一套
@@ -145,6 +270,7 @@ async fn run_one_subtask(
                 kb_hit: false,
                 credits_used: 0,
                 error_short: Some(safe),
+                result_preview: None,
                 started_at_ms: started,
                 finished_at_ms: finished,
             }

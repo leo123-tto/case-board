@@ -15,16 +15,14 @@
 //!
 //! 数据持久化由上层 Tauri 命令负责(写 chat_messages 表),本模块只做生成。
 
-/// 测试专用:串行化所有改全局 `HOME` / `XDG_DATA_HOME` 的测试(artifact 6 个 + commands 1 个)。
-/// `std::env::set_var` 是进程全局,并行测试互相串改 HOME → app_data_dir 路径错乱、偶发
-/// `NotFound`(CLAUDE.md 已知坑 18)。每个改 HOME 的测试开头取此锁:
-/// `let _env_guard = crate::chat::HOME_ENV_LOCK.lock().await;`(tokio Mutex 可跨 await)。
 pub mod agent_loop;
 pub mod arg_repair;
+pub mod artifact_intent;
 pub mod citations;
 pub mod commands;
 pub mod constitution;
 pub mod context;
+pub mod diagnostics;
 pub mod hooks;
 pub mod loop_guard;
 pub mod mcp_bridge;
@@ -32,16 +30,21 @@ pub mod mcp_paste;
 pub mod memory_extract;
 pub mod model_router;
 pub mod parallel;
+pub mod policy;
 pub mod prefix_cache;
 pub mod prompts;
 pub mod quality_gate;
+pub mod retrieval_policy;
+pub mod runtime;
+pub mod skills;
 pub mod stream;
 pub mod task_contract;
 pub mod tools;
 
 pub use commands::{
-    cancel_chat_impl, case_chat_impl, clear_chat_history_impl, list_chat_history_impl,
-    CaseChatInput, CaseChatResult, ChatCancelRegistry,
+    cancel_chat_impl, case_chat_impl, clear_chat_conversation_impl, clear_chat_history_impl,
+    list_chat_history_impl, steer_case_chat_impl, CaseChatInput, CaseChatResult,
+    ChatCancelRegistry, ChatRunScope,
 };
 pub use context::TaskType;
 pub use prompts::task_user_prompt;

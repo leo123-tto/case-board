@@ -4,12 +4,43 @@
 //! 及私有 SSE 解析):所有 chat 统一走 `agent_loop`(它有自己的 SSE 解析与请求体类型)。
 //! 本文件现在只留两条被 `agent_loop` / `commands` / `hooks` / `feedback` 共用的类型。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatActivityPhase {
+    Run,
+    Turn,
+    Tool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatActivityStatus {
+    Started,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatActivity {
+    pub runtime: String,
+    pub phase: ChatActivityPhase,
+    pub status: ChatActivityStatus,
+    pub sequence: u32,
+    pub turn: Option<u32>,
+    pub tool: Option<String>,
+    pub elapsed_ms: Option<u64>,
+    pub error_category: Option<String>,
+}
 
 /// 流式输出事件,通过 tx 发给上层(Tauri 命令 → window.emit)。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChatStreamEvent {
+    /// Runtime 的脱敏过程元数据。绝不携带 prompt、正文、推理、工具参数或结果。
+    Activity { activity: ChatActivity },
     /// 增量 token(已 utf-8 安全)
     Delta { text: String },
     /// V0.3 · thinking 模型(deepseek-v4-pro)推理阶段的 `reasoning_content` 增量。

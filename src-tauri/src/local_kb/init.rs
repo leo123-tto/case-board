@@ -65,7 +65,7 @@ const WELCOME_MD: &str = "# 法律知识库\n\n\
 - `wiki/sources/` — 你整理过的来源页(由 Claude Code + legal-kb skill 治理)\n\
 - `wiki/topics/` — 专题页\n\n\
 ## 长期使用建议\n\
-- 用 CaseBoard 跑案件 chat,元典调用先写缓存；整部法规会同时清洗进入 `raw/notes/` 并生成 `wiki/sources/` 来源页\n\
+- 用 CaseBoard 跑案件 chat,元典调用先写缓存；整部法规会清洗进入 `raw/notes/` L1 原文区并标记待复核，不自动冒充已治理的 `wiki/sources/` 来源页\n\
 - 本地 BM25/语义检索强命中就直接复用；仅本地不足时再调用元典\n\
 - 同事可以通过 CaseBoard 导出/导入资料包共享 `yuandian-cache/`\n";
 

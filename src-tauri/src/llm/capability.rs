@@ -125,13 +125,16 @@ impl ProviderCapability {
         }
     }
 
-    /// Kimi Coding Plan 只接受 temperature=1；其他 provider 完整保留调用方参数。
-    pub fn normalize_temperature(&self, requested: f32) -> f32 {
-        if self.kind == LlmProviderKind::KimiCompat {
+    /// Kimi Coding Plan 只接受 temperature=1；其他 provider 保留调用方意图，但统一在
+    /// 协议边界收敛到两位小数。不要直接把 `f32` 塞进 `serde_json::Value`：例如 0.3 会
+    /// 被扩成 0.30000001192092896，MiniMax 会以 1210 拒绝该参数。
+    pub fn normalize_temperature(&self, requested: f32) -> f64 {
+        let normalized = if self.kind == LlmProviderKind::KimiCompat {
             1.0
         } else {
-            requested
-        }
+            requested as f64
+        };
+        (normalized * 100.0).round() / 100.0
     }
 }
 

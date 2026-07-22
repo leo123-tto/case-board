@@ -25,6 +25,7 @@ use sqlx::{FromRow, SqlitePool};
 pub struct ChatTask {
     pub id: String,
     pub case_id: String,
+    pub conversation_id: Option<String>,
     pub message_id: String,
     pub task_type: String,
     pub status: String,
@@ -52,6 +53,7 @@ pub struct ChatTask {
 pub struct NewChatTask<'a> {
     pub id: &'a str,
     pub case_id: &'a str,
+    pub conversation_id: Option<&'a str>,
     pub message_id: &'a str,
     pub task_type: &'a str,
     /// 通常 `"planning"`(主 agent 还在拆任务),也可以直接 `"executing"`。
@@ -128,11 +130,12 @@ pub async fn create_chat_task(pool: &SqlitePool, task: NewChatTask<'_>) -> Resul
     let started_at = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO chat_tasks \
-         (id, case_id, message_id, task_type, status, attached_doc_ids, started_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         (id, case_id, conversation_id, message_id, task_type, status, attached_doc_ids, started_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(task.id)
     .bind(task.case_id)
+    .bind(task.conversation_id)
     .bind(task.message_id)
     .bind(task.task_type)
     .bind(task.status)

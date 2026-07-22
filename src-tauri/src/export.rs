@@ -678,6 +678,80 @@ pub(crate) fn strip_artifact_cruft(md: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// 把 Milkdown 工作区文稿渲染为单文件 HTML。不套案件报告的封面/目录，
+/// 只还原编辑器本身的文档层级、字体、行距、列表、表格、引用与预格式块。
+pub(crate) fn render_editor_html(title: &str, md: &str) -> String {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    let parser = Parser::new_ext(md, opts);
+    let mut body_html = String::new();
+    html::push_html(&mut body_html, parser);
+    let title = html_escape(title.trim());
+
+    format!(
+        r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  html {{ background: #f5f5f4; }}
+  body {{ margin: 0 auto; max-width: 50rem; min-height: 100vh; padding: 2.5rem 3rem 6rem; background: #fff; color: #1a1a1a; font-family: "Songti SC", "STSong", "SimSun", "Noto Serif SC", serif; font-size: 16px; line-height: 1.9; }}
+  .document-title {{ margin: 0 0 1.4rem; font-size: 1.45rem; font-weight: 700; line-height: 1.5; text-align: center; }}
+  main h1 {{ margin: 1.6rem 0 1.2rem; font-size: 1.45rem; font-weight: 700; line-height: 1.5; text-align: center; }}
+  main h2 {{ margin: 1.4rem 0 .8rem; font-size: 1.18rem; font-weight: 700; line-height: 1.5; }}
+  main h3 {{ margin: 1.1rem 0 .6rem; font-size: 1.05rem; font-weight: 700; line-height: 1.5; }}
+  main h4, main h5, main h6 {{ margin: 1rem 0 .5rem; font-size: 1rem; font-weight: 700; line-height: 1.5; }}
+  main p {{ margin: .6rem 0; text-align: justify; }}
+  main ul, main ol {{ margin: .6rem 0; padding-left: 1.8rem; }}
+  main li {{ margin: .25rem 0; }}
+  main table {{ width: 100%; margin: 1rem 0; border-collapse: collapse; font-size: .95rem; }}
+  main th, main td {{ padding: .45rem .7rem; border: 1px solid #c8c8c8; text-align: left; vertical-align: top; }}
+  main th {{ background: #f4f4f4; font-weight: 700; }}
+  main blockquote {{ margin: .8rem 0; padding-left: 1rem; border-left: 3px solid #d0d0d0; color: #555; }}
+  main hr {{ margin: 1.5rem 0; border: 0; border-top: 1px solid #d8d8d8; }}
+  main code {{ padding: .1rem .3rem; border-radius: 3px; background: #f0f0f0; font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: .9em; }}
+  main pre {{ margin: .8rem 0; padding: 1rem 1.25rem; overflow-x: auto; border-radius: 10px; background: #f3f4f6; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.9; }}
+  main pre code {{ padding: 0; background: transparent; font-family: inherit; font-size: 1em; }}
+  @page {{ size: A4; margin: 25.4mm; }}
+  @media print {{ html {{ background: #fff; }} body {{ max-width: none; min-height: auto; padding: 0; }} h1, h2, h3, h4, h5, h6 {{ break-after: avoid; }} table, blockquote, pre {{ break-inside: avoid; }} }}
+</style>
+</head>
+<body>
+<header class="document-title">{title}</header>
+<main>{body_html}</main>
+</body>
+</html>"#,
+    )
+}
+
+/// 两个 Milkdown 工作区共用的统一导出入口。
+pub async fn export_editor_document_to(
+    md_path: &Path,
+    title: &str,
+    format: &str,
+    save_path: &Path,
+) -> Result<PathBuf, String> {
+    let raw = std::fs::read_to_string(md_path).map_err(|e| format!("读 MD 失败:{e}"))?;
+    let md = strip_artifact_cruft(&raw);
+    match format {
+        "docx" => {
+            let bytes = crate::docx_filing::build_editor_docx_bytes(title, &md)?;
+            std::fs::write(save_path, bytes).map_err(|e| format!("写 docx 失败:{e}"))?;
+        }
+        "html" => {
+            let html = render_editor_html(title, &md);
+            std::fs::write(save_path, html).map_err(|e| format!("写 HTML 失败:{e}"))?;
+        }
+        _ => return Err("仅支持导出 docx 或 html".to_string()),
+    }
+    Ok(save_path.to_path_buf())
+}
+
 /// 通用 MD → 自定义样式 HTML(单文件,内嵌 CSS)。
 pub async fn render_md_html(md_path: &Path, title: &str) -> Result<String, String> {
     let raw = std::fs::read_to_string(md_path).map_err(|e| format!("读 MD 失败:{}", e))?;

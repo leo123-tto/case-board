@@ -111,6 +111,19 @@
   font-weight: 700;
 }
 
+/*
+ * Nord 按系统 prefers-color-scheme 给奇数列套深色背景，即使 CaseBoard 本身固定为
+ * 浅色也会触发。用更高 specificity 在编辑器边界内归一化，避免左列变成黑框。
+ */
+.milkdown-editor .ProseMirror.milkdown-theme-nord.prose td,
+.milkdown-editor .ProseMirror.milkdown-theme-nord.prose th {
+  background-color: #fff;
+  color: #1a1a1a;
+}
+.milkdown-editor .ProseMirror.milkdown-theme-nord.prose th {
+  background-color: #f4f4f4;
+}
+
 /* 引用 / 分隔线 / 代码 */
 .milkdown-editor .ProseMirror blockquote {
   border-left: 3px solid #d0d0d0;
@@ -129,6 +142,23 @@
   padding: 0.1rem 0.3rem;
   font-family: ui-monospace, monospace;
   font-size: 0.9em;
+}
+.milkdown-editor .ProseMirror.milkdown-theme-nord.prose pre {
+  margin: 0.9rem 0;
+  overflow-x: auto;
+  border: 1px solid #d8dde5;
+  border-radius: 8px;
+  background: #f6f7f9;
+  color: #1a1a1a;
+  padding: 1rem 1.15rem;
+}
+.milkdown-editor .ProseMirror pre > code {
+  display: block;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* 选中态(ProseMirror gapcursor 等保持默认) */

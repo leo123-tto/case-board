@@ -20,31 +20,51 @@ import {
   Brain,
   Wrench,
   BookText,
+  Eye,
   SlidersHorizontal,
   User,
   Palette,
 } from "lucide-react";
 import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import { confirmDialog } from "@/lib/dialog";
 import { todayIsoLocal } from "@/lib/date";
 
 import { Button } from "@/components/ui/button";
+import { toast } from "@/components/ui/toast";
 import { HoverHint } from "@/components/HoverHint";
 import { GroupQrCode } from "@/components/GroupQrCode";
 import { KbSemanticIndexCard } from "@/components/KbSemanticIndexCard";
+import { KbGuideCard } from "@/components/KbGuideCard";
 import { DeviceSyncCard } from "@/components/DeviceSyncCard";
+import { NetworkResearchSettingsCard } from "@/components/NetworkResearchSettingsCard";
 import {
   createLocalKb,
+  checkPiRuntimeUpdate,
+  beginPiProviderAuth,
+  cancelPiProviderAuth,
   detectKbStatus,
   exportKbToZip,
   getSettings,
+  getPiRuntimeStatus,
+  getPiProviderCatalog,
+  getPiCredentialStatus,
   getYuandianBalance,
   getYuandianCreditsOverview,
   importKbFromZip,
+  installPiRuntimeUpdate,
+  importLegalSkill,
+  readLegalSkillContent,
   migrateLocalKb,
   pruneYuandianCache,
+  rollbackPiRuntime,
+  removePiProviderCredential,
+  respondPiProviderAuth,
+  removeLegalSkill,
+  openAgentRuntimeLogDirectory,
   openInDefaultApp,
   openUrl,
+  listLegalSkills,
   parseMcpPaste,
   saveSettings,
   testMcpServer,
@@ -53,6 +73,7 @@ import {
   verifyOpenAICompatKey,
   verifyMinerUKey,
   verifyPaddleVlKey,
+  verifyPiProvider,
   verifyEmbeddingKey,
   verifyYuandianKey,
   type KbConflictStrategy,
@@ -60,9 +81,18 @@ import {
   type KbStatus,
   type CreditsOverview,
   type YuandianBalance,
+  type PiRuntimeStatus,
+  type PiRuntimeUpdateInfo,
+  type PiRuntimeUpdateProgress,
+  type PiProviderCatalog,
+  type PiModelSummary,
+  type PiCredentialStatus,
+  type PiProviderAuthEvent,
+  type LegalSkillSummary,
 } from "@/lib/api";
-import type { Settings, McpServerConfig } from "@/lib/types";
+import type { Settings, McpServerConfig, PiThinkingLevel } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { effectiveAgentRuntime } from "@/lib/piRuntime";
 import {
   FEATURE_FLAGS,
   getFeatureFlag,
@@ -70,6 +100,10 @@ import {
   type FeatureFlagName,
 } from "@/lib/featureFlags";
 import { FONT_SCALE, useFontScale } from "@/lib/uiScale";
+import {
+  normalizeWeatherCity,
+  WEATHER_CITY_CHANGED_EVENT,
+} from "@/components/homeCompanionLogic";
 import {
   THEMES,
   getThemePreference,
@@ -97,6 +131,48 @@ type CompatSettingKey =
   | "custom_llm_api_key"
   | "custom_llm_verified_at";
 type CompatFieldKind = "endpoint" | "model" | "apiKey" | "verifiedAt";
+
+const PI_THINKING_LEVELS: PiThinkingLevel[] = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+const PI_THINKING_LABELS: Record<PiThinkingLevel, string> = {
+  off: "关闭",
+  minimal: "最小",
+  low: "低",
+  medium: "中",
+  high: "高",
+  xhigh: "超高",
+  max: "最大",
+};
+
+function piModelThinkingLevels(model: PiModelSummary | undefined): PiThinkingLevel[] {
+  if (!model) return [];
+  if (model.thinking_levels.length > 0) return model.thinking_levels;
+  return model.reasoning ? PI_THINKING_LEVELS.slice(0, 5) : ["off"];
+}
+
+function clampPiThinkingLevel(
+  requested: PiThinkingLevel | undefined,
+  supported: PiThinkingLevel[],
+): PiThinkingLevel | null {
+  if (supported.length === 0) return null;
+  if (requested && supported.includes(requested)) return requested;
+  const targetIndex = Math.max(0, PI_THINKING_LEVELS.indexOf(requested ?? "medium"));
+  for (const candidate of PI_THINKING_LEVELS.slice(targetIndex)) {
+    if (supported.includes(candidate)) return candidate;
+  }
+  for (const candidate of PI_THINKING_LEVELS.slice(0, targetIndex).reverse()) {
+    if (supported.includes(candidate)) return candidate;
+  }
+  return supported[0];
+}
 
 /** 云端 AI 后端可选项(下拉)。glm/mimo/custom 共用「通用 OpenAI 兼容」配置(compat_llm_*)。 */
 const CLOUD_BACKEND_OPTIONS = [
@@ -292,6 +368,7 @@ export function SettingsModal({
     [],
   );
   const [settings, setSettings] = useState<Settings | null>(null);
+  const savedWeatherCityRef = useRef<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -333,6 +410,215 @@ export function SettingsModal({
   const [yuandianMsg, setYuandianMsg] = useState<string>("");
   const [embeddingStatus, setEmbeddingStatus] = useState<VerifyStatus>("idle");
   const [embeddingMsg, setEmbeddingMsg] = useState<string>("");
+  const [piRuntimeStatus, setPiRuntimeStatus] = useState<PiRuntimeStatus | null>(null);
+  const [checkingPiRuntime, setCheckingPiRuntime] = useState(false);
+  const [piUpdateInfo, setPiUpdateInfo] = useState<PiRuntimeUpdateInfo | null>(null);
+  const [piUpdateBusy, setPiUpdateBusy] = useState<"checking" | "installing" | "rollback" | null>(null);
+  const [piUpdateProgress, setPiUpdateProgress] = useState<PiRuntimeUpdateProgress | null>(null);
+  const [piUpdateMessage, setPiUpdateMessage] = useState<string>("");
+  const [piCatalog, setPiCatalog] = useState<PiProviderCatalog | null>(null);
+  const [piCatalogBusy, setPiCatalogBusy] = useState(false);
+  const [piCredentialStatus, setPiCredentialStatus] = useState<PiCredentialStatus | null>(null);
+  const [piAuthSessionId, setPiAuthSessionId] = useState<string | null>(null);
+  const piAuthSessionRef = useRef<string | null>(null);
+  const [piAuthEvent, setPiAuthEvent] = useState<PiProviderAuthEvent | null>(null);
+  const [piAuthUrl, setPiAuthUrl] = useState<string | null>(null);
+  const [piAuthInput, setPiAuthInput] = useState("");
+  const [piVerifyStatus, setPiVerifyStatus] = useState<VerifyStatus>("idle");
+  const [piVerifyMessage, setPiVerifyMessage] = useState("");
+  const selectedPiProvider = piCatalog?.providers.find(
+    (provider) => provider.id === settings?.pi_provider_id,
+  );
+  const selectedPiModel = selectedPiProvider?.models.find(
+    (model) => model.id === settings?.pi_model_id,
+  );
+  const selectedPiThinkingLevels = piModelThinkingLevels(selectedPiModel);
+  const selectedPiThinkingLevel = clampPiThinkingLevel(
+    settings?.pi_provider_id && settings.pi_model_id
+      ? settings.pi_model_thinking_levels?.[settings.pi_provider_id]?.[settings.pi_model_id]
+      : undefined,
+    selectedPiThinkingLevels,
+  );
+
+  const openPiAuthUrl = useCallback(async (url: string) => {
+    try {
+      await openUrl(url);
+    } catch (error) {
+      toast(`无法打开 OpenAI 登录页：${String(error)}`, "error", 7000);
+    }
+  }, []);
+
+  const checkPiRuntime = useCallback(async (): Promise<PiRuntimeStatus> => {
+    setCheckingPiRuntime(true);
+    try {
+      const status = await getPiRuntimeStatus();
+      setPiRuntimeStatus(status);
+      return status;
+    } catch (e) {
+      const status: PiRuntimeStatus = {
+        state: "unhealthy",
+        available: false,
+        source: null,
+        installed_version: null,
+        sidecar_version: null,
+        pi_sdk_version: null,
+        protocol_version: 3,
+        platform: null,
+        arch: null,
+        error_category: "invoke",
+        message: String(e),
+      };
+      setPiRuntimeStatus(status);
+      return status;
+    } finally {
+      setCheckingPiRuntime(false);
+    }
+  }, []);
+
+  const loadPiCatalog = useCallback(async () => {
+    setPiCatalogBusy(true);
+    try {
+      const catalog = await getPiProviderCatalog();
+      setPiCatalog(catalog);
+      return catalog;
+    } catch (error) {
+      toast(`读取 Pi 模型目录失败：${String(error)}`, "error", 7000);
+      return null;
+    } finally {
+      setPiCatalogBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (tab !== "brain") {
+      setPiRuntimeStatus(null);
+      setPiUpdateInfo(null);
+      setPiUpdateProgress(null);
+      setPiUpdateMessage("");
+      return;
+    }
+    if (effectiveAgentRuntime(settings?.agent_runtime) === "pi" && piRuntimeStatus === null) {
+      void checkPiRuntime();
+    }
+  }, [checkPiRuntime, piRuntimeStatus, settings?.agent_runtime, tab]);
+
+  useEffect(() => {
+    if (tab !== "brain" || effectiveAgentRuntime(settings?.agent_runtime) !== "pi") return;
+    let unlisten: (() => void) | undefined;
+    void listen<PiRuntimeUpdateProgress>("pi-runtime-update-progress", (event) => {
+      setPiUpdateProgress(event.payload);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, [settings?.agent_runtime, tab]);
+
+  useEffect(() => {
+    if (
+      tab !== "brain"
+      || effectiveAgentRuntime(settings?.agent_runtime) !== "pi"
+      || !piRuntimeStatus?.available
+      || piCatalog
+    ) return;
+    void loadPiCatalog();
+  }, [loadPiCatalog, piCatalog, piRuntimeStatus?.available, settings?.agent_runtime, tab]);
+
+  useEffect(() => {
+    const providerId = settings?.pi_provider_id?.trim();
+    if (!providerId || effectiveAgentRuntime(settings?.agent_runtime) !== "pi") {
+      setPiCredentialStatus(null);
+      return;
+    }
+    void getPiCredentialStatus(providerId)
+      .then(setPiCredentialStatus)
+      .catch(() => setPiCredentialStatus(null));
+  }, [settings?.agent_runtime, settings?.pi_provider_id]);
+
+  useEffect(() => {
+    if (tab !== "brain" || effectiveAgentRuntime(settings?.agent_runtime) !== "pi") return;
+    let unlisten: (() => void) | undefined;
+    void listen<PiProviderAuthEvent>("pi-provider-auth-event", (event) => {
+      if (piAuthSessionRef.current === "pending") {
+        piAuthSessionRef.current = event.payload.auth_session_id;
+        setPiAuthSessionId(event.payload.auth_session_id);
+      } else if (event.payload.auth_session_id !== piAuthSessionRef.current) {
+        return;
+      }
+      if (event.payload.type === "url") {
+        setPiAuthUrl(event.payload.url);
+        if (!event.payload.opened) void openPiAuthUrl(event.payload.url);
+      }
+      setPiAuthEvent(event.payload);
+      if (event.payload.type === "prompt") setPiAuthInput("");
+      if (event.payload.type === "success") {
+        void getPiCredentialStatus(event.payload.provider_id).then(setPiCredentialStatus);
+        setPiAuthUrl(null);
+        piAuthSessionRef.current = null;
+        setPiAuthSessionId(null);
+      } else if (event.payload.type === "error" || event.payload.type === "cancelled") {
+        setPiAuthUrl(null);
+        piAuthSessionRef.current = null;
+        setPiAuthSessionId(null);
+      }
+    }).then((fn) => { unlisten = fn; });
+    return () => unlisten?.();
+  }, [openPiAuthUrl, settings?.agent_runtime, tab]);
+
+  const checkPiUpdate = useCallback(async () => {
+    setPiUpdateBusy("checking");
+    setPiUpdateMessage("");
+    try {
+      const info = await checkPiRuntimeUpdate();
+      setPiUpdateInfo(info);
+      if (info.message) setPiUpdateMessage(info.message);
+    } catch (error) {
+      setPiUpdateMessage(String(error));
+    } finally {
+      setPiUpdateBusy(null);
+    }
+  }, []);
+
+  const installPiUpdate = useCallback(async () => {
+    const version = piUpdateInfo?.latest_version;
+    if (!version || !piUpdateInfo.has_update) return;
+    const confirmed = await confirmDialog(
+      `将下载并验证 Pi Runtime ${version}。只有签名、SHA-256、平台签名和健康检查全部通过后才会切换，是否继续？`,
+      { title: "安装 Pi Runtime 更新", okLabel: "下载并安装" },
+    );
+    if (!confirmed) return;
+    setPiUpdateBusy("installing");
+    setPiUpdateProgress({ stage: "manifest", message: "正在准备更新" });
+    setPiUpdateMessage("");
+    try {
+      const result = await installPiRuntimeUpdate(version);
+      await Promise.all([checkPiRuntime(), checkPiUpdate()]);
+      setPiUpdateMessage(result.message);
+    } catch (error) {
+      setPiUpdateMessage(String(error));
+    } finally {
+      setPiUpdateBusy(null);
+    }
+  }, [checkPiRuntime, checkPiUpdate, piUpdateInfo]);
+
+  const rollbackPiUpdate = useCallback(async () => {
+    const confirmed = await confirmDialog(
+      "将让后续新会话回到安装包内置 Pi Runtime；已经下载的版本不会删除。是否继续？",
+      { title: "回退 Pi Runtime", okLabel: "回退到内置版本" },
+    );
+    if (!confirmed) return;
+    setPiUpdateBusy("rollback");
+    setPiUpdateMessage("");
+    try {
+      const result = await rollbackPiRuntime();
+      setPiUpdateMessage(result.message);
+      setPiUpdateInfo(null);
+      await checkPiRuntime();
+    } catch (error) {
+      setPiUpdateMessage(String(error));
+    } finally {
+      setPiUpdateBusy(null);
+    }
+  }, [checkPiRuntime]);
 
   // settings 加载完后,如果 verified_at 非空,初始化为 "ok"(从 DB 读出来的已验证状态)
   useEffect(() => {
@@ -603,7 +889,10 @@ export function SettingsModal({
     let cancelled = false;
     getSettings()
       .then((s) => {
-        if (!cancelled) setSettings(s);
+        if (!cancelled) {
+          setSettings(s);
+          savedWeatherCityRef.current = normalizeWeatherCity(s.weather_city);
+        }
       })
       .catch((e) => {
         if (!cancelled) setError(String(e));
@@ -638,7 +927,17 @@ export function SettingsModal({
     setSaving(true);
     setError(null);
     try {
-      await saveSettings(prepareSettingsForSave(settings));
+      const prepared = prepareSettingsForSave({
+        ...settings,
+        weather_city: normalizeWeatherCity(settings.weather_city),
+      });
+      await saveSettings(prepared);
+      setSettings(prepared);
+      const savedWeatherCity = normalizeWeatherCity(prepared.weather_city);
+      if (savedWeatherCity !== savedWeatherCityRef.current) {
+        savedWeatherCityRef.current = savedWeatherCity;
+        window.dispatchEvent(new CustomEvent(WEATHER_CITY_CHANGED_EVENT));
+      }
       for (const [name, value] of Object.entries(featureFlagDraft)) {
         setFeatureFlag(name as FeatureFlagName, value);
       }
@@ -667,6 +966,146 @@ export function SettingsModal({
   function updateField<K extends keyof Settings>(key: K, value: Settings[K]) {
     setSettings((prev) => (prev ? { ...prev, [key]: value } : prev));
     setDirty(true);
+  }
+
+  async function handleAgentRuntimeChange(value: string) {
+    if (value !== "pi") {
+      setPiRuntimeStatus(null);
+      setPiUpdateInfo(null);
+      setPiUpdateProgress(null);
+      setPiUpdateMessage("");
+      updateField("agent_runtime", null);
+      return;
+    }
+    const status = await checkPiRuntime();
+    if (status.available) {
+      updateField("agent_runtime", "pi");
+    } else {
+      toast(status.message ?? "当前设备无法使用 Pi Runtime", "error", 7000);
+    }
+  }
+
+  function handlePiProviderChange(providerId: string) {
+    const provider = piCatalog?.providers.find((item) => item.id === providerId);
+    updateFields({
+      pi_provider_id: providerId || null,
+      pi_model_id: provider?.models[0]?.id ?? null,
+    });
+    setPiCredentialStatus(null);
+    setPiAuthEvent(null);
+    setPiAuthUrl(null);
+    setPiVerifyStatus("idle");
+    setPiVerifyMessage("");
+  }
+
+  function updatePiThinkingLevel(level: PiThinkingLevel) {
+    const providerId = settings?.pi_provider_id?.trim();
+    const modelId = settings?.pi_model_id?.trim();
+    if (!providerId || !modelId) return;
+    setSettings((previous) => previous ? {
+      ...previous,
+      pi_model_thinking_levels: {
+        ...(previous.pi_model_thinking_levels ?? {}),
+        [providerId]: {
+          ...(previous.pi_model_thinking_levels?.[providerId] ?? {}),
+          [modelId]: level,
+        },
+      },
+    } : previous);
+    setDirty(true);
+    setPiVerifyStatus("idle");
+    setPiVerifyMessage("");
+  }
+
+  async function startPiProviderAuth(authType: "api_key" | "oauth") {
+    const providerId = settings?.pi_provider_id?.trim();
+    if (!providerId) return;
+    setPiAuthEvent(null);
+    setPiAuthUrl(null);
+    setPiAuthInput("");
+    piAuthSessionRef.current = "pending";
+    setPiAuthSessionId("pending");
+    try {
+      const sessionId = await beginPiProviderAuth(
+        providerId,
+        authType,
+        authType === "oauth" ? "browser" : undefined,
+      );
+      if (piAuthSessionRef.current === "pending") {
+        piAuthSessionRef.current = sessionId;
+        setPiAuthSessionId(sessionId);
+        setPiAuthEvent({
+          type: "progress",
+          auth_session_id: sessionId,
+          message: authType === "oauth" ? "正在打开 Provider 登录页…" : "正在准备 API Key 输入…",
+        });
+      }
+    } catch (error) {
+      piAuthSessionRef.current = null;
+      setPiAuthSessionId(null);
+      toast(String(error), "error", 7000);
+    }
+  }
+
+  async function submitPiAuthPrompt() {
+    if (!piAuthSessionId || piAuthEvent?.type !== "prompt") return;
+    try {
+      await respondPiProviderAuth(piAuthSessionId, piAuthEvent.prompt_id, piAuthInput);
+      setPiAuthEvent({
+        type: "progress",
+        auth_session_id: piAuthSessionId,
+        message: "正在验证并保存到系统凭据库…",
+      });
+      setPiAuthInput("");
+    } catch (error) {
+      toast(String(error), "error", 7000);
+    }
+  }
+
+  async function cancelPiAuth() {
+    if (!piAuthSessionId || piAuthSessionId === "pending") return;
+    try {
+      await cancelPiProviderAuth(piAuthSessionId);
+    } catch (error) {
+      toast(String(error), "error", 5000);
+    }
+  }
+
+  async function removePiCredential() {
+    const providerId = settings?.pi_provider_id?.trim();
+    if (!providerId) return;
+    const confirmed = await confirmDialog("将从系统凭据库删除该 Pi provider 的凭据，是否继续？", {
+      title: "移除模型凭据",
+      okLabel: "移除",
+    });
+    if (!confirmed) return;
+    try {
+      await removePiProviderCredential(providerId);
+      setPiCredentialStatus(await getPiCredentialStatus(providerId));
+      setPiAuthEvent(null);
+    } catch (error) {
+      toast(String(error), "error", 7000);
+    }
+  }
+
+  async function verifySelectedPiProvider() {
+    const providerId = settings?.pi_provider_id?.trim();
+    const modelId = settings?.pi_model_id?.trim();
+    if (!providerId || !modelId) return;
+    setPiVerifyStatus("verifying");
+    setPiVerifyMessage("");
+    try {
+      const result = await verifyPiProvider(providerId, modelId, selectedPiThinkingLevel);
+      setPiVerifyStatus(result.ok ? "ok" : "fail");
+      setPiVerifyMessage(
+        result.ok
+          ? `真实请求已通过 · ${result.latency_ms}ms`
+          : result.message,
+      );
+    } catch (error) {
+      setPiVerifyStatus("fail");
+      setPiVerifyMessage(String(error));
+    }
   }
 
   function updateFeatureFlag(name: FeatureFlagName, value: boolean) {
@@ -714,46 +1153,27 @@ export function SettingsModal({
   // 改用条件渲染同一 body JSX,React 会正确 diff
   const body = (
     <>
-        {/* 标题栏 */}
+      {!isPage && (
+        /* 弹窗模式保留标题与关闭按钮；独立设置页直接从分类标签开始。 */
         <header className="app-subheader flex items-center justify-between gap-4 border-b px-4 py-3.5 sm:px-5">
           <div>
-            <h2
-              className={cn(
-                "font-semibold text-foreground",
-                isPage ? "text-lg" : "text-sm",
-              )}
-            >
+            <h2 className="text-sm font-semibold text-foreground">
               设置
             </h2>
             <p className="mt-0.5 text-xs text-muted-foreground">
               配置模型、知识库、数据源和可选功能。
             </p>
           </div>
-          {isPage ? (
-            <Button
-              size="sm"
-              onClick={handleSave}
-              disabled={saving || !settings || !dirty}
-              title="保存本页全部设置"
-            >
-              {saving ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <Save className="size-3.5" />
-              )}
-              保存
-            </Button>
-          ) : (
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={handleClose}
-              aria-label="关闭"
-            >
-              <X className="size-4" />
-            </Button>
-          )}
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={handleClose}
+            aria-label="关闭"
+          >
+            <X className="size-4" />
+          </Button>
         </header>
+      )}
 
         {/* 内容区 */}
         <div className="flex-1 overflow-auto px-4 py-5 sm:px-5">
@@ -766,39 +1186,62 @@ export function SettingsModal({
             <>
             {/* 2026-06-16 · 标签页导航:按类型归拢散乱配置 */}
             <div
-              className="mb-6 flex flex-wrap gap-1.5 border-b border-border pb-3"
-              role="tablist"
-              aria-label="设置分类"
+              className="mb-6 flex items-start gap-3 border-b border-border pb-3"
+              data-settings-tab-row
             >
-              {SETTINGS_TABS.map((t) => {
-                const Icon = t.icon;
-                const active = tab === t.id;
-                return (
-                  <button
-                    key={t.id}
-                    type="button"
-                    onClick={() => setTab(t.id)}
-                    role="tab"
-                    aria-selected={active}
-                    className={cn(
-                      "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-[transform,background-color,color,box-shadow] duration-150 active:scale-[0.97]",
-                      active
-                        ? "bg-brand-soft text-brand shadow-sm ring-1 ring-brand/15"
-                        : "text-muted-foreground hover:bg-accent/80 hover:text-foreground",
-                    )}
-                  >
-                    <Icon className="size-4" />
-                    {t.label}
-                  </button>
-                );
-              })}
+              <div
+                className="flex min-w-0 flex-1 flex-wrap gap-1.5"
+                role="tablist"
+                aria-label="设置分类"
+              >
+                {SETTINGS_TABS.map((t) => {
+                  const Icon = t.icon;
+                  const active = tab === t.id;
+                  return (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => setTab(t.id)}
+                      role="tab"
+                      aria-selected={active}
+                      className={cn(
+                        "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-[transform,background-color,color,box-shadow] duration-150 active:scale-[0.97]",
+                        active
+                          ? "bg-brand-soft text-brand shadow-sm ring-1 ring-brand/15"
+                          : "text-muted-foreground hover:bg-accent/80 hover:text-foreground",
+                      )}
+                    >
+                      <Icon className="size-4" />
+                      {t.label}
+                    </button>
+                  );
+                })}
+              </div>
+              {isPage && (
+                <Button
+                  size="sm"
+                  className="shrink-0"
+                  onClick={handleSave}
+                  disabled={saving || !settings || !dirty}
+                  title="保存本页全部设置"
+                >
+                  {saving ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <Save className="size-3.5" />
+                  )}
+                  保存
+                </Button>
+              )}
             </div>
             <div
+              data-testid={tab === "brain" ? "brain-settings-layout" : undefined}
               className={cn(
-                // page 模式:每个功能区各占一半,左右成对(更简洁、少占行);
-                // 窗口恒 ≥1024(minWidth),lg 断点始终生效 → 默认就是两列。
-                // modal 模式:保持单列堆叠,窄弹窗里两列会挤。
-                isPage
+                // 大脑页包含动态增长的 Runtime 配置，必须按任务纵向排列；
+                // 其他 page 标签仍用两列紧凑卡片，modal 保持单列。
+                isPage && tab === "brain"
+                  ? "flex flex-col gap-6"
+                  : isPage
                   ? "grid grid-cols-1 items-start gap-x-6 gap-y-6 lg:grid-cols-2"
                   : "space-y-6",
               )}
@@ -828,6 +1271,19 @@ export function SettingsModal({
                           )
                         }
                         placeholder="例:刘律师"
+                        className={inputCls}
+                      />
+                    </Field>
+                    <Field
+                      label="首页天气城市"
+                      hint="可选。留空自动使用系统定位；定位失败时网络粗略结果只展示，不进入 AI 问候"
+                    >
+                      <input
+                        type="text"
+                        value={settings.weather_city ?? ""}
+                        onChange={(e) => updateField("weather_city", e.target.value || null)}
+                        placeholder="例：南通"
+                        maxLength={80}
                         className={inputCls}
                       />
                     </Field>
@@ -1103,27 +1559,378 @@ export function SettingsModal({
               {/* ── 大脑:云端 AI 后端 + DeepSeek / MiniMax(切换后只显示所选后端)── */}
               {tab === "brain" && (
                 <>
-                  <Section title="AI Soul">
-                    <Field
-                      label="全局工作风格"
-                      hint="写长期偏好和协作习惯,例如回答结构、风险提示口径、默认称呼。不要写具体案件事实。"
-                    >
-                      <textarea
-                        value={settings.ai_soul_md ?? ""}
-                        onChange={(e) =>
-                          updateField("ai_soul_md", e.target.value || null)
-                        }
-                        rows={5}
-                        placeholder="例:先给结论,再列依据和风险;事实不明确时先追问;法律文书表达正式克制。"
-                        className={cn(inputCls, "min-h-[112px] resize-y leading-relaxed")}
-                      />
+                  <Section
+                    title="AI 助手运行时"
+                    desc="Runtime 负责编排模型、工具调用和流式输出；案件数据、元典、知识库、MCP 与质量检查仍由 CaseBoard 管理。"
+                  >
+                    <Field label="运行时">
+                      <select
+                        aria-label="AI 助手运行时"
+                        value={effectiveAgentRuntime(settings.agent_runtime)}
+                        onChange={(e) => void handleAgentRuntimeChange(e.target.value)}
+                        disabled={checkingPiRuntime}
+                        className={inputCls}
+                      >
+                        <option value="native">原生 Runtime（稳定）</option>
+                        <option value="pi">Pi Runtime（实验性）</option>
+                      </select>
                       <p className="mt-1 text-label text-muted-foreground">
-                        AI Soul 会注入案件 AI 助手,但优先级低于系统规则、当前问题、案件材料和工具返回。
+                        Pi 使用官方 SDK 的成熟 Agent 循环；文件权限仍由 CaseBoard 控制，并只加载下方经过确认的全局法律 Skills。
                       </p>
+                      {piRuntimeStatus && !piRuntimeStatus.available && (
+                        <p className="mt-1.5 text-xs text-red-600">
+                          ✗ {piRuntimeStatus.message ?? "当前设备无法使用 Pi Runtime"}
+                        </p>
+                      )}
                     </Field>
+
+                    {effectiveAgentRuntime(settings.agent_runtime) === "pi" && (
+                      <div className="space-y-3 text-xs">
+                        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/25 px-3 py-2.5">
+                          <div>
+                            {checkingPiRuntime ? (
+                              <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+                                <Loader2 className="size-3.5 animate-spin" /> 正在检测 Pi Runtime…
+                              </span>
+                            ) : piRuntimeStatus?.available ? (
+                              <span className="text-green-700">
+                                ✓ Pi Runtime {piRuntimeStatus.sidecar_version} · Pi SDK {piRuntimeStatus.pi_sdk_version}
+                              </span>
+                            ) : (
+                              <span className="text-red-600">
+                                ✗ {piRuntimeStatus?.message ?? "尚未检测 Pi Runtime"}
+                              </span>
+                            )}
+                          </div>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void checkPiRuntime()}
+                            disabled={checkingPiRuntime}
+                          >
+                            <RefreshCw className={cn("size-3.5", checkingPiRuntime && "animate-spin")} />
+                            检测 Pi Runtime
+                          </Button>
+                        </div>
+
+                        <div className="rounded-lg border border-border bg-muted/25 px-3 py-3">
+                          <div>
+                            <p className="font-semibold text-foreground">对话模型</p>
+                            <p className="mt-0.5 text-label text-muted-foreground">
+                              只用于案件 AI 助手与独立 AI 工作区，不接管材料导入和全案分析。
+                            </p>
+                          </div>
+                          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                          <Field label="Pi 模型提供商">
+                            <select
+                              aria-label="Pi 模型提供商"
+                              value={settings.pi_provider_id ?? ""}
+                              onChange={(event) => handlePiProviderChange(event.target.value)}
+                              disabled={piCatalogBusy || !piCatalog}
+                              className={inputCls}
+                            >
+                              <option value="">跟随现有云端配置（兼容模式）</option>
+                              {piCatalog?.providers.map((provider) => (
+                                <option key={provider.id} value={provider.id}>{provider.name}</option>
+                              ))}
+                            </select>
+                            <p className="mt-1 text-label text-muted-foreground">
+                              目录直接来自当前 Pi SDK；升级 Runtime 后会自动出现其新增的官方 provider。
+                            </p>
+                            <p className="mt-1 text-label text-brand">
+                              {settings.pi_provider_id
+                                ? "当前 AI 助手与独立 AI 工作区对话使用 Pi Provider 与 Pi 模型；凭据优先取系统凭据库，未单独配置时仅复用下方同厂商已验证成功的 Key。Pi Provider 不接管案件导入和全案分析。"
+                                : "兼容模式：Agent Loop 使用 Pi，模型请求使用下方材料处理模型的 endpoint、模型和 API Key。"}
+                            </p>
+                          </Field>
+                          <Field label="Pi 模型">
+                            <select
+                              aria-label="Pi 模型"
+                              value={settings.pi_model_id ?? ""}
+                              onChange={(event) => {
+                                updateField("pi_model_id", event.target.value || null);
+                                setPiVerifyStatus("idle");
+                                setPiVerifyMessage("");
+                              }}
+                              disabled={!settings.pi_provider_id || piCatalogBusy}
+                              className={inputCls}
+                            >
+                              {(piCatalog?.providers.find((provider) => provider.id === settings.pi_provider_id)?.models ?? [])
+                                .map((model) => (
+                                  <option key={model.id} value={model.id}>{model.name}</option>
+                                ))}
+                            </select>
+                            {settings.pi_provider_id === "openai-codex" && (
+                              <p className="mt-1 text-label text-amber-700">
+                                OpenAI Codex OAuth 是 Pi 提供的实验性兼容能力，使用你的 ChatGPT 套餐登录。
+                              </p>
+                            )}
+                          </Field>
+                          {selectedPiModel?.reasoning && selectedPiThinkingLevel && (
+                            <Field label="Pi 推理强度">
+                              <select
+                                aria-label="Pi 推理强度"
+                                value={selectedPiThinkingLevel}
+                                onChange={(event) => updatePiThinkingLevel(
+                                  event.target.value as PiThinkingLevel,
+                                )}
+                                className={inputCls}
+                              >
+                                {selectedPiThinkingLevels.map((level) => (
+                                  <option key={level} value={level}>
+                                    {PI_THINKING_LABELS[level]}
+                                  </option>
+                                ))}
+                              </select>
+                              <p className="mt-1 text-label text-muted-foreground">
+                                档位来自当前 Pi SDK 模型目录；切换模型会恢复该模型上次选择。
+                              </p>
+                            </Field>
+                          )}
+                        </div>
+
+                        {settings.pi_provider_id && (
+                          <div className="mt-3 rounded-md border border-border bg-background px-3 py-2.5">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div>
+                                <p className="font-semibold text-foreground">认证</p>
+                                <p className={cn(
+                                  "mt-0.5",
+                                  piCredentialStatus?.configured ? "text-green-700" : "text-muted-foreground",
+                                )}>
+                                  {piCredentialStatus?.configured
+                                    ? `✓ 已在系统凭据库配置 ${piCredentialStatus.credential_type === "oauth" ? "OAuth" : "API Key"}`
+                                    : "尚未在系统凭据库配置凭据"}
+                                </p>
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                {piCatalog?.providers
+                                  .find((provider) => provider.id === settings.pi_provider_id)
+                                  ?.auth_types.includes("api_key") && (
+                                  <Button type="button" size="sm" variant="outline" onClick={() => void startPiProviderAuth("api_key")} disabled={piAuthSessionId !== null}>
+                                    配置 API Key
+                                  </Button>
+                                )}
+                                {piCatalog?.providers
+                                  .find((provider) => provider.id === settings.pi_provider_id)
+                                  ?.auth_types.includes("oauth") && (
+                                  <Button type="button" size="sm" onClick={() => void startPiProviderAuth("oauth")} disabled={piAuthSessionId !== null}>
+                                    使用 {piCatalog?.providers.find((provider) => provider.id === settings.pi_provider_id)?.name ?? "Provider"} 账号登录
+                                  </Button>
+                                )}
+                                {piCredentialStatus?.configured && (
+                                  <Button type="button" size="sm" variant="outline" onClick={() => void verifySelectedPiProvider()} disabled={piAuthSessionId !== null || piVerifyStatus === "verifying"}>
+                                    {piVerifyStatus === "verifying" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+                                    验证连接
+                                  </Button>
+                                )}
+                                {piCredentialStatus?.configured && (
+                                  <Button type="button" size="sm" variant="outline" onClick={() => void removePiCredential()} disabled={piAuthSessionId !== null}>
+                                    移除凭据
+                                  </Button>
+                                )}
+                              </div>
+                            </div>
+
+                            {piAuthUrl && (
+                              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-brand/15 bg-brand-soft/35 px-3 py-2">
+                                <p className="text-xs text-foreground">
+                                  请在系统浏览器完成账号登录
+                                </p>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => void openPiAuthUrl(piAuthUrl)}
+                                >
+                                  <ExternalLink className="size-3.5" />
+                                  重新打开登录页
+                                </Button>
+                              </div>
+                            )}
+                            {piAuthEvent?.type === "prompt" && piAuthEvent.prompt_type !== "manual_code" && (
+                              <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                                {piAuthEvent.prompt_type === "select" ? (
+                                  <select value={piAuthInput} onChange={(event) => setPiAuthInput(event.target.value)} className={inputCls}>
+                                    <option value="">请选择</option>
+                                    {piAuthEvent.options?.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+                                  </select>
+                                ) : (
+                                  <input
+                                    type={piAuthEvent.prompt_type === "secret" ? "password" : "text"}
+                                    value={piAuthInput}
+                                    onChange={(event) => setPiAuthInput(event.target.value)}
+                                    placeholder={piAuthEvent.placeholder ?? piAuthEvent.message}
+                                    autoComplete="off"
+                                    className={inputCls}
+                                  />
+                                )}
+                                <Button type="button" size="sm" onClick={() => void submitPiAuthPrompt()} disabled={!piAuthInput}>提交</Button>
+                              </div>
+                            )}
+                            {piAuthEvent?.type === "prompt" && piAuthEvent.prompt_type === "manual_code" && (
+                              <details className="mt-2 rounded-md border border-border bg-background px-3 py-2">
+                                <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+                                  浏览器未自动返回？
+                                </summary>
+                                <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                                  正常情况下无需填写。只有浏览器完成登录后没有自动返回时，才粘贴完整回调地址或授权码。
+                                </p>
+                                <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                                  <input
+                                    aria-label="OAuth 回调地址"
+                                    type="text"
+                                    value={piAuthInput}
+                                    onChange={(event) => setPiAuthInput(event.target.value)}
+                                    placeholder={piAuthEvent.placeholder ?? piAuthEvent.message}
+                                    autoComplete="off"
+                                    className={inputCls}
+                                  />
+                                  <Button type="button" size="sm" onClick={() => void submitPiAuthPrompt()} disabled={!piAuthInput}>
+                                    提交回调地址
+                                  </Button>
+                                </div>
+                              </details>
+                            )}
+                            {piAuthEvent && piAuthEvent.type !== "prompt" && piAuthEvent.type !== "url" && (
+                              <div className="mt-2 space-y-2">
+                                <p className={piAuthEvent.type === "error" ? "text-red-600" : "text-muted-foreground"}>
+                                  {piAuthEvent.type === "device_code"
+                                    ? `设备码：${piAuthEvent.user_code}（请在 ${piAuthEvent.verification_uri} 完成登录）`
+                                    : piAuthEvent.type === "cancelled"
+                                        ? "认证已取消"
+                                        : piAuthEvent.type === "success"
+                                          ? "✓ 认证成功，凭据已保存到系统凭据库"
+                                          : piAuthEvent.message}
+                                </p>
+                              </div>
+                            )}
+                            {piVerifyMessage && (
+                              <p className={cn("mt-2", piVerifyStatus === "ok" ? "text-green-700" : "text-red-600")}>
+                                {piVerifyStatus === "ok" ? "✓ " : "✗ "}{piVerifyMessage}
+                              </p>
+                            )}
+                            {piAuthSessionId && piAuthSessionId !== "pending" && (
+                              <Button type="button" size="sm" variant="ghost" className="mt-2" onClick={() => void cancelPiAuth()}>
+                                取消认证
+                              </Button>
+                            )}
+                          </div>
+                        )}
+                        </div>
+
+                        <NetworkResearchSettingsCard />
+
+                        <details className="group rounded-lg border border-border bg-background px-3 py-2.5">
+                          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 font-medium text-foreground">
+                            <span>运行维护</span>
+                            <span className="font-normal text-muted-foreground">
+                              {piRuntimeStatus?.installed_version
+                                ?? piRuntimeStatus?.sidecar_version
+                                ?? "未安装"}
+                            </span>
+                          </summary>
+                          <div className="mt-3 border-t border-border pt-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="space-y-0.5 text-muted-foreground">
+                              <p>
+                                当前：{piRuntimeStatus?.installed_version
+                                  ?? piRuntimeStatus?.sidecar_version
+                                  ?? "未安装"}
+                              </p>
+                              {piUpdateInfo && (
+                                <p>
+                                  内置：{piUpdateInfo.bundled_version}
+                                  {piUpdateInfo.latest_version
+                                    ? ` · 最新：${piUpdateInfo.latest_version}`
+                                    : ""}
+                                </p>
+                              )}
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                onClick={() => void openAgentRuntimeLogDirectory()}
+                              >
+                                <FolderOpen className="size-3.5" />
+                                打开运行日志
+                              </Button>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                onClick={() => void checkPiUpdate()}
+                                disabled={piUpdateBusy !== null}
+                              >
+                                <RefreshCw className={cn("size-3.5", piUpdateBusy === "checking" && "animate-spin")} />
+                                检查更新
+                              </Button>
+                              {piUpdateInfo?.has_update && piUpdateInfo.latest_version && (
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  onClick={() => void installPiUpdate()}
+                                  disabled={piUpdateBusy !== null}
+                                >
+                                  {piUpdateBusy === "installing" ? (
+                                    <Loader2 className="size-3.5 animate-spin" />
+                                  ) : (
+                                    <Download className="size-3.5" />
+                                  )}
+                                  下载并安装
+                                </Button>
+                              )}
+                              {piRuntimeStatus?.source === "app_data" && (
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => void rollbackPiUpdate()}
+                                  disabled={piUpdateBusy !== null}
+                                >
+                                  回退到内置版本
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+
+                          {piUpdateInfo?.has_update && (
+                            <p className="mt-2 text-foreground">
+                              可更新到 {piUpdateInfo.latest_version}
+                              {piUpdateInfo.asset_size ? ` · ${formatBytes(piUpdateInfo.asset_size)}` : ""}
+                              {piUpdateInfo.notes ? ` · ${piUpdateInfo.notes}` : ""}
+                            </p>
+                          )}
+                          {piUpdateInfo?.state === "up_to_date" && (
+                            <p className="mt-2 text-green-700">✓ 当前已是已发布的最新兼容版本</p>
+                          )}
+                          {piUpdateProgress && piUpdateBusy === "installing" && (
+                            <p className="mt-2 inline-flex items-center gap-1.5 text-brand">
+                              <Loader2 className="size-3.5 animate-spin" />
+                              {piUpdateProgress.message}
+                            </p>
+                          )}
+                          {piUpdateMessage && (
+                            <p className={cn(
+                              "mt-2",
+                              piUpdateInfo?.state === "error" ? "text-red-600" : "text-muted-foreground",
+                            )}>
+                              {piUpdateMessage}
+                            </p>
+                          )}
+                          </div>
+                        </details>
+                        </div>
+                    )}
                   </Section>
 
-                  <Section title="云端 AI 后端">
+                  <Section
+                    title="材料处理模型"
+                    desc="案件导入、单份材料抽取和全案分析继续使用这里的配置；Pi Provider 只用于案件 AI 助手和独立 AI 工作区对话。两条链路分开，避免批量抽取依赖实验性 Runtime。"
+                  >
                     <Field label="提供商">
                       <select
                         value={settings.cloud_llm_backend ?? "deepseek"}
@@ -1456,10 +2263,37 @@ export function SettingsModal({
                         </Section>
                       );
                     })()}
+
+                  <div
+                    data-testid="brain-personalization-grid"
+                    className="grid grid-cols-1 items-start gap-6 lg:grid-cols-2"
+                  >
+                    <LegalSkillsCard />
+
+                    <Section title="AI Soul">
+                      <Field
+                        label="全局工作风格"
+                        hint="写长期偏好和协作习惯,例如回答结构、风险提示口径、默认称呼。不要写具体案件事实。"
+                      >
+                        <textarea
+                          value={settings.ai_soul_md ?? ""}
+                          onChange={(e) =>
+                            updateField("ai_soul_md", e.target.value || null)
+                          }
+                          rows={5}
+                          placeholder="例:先给结论,再列依据和风险;事实不明确时先追问;法律文书表达正式克制。"
+                          className={cn(inputCls, "min-h-[112px] resize-y leading-relaxed")}
+                        />
+                        <p className="mt-1 text-label text-muted-foreground">
+                          AI Soul 会注入案件 AI 助手,但优先级低于系统规则、当前问题、案件材料和工具返回。
+                        </p>
+                      </Field>
+                    </Section>
+                  </div>
                 </>
               )}
 
-              {/* ── 功能模型:硅基流动(Embedding 语义检索;留空后端默认 bge-m3 免费)──
+              {/* ── 功能模型：硅基流动（Embedding 语义检索；留空使用后端默认 bge-m3）──
                   填了才启用,否则回退关键词选材料。接口地址 / 模型不暴露。 */}
               {tab === "models" && (
               <Section
@@ -1518,7 +2352,14 @@ export function SettingsModal({
               </Section>
               )}
 
-              {/* ── 知识库:法律向量检索维护(法条+案例+企业语义索引)── */}
+              {tab === "kb" && (
+                <KbGuideCard
+                  aiMaintenanceEnabled={settings.ai_kb_maintenance_enabled === true}
+                  onAiMaintenanceChange={(value) => updateField("ai_kb_maintenance_enabled", value)}
+                />
+              )}
+
+              {/* ── 知识库:raw 正文向量检索维护 ── */}
               {tab === "kb" && (
               <KbSemanticIndexCard
                 embeddingConfigured={!!settings.embedding_api_key?.trim()}
@@ -1702,6 +2543,262 @@ function VerifyStatusIcon({ status }: { status: VerifyStatus }) {
     return <XCircle className="h-5 w-5 shrink-0 text-red-500" aria-label="验证失败" />;
   }
   return null;
+}
+
+function LegalSkillsCard() {
+  const [skills, setSkills] = useState<LegalSkillSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    skill: LegalSkillSummary;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [preview, setPreview] = useState<{ name: string; content: string } | null>(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      setSkills(await listLegalSkills());
+      setMessage(null);
+    } catch (error) {
+      setMessage(formatErr(error));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("contextmenu", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [contextMenu]);
+
+  useEffect(() => {
+    if (!preview) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPreview(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [preview]);
+
+  const importSkill = async () => {
+    const picked = await dialogOpen({
+      directory: false,
+      multiple: false,
+      title: "选择要导入的 SKILL.md",
+      filters: [{ name: "Agent Skill", extensions: ["md"] }],
+    });
+    if (typeof picked !== "string") return;
+    setBusy(true);
+    try {
+      const imported = await importLegalSkill(picked);
+      await refresh();
+      setMessage(`已导入 ${imported.name}`);
+    } catch (error) {
+      setMessage(formatErr(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeSkill = async (skill: LegalSkillSummary) => {
+    if (!skill.removable) return;
+    const confirmed = await confirmDialog(
+      `移除全局 Skill「${skill.name}」？这不会删除你最初选择的文件。`,
+      { title: "移除法律 Skill", okLabel: "移除" },
+    );
+    if (!confirmed) return;
+    setBusy(true);
+    try {
+      await removeLegalSkill(skill.name);
+      await refresh();
+      setMessage(`已移除 ${skill.name}`);
+    } catch (error) {
+      setMessage(formatErr(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const viewSkill = async (skill: LegalSkillSummary) => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const content = await readLegalSkillContent(skill.name);
+      setPreview({ name: skill.name, content });
+    } catch (error) {
+      setMessage(formatErr(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openContextMenu = (event: React.MouseEvent, skill: LegalSkillSummary) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({
+      skill,
+      x: Math.max(8, Math.min(event.clientX, window.innerWidth - 188)),
+      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 112)),
+    });
+  };
+
+  return (
+    <>
+      <Section
+        title="全局法律 Skills"
+        desc="原生与 Pi Runtime 共用；目前只支持人工导入单个纯文字 SKILL.md。"
+      >
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-xs text-muted-foreground">
+                {loading ? "正在读取…" : `已加载 ${skills.length} 个 Skills`}
+              </p>
+              <p className="mt-0.5 text-[11px] text-muted-foreground">
+                右键查看内容；已导入的 Skill 还可以删除。
+              </p>
+            </div>
+            <Button type="button" size="sm" variant="outline" onClick={() => void importSkill()} disabled={busy}>
+              {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Upload className="size-3.5" />}
+              导入 SKILL.md
+            </Button>
+          </div>
+          <div
+            role="region"
+            aria-label="法律 Skills 列表"
+            aria-busy={loading || busy}
+            className="h-[260px] overflow-y-auto overscroll-contain rounded-lg border border-border bg-background"
+          >
+            <div className="divide-y divide-border">
+              {skills.map((skill) => (
+                <div
+                  key={skill.name}
+                  data-legal-skill={skill.name}
+                  onContextMenu={(event) => openContextMenu(event, skill)}
+                  className="flex items-start gap-3 px-3 py-2.5 transition-colors hover:bg-accent/45"
+                  title="右键查看 Skill 内容"
+                >
+                  <BookText className="mt-0.5 size-4 shrink-0 text-brand" />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-xs font-medium text-foreground">{skill.name}</span>
+                      <span className="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                        {skill.source === "builtin" ? "内置" : "已导入"} · v{skill.version}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{skill.description}</p>
+                  </div>
+                </div>
+              ))}
+              {!loading && skills.length === 0 ? (
+                <p className="px-3 py-4 text-center text-xs text-muted-foreground">暂无可用 Skill</p>
+              ) : null}
+            </div>
+          </div>
+          {message ? <p className="text-xs text-muted-foreground">{message}</p> : null}
+        </div>
+      </Section>
+
+      {contextMenu ? (
+        <div
+          role="menu"
+          aria-label={`${contextMenu.skill.name} 操作`}
+          className="fixed z-[200] min-w-[180px] overflow-hidden rounded-lg border border-border bg-popover py-1 shadow-xl"
+          style={{ top: contextMenu.y, left: contextMenu.x }}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <p className="max-w-[220px] truncate px-3 py-1 text-[11px] text-muted-foreground">
+            {contextMenu.skill.name}
+          </p>
+          <button
+            type="button"
+            role="menuitem"
+            className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-foreground hover:bg-accent"
+            onClick={() => {
+              const skill = contextMenu.skill;
+              setContextMenu(null);
+              void viewSkill(skill);
+            }}
+          >
+            <Eye className="size-3.5 text-muted-foreground" />
+            查看内容
+          </button>
+          {contextMenu.skill.removable ? (
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40"
+              onClick={() => {
+                const skill = contextMenu.skill;
+                setContextMenu(null);
+                void removeSkill(skill);
+              }}
+            >
+              <Trash2 className="size-3.5" />
+              删除 Skill
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {preview ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={`查看 Skill：${preview.name}`}
+          className="fixed inset-0 z-[210] flex items-center justify-center bg-foreground/20 px-4 py-8 backdrop-blur-sm"
+          onClick={() => setPreview(null)}
+        >
+          <div
+            className="flex max-h-[82vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-border bg-card shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="flex items-center justify-between gap-3 border-b border-border px-5 py-3.5">
+              <div className="min-w-0">
+                <h2 className="truncate text-sm font-semibold text-foreground">{preview.name}</h2>
+                <p className="mt-0.5 text-xs text-muted-foreground">只读 SKILL.md</p>
+              </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label="关闭 Skill 内容"
+                onClick={() => setPreview(null)}
+              >
+                <X className="size-4" />
+              </Button>
+            </header>
+            <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words bg-muted/20 p-5 font-mono text-xs leading-relaxed text-foreground">
+              {preview.content}
+            </pre>
+          </div>
+        </div>
+      ) : null}
+    </>
+  );
 }
 
 function Section({
@@ -2652,7 +3749,7 @@ function LocalKbCard({
   return (
     <Section
       title="本地法律知识库"
-      desc="启用后,法律检索优先查本地缓存,只在缺时调元典 — 大幅省积分。"
+      desc="按 Wiki 导航 → raw 关键词 → raw 向量 → 外部数据源检索；外部完整详情写回 L1 raw。"
     >
       {/* 状态条 */}
       <div className="rounded-md border border-border bg-background p-3">

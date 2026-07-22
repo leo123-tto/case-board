@@ -1,24 +1,29 @@
 name: Build Windows
 
-# 在 Windows runner 上编译 .exe 安装器(NSIS),供 Release 分发。
-# 公开仓的 GitHub-hosted runner 免费。手动触发:
-#   gh workflow run build-windows.yml --ref main -f release_ref=v0.4.7
-# macOS 的 dmg 在本机用 scripts/release.sh 打包,这里只补 Windows 包。
+# Public source is already the sanitized free edition. This workflow checks out an exact
+# release tag, bundles the pinned Pi Runtime, installs the NSIS package, and smoke-tests it.
+# Updater signatures are generated locally after the artifact is downloaded; signing keys
+# never enter GitHub Actions.
 on:
   workflow_dispatch:
     inputs:
       release_ref:
-        description: "要构建的发布 tag，例如 v0.4.7"
+        description: "Release tag to build, for example v0.4.15"
         required: true
         type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: caseboard-windows-public
+  cancel-in-progress: false
 
 jobs:
   build-windows:
     name: Build Windows installer (.exe)
     runs-on: windows-latest
     steps:
-      # workflow 始终从 main scope 触发，以便不同 tag 复用同一份 Rust cache；
-      # 实际源码仍严格 checkout 到输入的 release tag。
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.release_ref }}
@@ -37,7 +42,6 @@ jobs:
             exit 1
           }
           git describe --tags --exact-match HEAD
-          Write-Host "building $expected at $(git rev-parse HEAD)"
 
       - uses: pnpm/action-setup@v4
         with:
@@ -48,30 +52,72 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
       - uses: dtolnay/rust-toolchain@stable
 
-      # 注意:Cargo workspace 的 target 在仓库根 target/(不在 src-tauri/target)。
+      # Cargo is a workspace, so its shared target directory is at repository root.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        shell: pwsh
+        run: |
+          pnpm install --frozen-lockfile
+          Push-Location sidecars/pi-runtime
+          bun install --frozen-lockfile --ignore-scripts
+          Pop-Location
 
-      # 应用内更新签名:私钥来自仓库 Actions secret(加密存储,fork 的 PR 拿不到)。
-      # 注入后 createUpdaterArtifacts 会为 NSIS 安装包生成同名 .sig 签名文件。
-      # 匿名使用统计:注入 anon/publishable key(低权限,只能写 usage_events;
-      # 缺失时代码里 option_env! 取不到 → 统计自动禁用)。fork 的 PR 拿不到这些 secret。
+      - name: Disable updater artifacts before local signing
+        shell: pwsh
+        run: |
+          $path = "src-tauri/tauri.conf.json"
+          $config = Get-Content $path -Raw | ConvertFrom-Json
+          $config.bundle.createUpdaterArtifacts = $false
+          $config | ConvertTo-Json -Depth 20 | Set-Content $path -Encoding utf8
+
       - name: Build Windows installer (NSIS .exe)
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          CASEBOARD_TELEMETRY_URL: ${{ secrets.CASEBOARD_TELEMETRY_URL }}
-          CASEBOARD_TELEMETRY_KEY: ${{ secrets.CASEBOARD_TELEMETRY_KEY }}
+          CASEBOARD_TELEMETRY_URL: ${{ vars.CASEBOARD_TELEMETRY_URL }}
+          CASEBOARD_TELEMETRY_KEY: ${{ vars.CASEBOARD_TELEMETRY_KEY }}
         run: pnpm tauri build --bundles nsis
 
-      # 启动期冒烟:release 是 panic=abort,启动 panic 会立即退出并把信息打到 stderr。
-      # 进程活过 12 秒(窗口/webview 已起)即认为冒烟通过。
+      - name: Verify packaged Pi Runtime
+        shell: pwsh
+        run: |
+          pnpm verify:pi-runtime-bundle --bundle-dir sidecars/pi-runtime/dist/bundle
+          $installer = Get-ChildItem target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          if (-not $installer) { Write-Error "NSIS installer not found"; exit 1 }
+          $listing = (& 7z l $installer.FullName) -join "`n"
+          foreach ($required in @(
+            "caseboard-pi-runtime.exe",
+            "runtime-metadata.json",
+            "THIRD_PARTY_NOTICES.txt"
+          )) {
+            if ($listing -notmatch [regex]::Escape($required)) {
+              Write-Error "NSIS installer is missing Pi Runtime resource: $required"
+              exit 1
+            }
+          }
+
+      - name: Install packaged app and verify Pi Runtime
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          if (-not $installer) { Write-Error "NSIS installer not found"; exit 1 }
+          $installDir = Join-Path $env:RUNNER_TEMP "caseboard-installed-pi-runtime"
+          $install = Start-Process -FilePath $installer.FullName -PassThru -Wait `
+            -ArgumentList @("/S", "/D=$installDir")
+          if ($install.ExitCode -ne 0) {
+            Write-Error "NSIS silent install failed with exit code $($install.ExitCode)"
+            exit 1
+          }
+          pnpm verify:pi-runtime-bundle `
+            --bundle-dir "$env:RUNNER_TEMP/caseboard-installed-pi-runtime/pi-runtime"
+
       - name: Smoke run (catch startup crash)
         shell: pwsh
         run: |
@@ -84,30 +130,24 @@ jobs:
           }
           $exe = $cand | Select-Object -First 1
           if (-not $exe) { Write-Error "no runnable exe found in target/release"; exit 1 }
-          Write-Host "smoke target: $exe"
           $p = Start-Process -FilePath $exe -PassThru `
                  -RedirectStandardError smoke-err.txt -RedirectStandardOutput smoke-out.txt
           Start-Sleep -Seconds 12
           if ($p.HasExited) {
-            Write-Host "==== APP EXITED EARLY (code $($p.ExitCode)) ===="
-            Write-Host "---- stderr ----"; Get-Content smoke-err.txt -ErrorAction SilentlyContinue
-            Write-Host "---- stdout ----"; Get-Content smoke-out.txt -ErrorAction SilentlyContinue
-            Write-Host "---- crash.log ----"
+            Write-Host "APP EXITED EARLY (code $($p.ExitCode))"
+            Get-Content smoke-err.txt -ErrorAction SilentlyContinue
+            Get-Content smoke-out.txt -ErrorAction SilentlyContinue
             Get-Content "$env:APPDATA/CaseBoard/data/crash.log" -ErrorAction SilentlyContinue
-            Get-ChildItem -Recurse "$env:APPDATA" -Filter crash.log -ErrorAction SilentlyContinue |
-              ForEach-Object { Write-Host "found: $($_.FullName)"; Get-Content $_.FullName }
             exit 1
-          } else {
-            Stop-Process -Id $p.Id -Force
-            Write-Host "Smoke OK — app alive after 12s"
-            Get-Content smoke-err.txt -ErrorAction SilentlyContinue | Select-Object -First 40
           }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "Smoke OK - app alive after 12s"
+          Get-Content smoke-err.txt -ErrorAction SilentlyContinue | Select-Object -First 40
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: caseboard-windows-exe
-          path: |
-            target/release/bundle/nsis/*.exe
-            target/release/bundle/nsis/*.sig
+          name: caseboard-windows-exe-${{ inputs.release_ref }}
+          path: target/release/bundle/nsis/*.exe
           if-no-files-found: error
+          retention-days: 3

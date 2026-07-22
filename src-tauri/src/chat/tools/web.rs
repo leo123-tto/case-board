@@ -20,6 +20,7 @@ const WEB_USER_AGENT: &str = concat!("CaseBoard/", env!("CARGO_PKG_VERSION"), " 
 const WEB_TIMEOUT_SECS: u64 = 15;
 const SEARCH_MAX_RESULTS: usize = 10;
 const FETCH_MAX_CHARS: usize = 60_000;
+const DUCKDUCKGO_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 
 pub struct WebSearch;
 
@@ -74,11 +75,7 @@ impl Tool for WebSearch {
             }
         }
 
-        let url = Url::parse_with_params(
-            "https://duckduckgo.com/html/",
-            &[("q", q.as_str()), ("kl", "cn-zh")],
-        )
-        .map_err(|e| ToolError::Runtime(format!("构造搜索 URL 失败:{e}")))?;
+        let url = build_duckduckgo_search_url(&q)?;
         let client = web_client()?;
         let html = client
             .get(url)
@@ -90,17 +87,36 @@ impl Tool for WebSearch {
             .text()
             .await
             .map_err(|e| ToolError::Runtime(format!("读取搜索响应失败:{e}")))?;
-        let results = extract_duckduckgo_results(&html, max_results);
-        Ok(ToolResult::plain(
-            serde_json::to_string_pretty(&json!({
-                "engine": "DuckDuckGo HTML",
-                "query": query,
-                "results": results,
-                "_note": "互联网搜索结果只作为线索。涉及法律依据、裁判口径或政策发布日期时,优先用元典/官方页面进一步核验;不得把案件隐私作为搜索词。"
-            }))
-            .unwrap_or_else(|_| "{}".into()),
-        ))
+        build_search_result(query, &html, max_results)
     }
+}
+
+fn build_duckduckgo_search_url(query: &str) -> Result<Url, ToolError> {
+    Url::parse_with_params(DUCKDUCKGO_HTML_ENDPOINT, &[("q", query), ("kl", "cn-zh")])
+        .map_err(|e| ToolError::Runtime(format!("构造搜索 URL 失败:{e}")))
+}
+
+fn build_search_result(
+    query: &str,
+    html: &str,
+    max_results: usize,
+) -> Result<ToolResult, ToolError> {
+    let results = extract_duckduckgo_results(html, max_results);
+    if results.is_empty() {
+        return Err(ToolError::Runtime(
+            "DuckDuckGo 没有返回可用结果；请停止继续联网搜索，改用本地知识库、元典或已有材料完成分析"
+                .into(),
+        ));
+    }
+    Ok(ToolResult::plain(
+        serde_json::to_string_pretty(&json!({
+            "engine": "DuckDuckGo HTML",
+            "query": query,
+            "results": results,
+            "_note": "互联网搜索结果只作为线索。需要正文时继续调用 web_fetch。涉及法律依据、裁判口径或政策发布日期时,优先用元典/官方页面进一步核验;不得把案件隐私作为搜索词。"
+        }))
+        .unwrap_or_else(|_| "{}".into()),
+    ))
 }
 
 pub struct WebFetch;
@@ -244,7 +260,7 @@ fn validate_public_http_url(raw: &str) -> Result<Url, ToolError> {
     Ok(url)
 }
 
-async fn validate_public_http_url_for_request(raw: &str) -> Result<Url, ToolError> {
+pub(crate) async fn validate_public_http_url_for_request(raw: &str) -> Result<Url, ToolError> {
     let url = validate_public_http_url(raw)?;
     ensure_url_resolves_public(&url).await?;
     Ok(url)

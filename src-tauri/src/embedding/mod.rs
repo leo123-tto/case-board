@@ -1,6 +1,6 @@
 //! Embedding 客户端(V0.3.3 · 语义检索基础设施)。
 //!
-//! OpenAI 兼容 `/embeddings` 接口 —— 硅基流动(`BAAI/bge-m3`,默认,免费,1024 维)、
+//! OpenAI 兼容 `/embeddings` 接口 —— 硅基流动（`BAAI/bge-m3`，默认，1024 维）、
 //! 智谱(`embedding-3`,2048 维)等都兼容。用户在设置填 endpoint + model + key;
 //! 留空则语义检索**禁用、回退现有关键词选材料**(AI 无感)。
 //!
@@ -14,7 +14,7 @@ pub mod index;
 use serde::Deserialize;
 use std::time::Duration;
 
-/// 默认 endpoint / model:硅基流动 bge-m3(免费)。设置留空时用这俩兜底。
+/// 默认 endpoint / model：硅基流动 bge-m3。设置留空时用这两个值兜底。
 pub const DEFAULT_ENDPOINT: &str = "https://api.siliconflow.cn/v1/embeddings";
 pub const DEFAULT_MODEL: &str = "BAAI/bge-m3";
 

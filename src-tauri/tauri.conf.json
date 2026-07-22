@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "案件看板",
-  "version": "0.4.10",
+  "version": "0.4.15",
   "identifier": "app.caseboard.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build:pi-runtime && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -44,7 +44,8 @@
     ],
     "category": "Productivity",
     "resources": {
-      "../standalone/court_filing_cli": "standalone/court_filing_cli"
+      "../standalone/court_filing_cli": "standalone/court_filing_cli",
+      "../sidecars/pi-runtime/dist/bundle": "pi-runtime"
     },
     "shortDescription": "律师案件看板",
     "longDescription": "CaseBoard 案件看板 — 律师自己在办案件的可视化看板,本地优先、不改动源文件。把文件夹里的诉讼材料一拖,关键信息自动抽出,8 档智能状态机管理案件进展,内置 5 个法律计算工具。",

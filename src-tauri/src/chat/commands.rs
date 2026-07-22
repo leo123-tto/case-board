@@ -26,19 +26,23 @@ use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::chat::agent_loop::{run_chat_with_tools, AgentLoopRequest, ToolCallRecord};
+use crate::chat::agent_loop::{AgentLoopRequest, ToolCallRecord};
+use crate::chat::artifact_intent::ArtifactIntent;
 use crate::chat::citations::{parse_with_doc_paths, Citation};
 use crate::chat::constitution::build_system_prompt_with_memory;
 use crate::chat::context::TaskType;
-use crate::chat::model_router::route_model;
+use crate::chat::model_router::route_model_with_context;
 use crate::chat::prompts::task_user_prompt;
 use crate::chat::quality_gate::{
     evaluate_task_quality, format_quality_gate_note, task_output_incomplete, QualityGateInput,
 };
+use crate::chat::runtime::{
+    run_chat_with_runtime, validate_ai_assistant_ready, AgentRuntimeKind, ChatRunControl,
+};
 use crate::chat::stream::{ChatStreamEvent, ChatUsage};
 use crate::chat::task_contract::task_contract_prompt;
 use crate::chat::tools::{ToolContext, ToolRegistry};
-use crate::db::chat::{insert_chat_message, list_chat_messages, ChatMessage, NewChatMessage};
+use crate::db::chat::{insert_chat_message, ChatMessage, NewChatMessage};
 use crate::llm::LlmConfig;
 use crate::local_kb::cache::LocalKb;
 use crate::settings::Settings;
@@ -51,20 +55,87 @@ use crate::settings::Settings;
 ///
 /// case_chat 启动时注册 oneshot::Sender,完成时移除;
 /// cancel_chat 命令通过 message_id 找到并 send(()) 触发取消。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatRunScope {
+    Case {
+        case_id: String,
+        conversation_id: String,
+    },
+    Workspace {
+        workspace_id: String,
+        conversation_id: String,
+    },
+}
+
+struct ActiveChatRun {
+    cancel: oneshot::Sender<()>,
+    steering: mpsc::UnboundedSender<String>,
+    scope: ChatRunScope,
+}
+
 #[derive(Default)]
 pub struct ChatCancelRegistry {
-    inner: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    inner: Mutex<HashMap<String, ActiveChatRun>>,
 }
 
 impl ChatCancelRegistry {
-    fn register(&self, message_id: String, sender: oneshot::Sender<()>) {
+    pub(crate) fn register(
+        &self,
+        message_id: String,
+        sender: oneshot::Sender<()>,
+        scope: ChatRunScope,
+    ) -> mpsc::UnboundedReceiver<String> {
+        let (steering, receiver) = mpsc::unbounded_channel();
         let mut guard = self.inner.lock().expect("chat cancel registry poisoned");
-        guard.insert(message_id, sender);
+        guard.insert(
+            message_id,
+            ActiveChatRun {
+                cancel: sender,
+                steering,
+                scope,
+            },
+        );
+        receiver
     }
 
-    fn take(&self, message_id: &str) -> Option<oneshot::Sender<()>> {
+    fn take(&self, message_id: &str) -> Option<ActiveChatRun> {
         let mut guard = self.inner.lock().expect("chat cancel registry poisoned");
         guard.remove(message_id)
+    }
+
+    pub(crate) fn steer(
+        &self,
+        message_id: &str,
+        scope: &ChatRunScope,
+        content: &str,
+    ) -> Result<(), String> {
+        let content = content.trim();
+        if content.is_empty() {
+            return Err("引导内容不能为空".into());
+        }
+        if content.chars().count() > 20_000 {
+            return Err("单条引导不能超过 20000 字".into());
+        }
+        let guard = self.inner.lock().map_err(|_| "AI 运行状态不可用")?;
+        let active = guard
+            .get(message_id)
+            .ok_or_else(|| "当前 AI 任务已经结束".to_string())?;
+        if &active.scope != scope {
+            return Err("引导目标与当前 AI 任务不匹配".into());
+        }
+        active
+            .steering
+            .send(content.to_string())
+            .map_err(|_| "当前 AI 任务已经结束".to_string())
+    }
+
+    pub(crate) fn cancel(&self, message_id: &str) -> bool {
+        self.take(message_id)
+            .is_some_and(|active| active.cancel.send(()).is_ok())
+    }
+
+    pub(crate) fn finish(&self, message_id: &str) {
+        let _ = self.take(message_id);
     }
 }
 
@@ -77,6 +148,7 @@ impl ChatCancelRegistry {
 pub struct CaseChatResult {
     pub user_message_id: String,
     pub assistant_message_id: String,
+    pub conversation_id: String,
     pub model: Option<String>,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
@@ -123,8 +195,13 @@ struct ChatRunFinish {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CaseChatInput {
     pub case_id: String,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
     pub user_message: String,
     pub task_type: Option<String>,
+    /// 由快捷入口或用户显式选择的全局法律 Skill；不允许 Runtime 自行安装或生成。
+    #[serde(default)]
+    pub skill_name: Option<String>,
     /// 前端事先生成的 assistant message id(=channel 名后缀)
     pub message_id: String,
     /// V0.2 D3-D4 新增:本轮引用的文档 id 列表(`AttachmentPicker` 选了几份)。
@@ -198,35 +275,43 @@ pub async fn case_chat_impl(
 ) -> Result<CaseChatResult, String> {
     let started_at = std::time::Instant::now();
     let task = TaskType::from_str_loose(input.task_type.as_deref());
+    let artifact_intent = ArtifactIntent::from_user_message(&input.user_message);
     let channel = format!("chat-stream-{}", input.message_id);
+
+    let conversation = match input.conversation_id.as_deref() {
+        Some(conversation_id) => crate::db::case_chat_conversations::get_conversation(
+            pool,
+            &input.case_id,
+            conversation_id,
+        )
+        .await
+        .map_err(|error| format!("读取对话失败: {error}"))?
+        .ok_or_else(|| "所选对话不存在或不属于当前案件".to_string())?,
+        None => crate::db::case_chat_conversations::ensure_conversation(pool, &input.case_id)
+            .await
+            .map_err(|error| format!("准备案件对话失败: {error}"))?,
+    };
+    let conversation_id = conversation.id;
 
     // ── 1. 取 settings + LlmConfig ────────────────────────────────────
     let settings: Settings = crate::settings::read_settings().unwrap_or_default();
-    // 2026-06-15:按云端后端检查对应的 key(MiniMax / DeepSeek 各自独立字段)。
-    if settings.effective_llm_provider() == "cloud" {
-        let backend = settings.effective_cloud_llm_backend();
-        // 2026-06-16:按后端取对应 key 字段(DeepSeek / MiniMax / 通用兼容 三选一)。
-        let (key_value, name): (Option<String>, &str) = if backend == "minimax" {
-            (settings.minimax_api_key.clone(), "MiniMax")
-        } else if settings.cloud_llm_is_compat() {
-            let label = crate::llm::providers::compat_preset(backend)
-                .map(|p| p.label)
-                .unwrap_or("云端 LLM");
-            (settings.effective_compat_llm_api_key(), label)
-        } else {
-            (settings.cloud_llm_api_key.clone(), "DeepSeek")
-        };
-        let key_missing = key_value.as_deref().map(str::trim).unwrap_or("").is_empty();
-        if key_missing {
-            return Err(format!("尚未配置 {} API Key,请在设置页填入", name));
-        }
-    }
+    validate_ai_assistant_ready(&settings)?;
     let mut llm_config = LlmConfig::from_settings(&settings);
 
     // ── 3. 读最近聊天历史(最近 6 对 = 12 条) ────────────────────────
-    let history_rows = list_chat_messages(pool, &input.case_id, Some(12))
-        .await
-        .map_err(|e| format!("读取聊天历史失败: {}", e))?;
+    let history_rows = crate::db::chat::list_chat_messages_in_conversation(
+        pool,
+        &input.case_id,
+        &conversation_id,
+        Some(12),
+    )
+    .await
+    .map_err(|e| format!("读取聊天历史失败: {}", e))?;
+    let previous_model = history_rows
+        .iter()
+        .rev()
+        .find(|row| row.role == "assistant")
+        .and_then(|row| row.model.clone());
     let history = clip_history_for_replay(&history_rows, 4000);
 
     // ── 4. 入库 user 消息 ────────────────────────────────────────────
@@ -242,6 +327,7 @@ pub async fn case_chat_impl(
         NewChatMessage {
             id: &user_msg_id,
             case_id: &input.case_id,
+            conversation_id: Some(&conversation_id),
             role: "user",
             content: &input.user_message,
             task_type: task.as_db_str(),
@@ -259,15 +345,31 @@ pub async fn case_chat_impl(
     )
     .await
     .map_err(|e| format!("入库 user 消息失败: {}", e))?;
+    crate::db::case_chat_conversations::touch_after_user_message(
+        pool,
+        &input.case_id,
+        &conversation_id,
+        &input.user_message,
+    )
+    .await
+    .map_err(|error| format!("更新对话状态失败: {error}"))?;
 
     // ── 5. 起 cancel channel + 注册 ───────────────────────────────────
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    registry.register(input.message_id.clone(), cancel_tx);
+    let steering_rx = registry.register(
+        input.message_id.clone(),
+        cancel_tx,
+        ChatRunScope::Case {
+            case_id: input.case_id.clone(),
+            conversation_id: conversation_id.clone(),
+        },
+    );
 
     // ── 6. 起 stream channel + 转发到 window ──────────────────────────
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatStreamEvent>();
     let app_for_emit = app.clone();
     let channel_for_emit = channel.clone();
+    let diagnostics_request_id = input.message_id.clone();
     // 边转发边累积 delta 文本:出错时拿它落库当 partial,避免前端"全消失"。
     let forward = tokio::spawn(async move {
         let mut streamed = String::new();
@@ -275,13 +377,20 @@ pub async fn case_chat_impl(
             if let ChatStreamEvent::Delta { text } = &ev {
                 streamed.push_str(text);
             }
+            if let ChatStreamEvent::Activity { activity } = &ev {
+                crate::chat::diagnostics::append_runtime_activity(
+                    "case",
+                    &diagnostics_request_id,
+                    activity,
+                );
+            }
             let _ = app_for_emit.emit(&channel_for_emit, ev);
         }
         streamed
     });
 
     // ── 7. 拼 user_prompt(固定任务前缀 + 用户原话) ──────────────────
-    let user_message_final = match task_user_prompt(task) {
+    let mut user_message_final = match task_user_prompt(task) {
         Some(template) => {
             if input.user_message.trim().is_empty() {
                 template.to_string()
@@ -295,12 +404,20 @@ pub async fn case_chat_impl(
         }
         None => input.user_message.clone(),
     };
+    let research_requirement =
+        crate::chat::policy::explicit_research_requirement(&input.user_message);
 
     // V0.2 D4-D5.D · 用 model_router 替换硬编码 temperature/max_tokens
     // V0.3 · model_router 统一读 cloud_llm_model 档位(全局 flash/pro 或 auto 自动挡);
     // 把选中的模型回写进 llm_config,**agent_loop 和 stream 两条路径都用同一个模型**(不再分叉)。
     // ⚠️ 只在云端档覆盖:本地档(ollama)的 model 是本机模型名,绝不能被 DeepSeek 档位名覆盖。
-    let choice = route_model(task, &input.user_message, &settings);
+    let choice = route_model_with_context(
+        task,
+        &input.user_message,
+        &history,
+        previous_model.as_deref(),
+        &settings,
+    );
     if settings.effective_llm_provider() == "cloud" {
         llm_config.model = choice.model.clone();
     }
@@ -324,6 +441,7 @@ pub async fn case_chat_impl(
             crate::db::chat_tasks::NewChatTask {
                 id: &tid,
                 case_id: &input.case_id,
+                conversation_id: Some(&conversation_id),
                 message_id: &input.message_id,
                 task_type: task_type_for_chat,
                 status: "executing",
@@ -381,8 +499,18 @@ pub async fn case_chat_impl(
         &case_memories,
     );
     constitution_prompt.push_str(&task_contract_prompt(task));
+    constitution_prompt.push_str(artifact_intent.prompt_contract());
+    let runtime = AgentRuntimeKind::from_settings(&settings);
+    if runtime == AgentRuntimeKind::Native {
+        constitution_prompt.push_str(&crate::chat::skills::native_prompt(
+            input.skill_name.as_deref(),
+        )?);
+    } else if let Some(skill_name) = input.skill_name.as_deref() {
+        crate::chat::skills::resolve(skill_name)?;
+        user_message_final = format!("/skill:{skill_name} {user_message_final}");
+    }
 
-    let registry_tools = ToolRegistry::default_v0_2();
+    let registry_tools = ToolRegistry::for_current_credentials();
     // V0.3.6 · 外部 MCP server(白名单,默认空 = 零开销零变化)。连/列失败的 server 跳过+dlog,不拖垮 chat。
     // 连接生命周期绑本次调用:registry_tools(持 Arc<McpClient>)在本函数末尾 drop → 子进程被 kill_on_drop 杀。
     let registry_tools = if settings.mcp_servers.is_empty() {
@@ -391,6 +519,13 @@ pub async fn case_chat_impl(
         let mcp_tools = crate::chat::mcp_bridge::connect_mcp_servers(&settings.mcp_servers).await;
         registry_tools.with_mcp(mcp_tools)
     };
+    constitution_prompt.push_str(&crate::chat::constitution::research_route_prompt(
+        &registry_tools.registered_tool_names(),
+    ));
+    constitution_prompt.push_str(&crate::chat::policy::explicit_research_prompt(
+        research_requirement,
+        &registry_tools.registered_tool_names(),
+    ));
     let local_kb = LocalKb::auto_detect(&settings);
     let ctx = ToolContext {
         pool,
@@ -419,24 +554,39 @@ pub async fn case_chat_impl(
         // thinking 模型不支持 tool_choice="required"(DeepSeek 400),降级 auto;详 resolve_tool_choice。
         tool_choice: resolve_tool_choice(task.needs_tools(), &choice.model).into(),
         case_doc_paths_for_citation_check: case_doc_paths_for_citation_check.clone(),
+        loop_guard_config: None,
+        emit_turn_progress: false,
+        tool_call_budget_config: None,
     };
-    let result: Result<ChatRunFinish, String> =
-        run_chat_with_tools(&llm_config, agent_req, &registry_tools, ctx, tx, cancel_rx)
-            .await
-            .map(|out| ChatRunFinish {
-                content_cleaned: out.content_cleaned,
-                citations: out.citations,
-                tool_calls: out.tool_trace,
-                usage: out.usage,
-                metrics: Some(out.metrics),
-                ask_user: out.ask_user,
-            })
-            .map_err(|e| e.to_string());
+    crate::chat::policy::register_active_route(&input.message_id, research_requirement);
+    let result: Result<ChatRunFinish, String> = run_chat_with_runtime(
+        runtime,
+        &llm_config,
+        agent_req,
+        &registry_tools,
+        ctx,
+        tx,
+        ChatRunControl {
+            cancel: cancel_rx,
+            steering: steering_rx,
+        },
+    )
+    .await
+    .map(|out| ChatRunFinish {
+        content_cleaned: out.content_cleaned,
+        citations: out.citations,
+        tool_calls: out.tool_trace,
+        usage: out.usage,
+        metrics: Some(out.metrics),
+        ask_user: out.ask_user,
+    })
+    .map_err(|e| e.to_string());
+    crate::chat::policy::clear_active_route(&input.message_id);
 
     // 等 forward 把 channel 排空,拿回已流式产出的文本(出错时当 partial 落库)
     let streamed_partial = forward.await.unwrap_or_default();
     // 无论成败,清掉 registry(注册的 sender 可能已被消费,这里兜底)
-    let _ = registry.take(&input.message_id);
+    registry.finish(&input.message_id);
 
     let latency_ms = started_at.elapsed().as_millis() as u64;
 
@@ -464,41 +614,38 @@ pub async fn case_chat_impl(
             // V0.2 D6.5 · 入 chat_messages.content 用 cleaned(剥掉 <CITATIONS> 块);
             // artifact 落盘也用 cleaned,防止 .md 文件里残留 JSON 引用块。
             let mut assistant_content = content_cleaned;
+            let explicit_research_unmet = ask_user.as_ref().is_none_or(|items| items.is_empty())
+                && crate::chat::policy::research_requirement_unmet(
+                    research_requirement,
+                    &final_tool_calls,
+                );
             let output_incomplete = ask_user.as_ref().is_none_or(|items| items.is_empty())
-                && task_output_incomplete(task, &assistant_content);
-            // ── 9. 决定是否落 artifact ──────────────────────────────
-            let mut artifact_doc_id = if let Some(task_str) = task.as_db_str() {
-                if !output_incomplete && assistant_content.chars().count() >= 1500 {
-                    match write_chat_artifact(
-                        pool,
-                        &input.case_id,
-                        &assistant_id,
-                        task_str,
-                        &assistant_content,
-                    )
-                    .await
-                    {
-                        Ok(doc_id) => Some(doc_id),
-                        Err(e) => {
-                            crate::dlog!("[chat] artifact 写盘失败: {}", e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
+                && (task_output_incomplete(task, &assistant_content) || explicit_research_unmet);
             // V0.3 D2 · save_artifact(自由聊天起草文书)写的是独立 document,不走上面 task-based
             // 路径,artifact_doc_id 仍为 None。这里补:本轮有成功的 save_artifact 工具调用时,
             // 取该案最新 chat_artifact 文档 id 回传 → 前端据此**自动进 Milkdown 编辑器打开**。
             // (MVP 一轮至多一个 save_artifact,最新即本轮所产;多个时取最新也合理。)
+            let mut artifact_doc_id = None;
+            let mut artifact_persistence_error = None;
+            if let Some(id) = final_tool_calls.iter().rev().find_map(|call| {
+                (call.success
+                    && matches!(
+                        call.tool.as_str(),
+                        "write_workspace_file" | "rename_workspace_file"
+                    ))
+                .then(|| call.args.get("document_id")?.as_str().map(str::to_string))
+                .flatten()
+            }) {
+                artifact_doc_id = Some(id);
+            }
             if artifact_doc_id.is_none()
-                && final_tool_calls
-                    .iter()
-                    .any(|t| t.tool == "save_artifact" && t.success)
+                && final_tool_calls.iter().any(|t| {
+                    t.success
+                        && matches!(
+                            t.tool.as_str(),
+                            "save_artifact" | "create_workspace_file" | "copy_workspace_file"
+                        )
+                })
             {
                 match sqlx::query_scalar::<_, String>(
                     "SELECT id FROM documents \
@@ -511,7 +658,53 @@ pub async fn case_chat_impl(
                 {
                     Ok(Some(id)) => artifact_doc_id = Some(id),
                     Ok(None) => {}
-                    Err(e) => crate::dlog!("[chat] 查 save_artifact doc_id 失败: {}", e),
+                    Err(e) => crate::dlog!("[chat] 查工作区 artifact doc_id 失败: {}", e),
+                }
+            }
+
+            // 固定任务保留既有自动落盘；若模型已经成功保存，则不再制造重复文件。
+            if artifact_doc_id.is_none() {
+                if let Some(task_str) = task.as_db_str() {
+                    if !output_incomplete && assistant_content.chars().count() >= 1500 {
+                        match write_chat_artifact(
+                            pool,
+                            &input.case_id,
+                            &assistant_id,
+                            task_str,
+                            &assistant_content,
+                        )
+                        .await
+                        {
+                            Ok(doc_id) => artifact_doc_id = Some(doc_id),
+                            Err(e) => crate::dlog!("[chat] artifact 写盘失败: {}", e),
+                        }
+                    }
+                }
+            }
+
+            // 用户明确要求“保存下来”时，宿主层验证真实 artifact。模型忘记调用工具也会
+            // 把完整最终 Markdown 兜底保存；追问、空正文和不完整输出绝不误存。
+            if artifact_intent.should_create_fallback(
+                ask_user.as_ref().is_some_and(|items| !items.is_empty()),
+                output_incomplete,
+                &assistant_content,
+                artifact_doc_id.as_deref(),
+            ) {
+                match write_chat_artifact(
+                    pool,
+                    &input.case_id,
+                    &assistant_id,
+                    "requested_report",
+                    &assistant_content,
+                )
+                .await
+                {
+                    Ok(doc_id) => artifact_doc_id = Some(doc_id),
+                    Err(e) => {
+                        crate::dlog!("[chat] 用户请求的报告兜底保存失败: {}", e);
+                        artifact_persistence_error =
+                            Some("报告正文已生成，但保存到工作区失败，请重试保存。".to_string());
+                    }
                 }
             }
 
@@ -522,7 +715,7 @@ pub async fn case_chat_impl(
                 );
             }
 
-            let quality_report = evaluate_task_quality(QualityGateInput {
+            let mut quality_report = evaluate_task_quality(QualityGateInput {
                 task,
                 content: &assistant_content,
                 citations: &final_citations,
@@ -530,10 +723,26 @@ pub async fn case_chat_impl(
                 ask_user_present: ask_user.as_ref().is_some_and(|items| !items.is_empty()),
                 artifact_doc_id: artifact_doc_id.as_deref(),
             });
+            crate::chat::policy::enforce_research_requirement(
+                &mut quality_report,
+                research_requirement,
+                &final_tool_calls,
+            );
             let incomplete_error = quality_report
                 .incomplete
-                .then(|| "模拟对抗未生成完整终稿；已保留过程内容，请重试本任务。".to_string());
-            let quality_note = format_quality_gate_note(&quality_report);
+                .then(|| {
+                    quality_report.warnings.first().cloned().unwrap_or_else(|| {
+                        "本轮任务未形成可核验的完整结果；已保留过程内容，请重试。".into()
+                    })
+                })
+                .or(artifact_persistence_error);
+            let mut quality_note = format_quality_gate_note(&quality_report);
+            if incomplete_error
+                .as_deref()
+                .is_some_and(|message| message.contains("保存到工作区失败"))
+            {
+                quality_note.push_str("\n\n> 保存提示：报告正文已生成，但没有成功写入工作区；系统未将本轮标记为完成。");
+            }
             if !quality_note.is_empty() {
                 assistant_content.push_str(&quality_note);
                 let _ = app.emit(&channel, ChatStreamEvent::Delta { text: quality_note });
@@ -582,6 +791,7 @@ pub async fn case_chat_impl(
                 NewChatMessage {
                     id: &assistant_id,
                     case_id: &input.case_id,
+                    conversation_id: Some(&conversation_id),
                     role: "assistant",
                     content: &assistant_content,
                     task_type: task.as_db_str(),
@@ -624,6 +834,7 @@ pub async fn case_chat_impl(
             Ok(CaseChatResult {
                 user_message_id: user_msg_id,
                 assistant_message_id: assistant_id,
+                conversation_id: conversation_id.clone(),
                 model: Some(usage.model),
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
@@ -640,6 +851,15 @@ pub async fn case_chat_impl(
         Err(err) => {
             // 出错也要 emit Error 给前端
             let msg = err.to_string();
+            let cancelled = msg.contains("用户取消") || msg.to_lowercase().contains("cancel");
+            crate::chat::diagnostics::append_runtime_terminal(
+                "case",
+                &input.message_id,
+                runtime.as_str(),
+                cancelled,
+                latency_ms,
+                crate::chat::diagnostics::runtime_error_category(&msg),
+            );
             let _ = app.emit(
                 &channel,
                 ChatStreamEvent::Error {
@@ -651,12 +871,7 @@ pub async fn case_chat_impl(
             // V0.2 D6.5 · chat_task 收尾标 failed / cancelled
             if let Some(tid) = &chat_task_id {
                 // 「用户取消」走 cancelled,其他走 failed(便于前端区分展示)
-                let terminal = if msg.contains("用户取消") || msg.to_lowercase().contains("cancel")
-                {
-                    "cancelled"
-                } else {
-                    "failed"
-                };
+                let terminal = if cancelled { "cancelled" } else { "failed" };
                 let _ = crate::db::chat_tasks::finish_chat_task(
                     pool,
                     tid,
@@ -674,6 +889,7 @@ pub async fn case_chat_impl(
                 NewChatMessage {
                     id: &assistant_id,
                     case_id: &input.case_id,
+                    conversation_id: Some(&conversation_id),
                     role: "assistant",
                     content: &streamed_partial,
                     task_type: task.as_db_str(),
@@ -699,21 +915,76 @@ pub async fn case_chat_impl(
 pub async fn list_chat_history_impl(
     pool: &SqlitePool,
     case_id: &str,
+    conversation_id: Option<&str>,
     limit: Option<i64>,
 ) -> Result<Vec<ChatMessage>, String> {
-    list_chat_messages(pool, case_id, limit)
+    let conversation = match conversation_id {
+        Some(conversation_id) => {
+            crate::db::case_chat_conversations::get_conversation(pool, case_id, conversation_id)
+                .await
+                .map_err(|error| format!("读取对话失败: {error}"))?
+                .ok_or_else(|| "所选对话不存在或不属于当前案件".to_string())?
+        }
+        None => crate::db::case_chat_conversations::ensure_conversation(pool, case_id)
+            .await
+            .map_err(|error| format!("准备案件对话失败: {error}"))?,
+    };
+    crate::db::chat::list_chat_messages_in_conversation(pool, case_id, &conversation.id, limit)
         .await
         .map_err(|e| format!("读取聊天历史失败: {}", e))
 }
 
 /// 取消进行中的 chat。`message_id` 必须跟 case_chat 入参一致(=channel 后缀)。
 pub fn cancel_chat_impl(registry: &ChatCancelRegistry, message_id: &str) -> bool {
-    if let Some(sender) = registry.take(message_id) {
-        let _ = sender.send(());
-        true
-    } else {
-        false
-    }
+    registry.cancel(message_id)
+}
+
+pub async fn steer_case_chat_impl(
+    pool: &SqlitePool,
+    registry: &ChatCancelRegistry,
+    message_id: &str,
+    case_id: &str,
+    conversation_id: &str,
+    content: &str,
+) -> Result<String, String> {
+    let scope = ChatRunScope::Case {
+        case_id: case_id.to_string(),
+        conversation_id: conversation_id.to_string(),
+    };
+    registry.steer(message_id, &scope, content)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    insert_chat_message(
+        pool,
+        NewChatMessage {
+            id: &id,
+            case_id,
+            conversation_id: Some(conversation_id),
+            role: "user",
+            content: content.trim(),
+            task_type: Some("steering"),
+            model: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: None,
+            based_on: None,
+            artifact_doc_id: None,
+            error_short: None,
+            attached_doc_ids: None,
+            citations_json: None,
+            task_id: None,
+        },
+    )
+    .await
+    .map_err(|error| format!("保存引导消息失败: {error}"))?;
+    crate::db::case_chat_conversations::touch_after_user_message(
+        pool,
+        case_id,
+        conversation_id,
+        content.trim(),
+    )
+    .await
+    .map_err(|error| format!("更新对话状态失败: {error}"))?;
+    Ok(id)
 }
 
 /// 清空某案件下所有聊天记录(用户主动)。
@@ -721,6 +992,20 @@ pub async fn clear_chat_history_impl(pool: &SqlitePool, case_id: &str) -> Result
     crate::db::chat::delete_chat_history_for_case(pool, case_id)
         .await
         .map_err(|e| format!("清空聊天记录失败: {}", e))
+}
+
+pub async fn clear_chat_conversation_impl(
+    pool: &SqlitePool,
+    case_id: &str,
+    conversation_id: &str,
+) -> Result<u64, String> {
+    crate::db::case_chat_conversations::get_conversation(pool, case_id, conversation_id)
+        .await
+        .map_err(|error| format!("读取对话失败: {error}"))?
+        .ok_or_else(|| "所选对话不存在或不属于当前案件".to_string())?;
+    crate::db::chat::delete_chat_history_for_conversation(pool, case_id, conversation_id)
+        .await
+        .map_err(|error| format!("清空当前对话失败: {error}"))
 }
 
 // =============================================================================
@@ -885,6 +1170,7 @@ fn artifact_display_name(task_type: &str) -> &'static str {
         "find_similar_cases" => "类案检索",
         "verify_my_draft" => "草稿核校",
         "simulate_opposition" => "模拟对抗",
+        "requested_report" => "AI报告",
         _ => "AI助手",
     }
 }

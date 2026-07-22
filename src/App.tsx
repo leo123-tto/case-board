@@ -178,6 +178,10 @@ function MainApp() {
    */
   // string 而非 ModuleId:私人专属顶层 tab(「独立」)的 id 由接缝动态提供,开源仓为空。
   const [activeModule, setActiveModule] = useState<string>("litigation");
+  /** 首页「写材料」深链；普通点击顶部非诉 tab 时仍落在非诉功能卡片页。 */
+  const [transactionInitialTool, setTransactionInitialTool] = useState<
+    "ai_workspace" | null
+  >(null);
   /**
    * F2(2026-06-18):刚导入案件的 id —— 用来「识别为刑事案件后自动切到刑事 tab」。
    * 刑事案件被 civilCases 过滤掉,导入后若不切 tab 会在诉讼 tab「看不见」;但导入瞬间
@@ -466,26 +470,30 @@ function MainApp() {
     issues.push(...primaryOcrIssues(s));
     {
       // 2026-06-15/16:按云端后端校验对应的 key,与后端 effective_cloud_llm_backend 三选一对齐
-      // (minimax / 通用兼容 glm·mimo·custom / 其余回落 DeepSeek)。各后端 key 字段独立。
+      // (minimax / 通用兼容 glm·mimo·kimi·custom / 其余回落 DeepSeek)。各后端 key 字段独立。
       const backend = s.cloud_llm_backend ?? "deepseek";
       const isMinimax = backend === "minimax";
-      const isCompat = ["glm", "mimo", "custom"].includes(backend);
+      const isCompat = ["glm", "mimo", "kimi", "custom"].includes(backend);
       const compatKey =
         backend === "glm"
           ? s.glm_llm_api_key || s.compat_llm_api_key
           : backend === "mimo"
             ? s.mimo_llm_api_key || s.compat_llm_api_key
-            : backend === "custom"
-              ? s.custom_llm_api_key || s.compat_llm_api_key
-              : s.compat_llm_api_key;
+            : backend === "kimi"
+              ? s.kimi_llm_api_key || s.compat_llm_api_key
+              : backend === "custom"
+                ? s.custom_llm_api_key || s.compat_llm_api_key
+                : s.compat_llm_api_key;
       const compatVerifiedAt =
         backend === "glm"
           ? s.glm_llm_verified_at || s.compat_llm_verified_at
           : backend === "mimo"
             ? s.mimo_llm_verified_at || s.compat_llm_verified_at
-            : backend === "custom"
-              ? s.custom_llm_verified_at || s.compat_llm_verified_at
-              : s.compat_llm_verified_at;
+            : backend === "kimi"
+              ? s.kimi_llm_verified_at || s.compat_llm_verified_at
+              : backend === "custom"
+                ? s.custom_llm_verified_at || s.compat_llm_verified_at
+                : s.compat_llm_verified_at;
       const filled = isMinimax
         ? !!s.minimax_api_key?.trim()
         : isCompat
@@ -499,9 +507,19 @@ function MainApp() {
       const providerName = isMinimax
         ? "MiniMax"
         : isCompat
-          ? { glm: "智谱 GLM", mimo: "小米 MiMo", custom: "自定义模型" }[backend] ??
+          ? { glm: "智谱 GLM", mimo: "小米 MiMo", kimi: "Kimi", custom: "自定义模型" }[backend] ??
             "云端模型"
           : "DeepSeek";
+      if (backend === "custom") {
+        const customEndpoint = s.custom_llm_endpoint || s.compat_llm_endpoint;
+        const customModel = s.custom_llm_model || s.compat_llm_model;
+        if (!customEndpoint?.trim()) {
+          issues.push({ label: "自定义模型接口地址", reason: "missing" });
+        }
+        if (!customModel?.trim()) {
+          issues.push({ label: "自定义模型名称", reason: "missing" });
+        }
+      }
       const label = `${providerName} API Key(云端 LLM)`;
       if (!filled) {
         issues.push({ label, reason: "missing" });
@@ -517,7 +535,7 @@ function MainApp() {
       );
       // toast(z-200 在设置面板之上,不会被盖住)+ 自动打开设置面板引导补填
       toast(
-        `无法导入:${lines.join(";")}。已为你打开设置,填好并验证后再导入。`,
+        `无法导入:${lines.join(";")}。已为你打开「设置 → 大脑 → 材料处理模型」，填好并验证后再导入。`,
         "error",
         7000,
       );
@@ -1131,6 +1149,10 @@ function MainApp() {
       setViewerDoc(event.sourceDoc);
     }
   };
+  const openAiWorkspaceFromHome = () => {
+    setTransactionInitialTool("ai_workspace");
+    void setActiveModuleSafe("transaction");
+  };
   const goHome = () => {
     setView("home");
   };
@@ -1193,6 +1215,7 @@ function MainApp() {
           onPickCase={pickCaseFromHome}
           onOpenEvent={openHomeEvent}
           onImport={handleImport}
+          onOpenAiWorkspace={openAiWorkspaceFromHome}
           onDeleteCase={handleDeleteCaseById}
           onDeleteCases={handleDeleteCases}
           onCaseStatusChanged={handleCaseStatusChanged}
@@ -1244,6 +1267,7 @@ function MainApp() {
           onPickCase={pickCase}
           onOpenEvent={openHomeEvent}
           onImport={handleImport}
+          onOpenAiWorkspace={openAiWorkspaceFromHome}
           onDeleteCase={handleDeleteCaseById}
           onDeleteCases={handleDeleteCases}
           onCaseStatusChanged={handleCaseStatusChanged}
@@ -1257,7 +1281,10 @@ function MainApp() {
       {/* 顶部三模块 tab(诉讼 / 非诉 / 工具)+ 左侧首页按钮 + 右侧 DeepSeek 余额 */}
       <ModuleTabs
         active={activeModule}
-        onSwitch={setActiveModuleSafe}
+        onSwitch={(target) => {
+          setTransactionInitialTool(null);
+          void setActiveModuleSafe(target);
+        }}
         onGoHome={() => {
           setActiveModuleSafe("litigation");
           setView("home");
@@ -1283,7 +1310,9 @@ function MainApp() {
             }}
           />
         )}
-        {activeModule === "transaction" && <TransactionModule />}
+        {activeModule === "transaction" && (
+          <TransactionModule initialTool={transactionInitialTool} />
+        )}
         {activeModule === "tools" && (
           <ToolsModule
             initialTool={toolsRoute.tool}

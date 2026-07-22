@@ -5,7 +5,7 @@
 //! (`TaskType::VerifyMyDraft` 或用户直接要求);防幻觉平时靠"必查现行版本"+ `<CITATIONS>`。
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::{require_str, yuandian_key, Tool, ToolContext, ToolError, ToolResult};
 use crate::yuandian;
@@ -21,16 +21,7 @@ impl Tool for VerifyLegalCitations {
         include_str!("descriptions/verify_legal_citations.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "要校验的文本,含法规/案号引用。建议 <4000 字,长文本拆段分多次调"
-                }
-            },
-            "required": ["text"]
-        })
+        super::yuandian_schema::hall_detect()
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {

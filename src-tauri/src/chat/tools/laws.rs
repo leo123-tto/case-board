@@ -1,7 +1,7 @@
 //! 法规法条 5 个 tool(V0.2 D2-D3.B)。
 //!
 //! 全部走三段式:`try_kb_hit` → 调元典 `yuandian::*` → `save_and_wrap`。
-//! 走 KB cache(法规法条永不过期,本地命中等于免费)。
+//! 走 KB cache(仅复用通过现行法源时效门禁的法规法条,本地命中等于免费)。
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -12,6 +12,275 @@ use super::{
     ToolContext, ToolError, ToolResult,
 };
 use crate::yuandian;
+
+fn inactive_source_from_response(
+    query_type: &str,
+    response: &Value,
+) -> Option<crate::local_kb::validity::InactiveLegalSourceInfo> {
+    crate::local_kb::validity::sanitize_yuandian_legal_response(query_type, response.clone())
+        .inactive_sources
+        .into_iter()
+        .next()
+}
+
+fn cached_inactive_source(
+    ctx: &ToolContext<'_>,
+    query_type: &str,
+    cache_params: &Value,
+) -> Option<crate::local_kb::validity::InactiveLegalSourceInfo> {
+    if crate::local_kb::validity::historical_research_requested(query_type, cache_params) {
+        return None;
+    }
+    if crate::chat::policy::requires_direct_yuandian(ctx.message_id) {
+        return None;
+    }
+    let kb = ctx.local_kb?;
+    let raw = kb.load_raw_response(query_type, cache_params).or_else(|| {
+        let key = cache_params.get("key")?.as_str()?;
+        cache_params
+            .get("refer_date")
+            .and_then(Value::as_str)
+            .is_some_and(str::is_empty)
+            .then(|| kb.load_raw_response(query_type, &json!({"key": key})))
+            .flatten()
+    })?;
+    let parsed = serde_json::from_str::<Value>(&raw).ok()?;
+    let validated = crate::yuandian::validate_business_response(parsed).ok()?;
+    inactive_source_from_response(query_type, &validated)
+}
+
+fn replacement_query(source_name: &str) -> String {
+    format!("{source_name} 现行修订版 替代法律法规")
+}
+
+fn legal_search_has_usable_result(query_type: &str, response: &Value) -> bool {
+    match query_type {
+        "rh_ft_search" | "rh_fg_search" => response
+            .get("data")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+        "law_vector_search" => ["/extra/fatiao", "/data/extra/fatiao"]
+            .iter()
+            .any(|pointer| {
+                response
+                    .pointer(pointer)
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| !items.is_empty())
+            }),
+        _ => false,
+    }
+}
+
+fn should_apply_local_first(query_type: &str, cache_params: &Value) -> bool {
+    !crate::local_kb::validity::historical_research_requested(query_type, cache_params)
+}
+
+fn inactive_replacement_result(
+    source: &crate::local_kb::validity::InactiveLegalSourceInfo,
+    base_credits: u32,
+    search_status: &str,
+    search_payload: Value,
+    kb_hit: bool,
+) -> ToolResult {
+    ToolResult {
+        content: serde_json::to_string_pretty(&json!({
+            "status": "inactive_source_rejected",
+            "usable_as_authority": false,
+            "rejected_source": {
+                "name": source.name,
+                "validity": source.status,
+                "content_omitted": true
+            },
+            "replacement_search": {
+                "status": search_status,
+                "query": replacement_query(&source.name),
+                "result": search_payload
+            },
+            "_note": "该法规已失效、废止或尚未生效，不得引用、写入报告或知识库。仅可使用替代检索返回的现行有效法源；没有可用结果时必须如实说明未找到。"
+        }))
+        .unwrap_or_else(|_| "失效法规已拒绝；替代检索结果无法序列化。".into()),
+        yuandian_credits_used: base_credits,
+        kb_hit,
+    }
+}
+
+async fn search_replacement_for_inactive_source(
+    ctx: &ToolContext<'_>,
+    source: crate::local_kb::validity::InactiveLegalSourceInfo,
+    base_credits: u32,
+) -> ToolResult {
+    let query = replacement_query(&source.name);
+    if !crate::chat::policy::requires_direct_yuandian(ctx.message_id) {
+        let local = crate::local_kb::retrieval::retrieve_local(
+            ctx.local_kb,
+            ctx.settings,
+            crate::local_kb::retrieval::RetrievalDomain::Law,
+            &query,
+        )
+        .await;
+        if let Ok(report) = local {
+            if report.is_sufficient() {
+                return inactive_replacement_result(
+                    &source,
+                    base_credits,
+                    "local_current_law_found",
+                    serde_json::to_value(report).unwrap_or(Value::Null),
+                    base_credits == 0,
+                );
+            }
+        }
+    }
+
+    let Ok(api_key) = yuandian_key(ctx) else {
+        return inactive_replacement_result(
+            &source,
+            base_credits,
+            "external_search_not_executed",
+            json!({"reason": "未配置元典 API key，本地也未找到足够可靠的现行替代法源"}),
+            false,
+        );
+    };
+    if let Err(error) = ensure_yuandian_budget(ctx, base_credits.saturating_add(10)).await {
+        return inactive_replacement_result(
+            &source,
+            base_credits,
+            "external_search_not_executed",
+            json!({"reason": error.to_string()}),
+            false,
+        );
+    }
+    let params = yuandian::LawVectorSearchParams {
+        query: query.clone(),
+        rewrite_flag: Some(true),
+        validities: Some(vec!["现行有效".into()]),
+        effect_levels: None,
+        return_num: Some(30),
+        effect_level: None,
+        valid_only: None,
+        implement_date_start: None,
+        implement_date_end: None,
+        top_k: None,
+    };
+    match yuandian::law_vector_search(api_key, &params).await {
+        Ok(response) => {
+            let cache_params = serde_json::to_value(&params).unwrap_or_else(|_| {
+                json!({
+                    "query": query,
+                    "validities": ["现行有效"]
+                })
+            });
+            let replacement =
+                save_and_wrap(ctx, "law_vector_search", &cache_params, &query, response);
+            let payload = serde_json::from_str(&replacement.content)
+                .unwrap_or_else(|_| json!({"raw_result": replacement.content}));
+            let mut result = inactive_replacement_result(
+                &source,
+                base_credits.saturating_add(replacement.yuandian_credits_used),
+                "external_current_law_search_completed",
+                payload,
+                false,
+            );
+            result.kb_hit = replacement.kb_hit && base_credits == 0;
+            result
+        }
+        Err(error) => inactive_replacement_result(
+            &source,
+            base_credits,
+            "external_search_failed",
+            json!({"reason": error.to_string()}),
+            false,
+        ),
+    }
+}
+
+fn opt_string_array(args: &Value, key: &str) -> Result<Option<Vec<String>>, ToolError> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let values = value
+        .as_array()
+        .ok_or_else(|| ToolError::InvalidArgs(format!("{key} 必须是字符串数组")))?;
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let text = value
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| ToolError::InvalidArgs(format!("{key} 只能包含非空字符串")))?;
+        out.push(text.to_string());
+    }
+    Ok((!out.is_empty()).then_some(out))
+}
+
+fn ft_search_params_from_args(args: &Value) -> Result<yuandian::FtSearchParams, ToolError> {
+    Ok(yuandian::FtSearchParams {
+        keyword: require_str(args, "keyword")?.to_string(),
+        search_mode: opt_str(args, "search_mode").map(String::from),
+        fgmc: opt_str(args, "fgmc").map(String::from),
+        effect_level: opt_str(args, "xljb_1").map(String::from),
+        region: opt_str(args, "dy").map(String::from),
+        validity: opt_str(args, "sxx")
+            .map(String::from)
+            .or_else(|| Some("现行有效".into())),
+        publisher: opt_str(args, "fbbm").map(String::from),
+        valid_only: None,
+        top_k: Some(opt_u32(args, "top_k").unwrap_or(20)),
+        publish_date_start: opt_str(args, "fbrq_start").map(String::from),
+        publish_date_end: opt_str(args, "fbrq_end").map(String::from),
+        implement_date_start: opt_str(args, "ssrq_start").map(String::from),
+        implement_date_end: opt_str(args, "ssrq_end").map(String::from),
+    })
+}
+
+fn fg_search_params_from_args(args: &Value) -> Result<yuandian::FgSearchParams, ToolError> {
+    let keyword = opt_str(args, "keyword").map(String::from);
+    let fgmc = opt_str(args, "fgmc").map(String::from);
+    if keyword.is_none() && fgmc.is_none() {
+        return Err(ToolError::InvalidArgs(
+            "keyword 跟 fgmc 至少填一个,纯过滤无关键词易返回过宽".into(),
+        ));
+    }
+    Ok(yuandian::FgSearchParams {
+        keyword,
+        search_mode: opt_str(args, "search_mode").map(String::from),
+        fgmc,
+        effect_level: opt_str(args, "xljb_1").map(String::from),
+        region: opt_str(args, "dy").map(String::from),
+        validity: opt_str(args, "sxx")
+            .map(String::from)
+            .or_else(|| Some("现行有效".into())),
+        publisher: opt_str(args, "fbbm").map(String::from),
+        valid_only: None,
+        top_k: Some(opt_u32(args, "top_k").unwrap_or(20)),
+        publish_date_start: opt_str(args, "fbrq_start").map(String::from),
+        publish_date_end: opt_str(args, "fbrq_end").map(String::from),
+        implement_date_start: opt_str(args, "ssrq_start").map(String::from),
+        implement_date_end: opt_str(args, "ssrq_end").map(String::from),
+    })
+}
+
+fn law_vector_params_from_args(args: &Value) -> Result<yuandian::LawVectorSearchParams, ToolError> {
+    let filter = match args.get("fatiao_filter") {
+        None | Some(Value::Null) => Value::Null,
+        Some(Value::Object(filter)) => Value::Object(filter.clone()),
+        Some(_) => return Err(ToolError::InvalidArgs("fatiao_filter 必须是对象".into())),
+    };
+    Ok(yuandian::LawVectorSearchParams {
+        query: require_str(args, "query")?.to_string(),
+        rewrite_flag: opt_bool(args, "rewrite_flag"),
+        validities: opt_string_array(&filter, "sxx")?.or_else(|| Some(vec!["现行有效".into()])),
+        effect_levels: opt_string_array(&filter, "effect1")?,
+        return_num: Some(opt_u32(args, "return_num").unwrap_or(45)),
+        effect_level: None,
+        valid_only: None,
+        implement_date_start: opt_str(&filter, "law_start").map(String::from),
+        implement_date_end: opt_str(&filter, "law_end").map(String::from),
+        top_k: None,
+    })
+}
 
 pub struct SearchLaws;
 
@@ -24,55 +293,49 @@ impl Tool for SearchLaws {
         include_str!("descriptions/search_laws.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "keyword": {"type": "string", "description": "中文关键词,如「合同解除」「违约金」"},
-                "effect_level": {"type": "string", "description": "枚举:宪法|法律|行政法规|地方性法规|司法解释"},
-                "region": {"type": "string", "description": "省级地方法规过滤,如「江苏省」"},
-                "top_k": {"type": "integer", "description": "默认 20,最大 50"}
-            },
-            "required": ["keyword"]
-        })
+        super::yuandian_schema::law_keyword_search(true)
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
-        // D5-6:refer_date 只用于按条/按法规取详情(detail),ft_search 没有这个字段;
-        // 不再在 search_laws schema 暴露一个会被忽略的参数(避免误导 LLM)。
-        let keyword = require_str(args, "keyword")?;
-        let effect_level = opt_str(args, "effect_level").map(String::from);
-        let region = opt_str(args, "region").map(String::from);
-        let top_k = opt_u32(args, "top_k");
-
-        let cache_params = json!({
-            "keyword": keyword,
-            "effect_level": effect_level.clone(),
-            "region": region.clone(),
-            "top_k": top_k.unwrap_or(20)
-        });
+        let params = ft_search_params_from_args(args)?;
+        let keyword = params.keyword.clone();
+        let cache_params = serde_json::to_value(&params)
+            .map_err(|error| ToolError::Runtime(format!("法条检索缓存参数序列化失败:{error}")))?;
         if let Some(r) = try_kb_hit(ctx, "rh_ft_search", &cache_params) {
             return Ok(r);
         }
+        if should_apply_local_first("rh_ft_search", &cache_params) {
+            if let crate::chat::retrieval_policy::ExternalGateDecision::UseLocal(result) =
+                crate::chat::retrieval_policy::local_first_gate(
+                    ctx,
+                    crate::local_kb::retrieval::RetrievalDomain::Law,
+                    &keyword,
+                )
+                .await?
+            {
+                return Ok(result);
+            }
+        }
 
         let api_key = yuandian_key(ctx)?;
-        let params = yuandian::FtSearchParams {
-            keyword: keyword.to_string(),
-            fgmc: None,
-            effect_level,
-            region,
-            valid_only: None,
-            top_k,
-            publish_date_start: None,
-            publish_date_end: None,
-            implement_date_start: None,
-            implement_date_end: None,
-        };
         let resp = yuandian::ft_search(api_key, &params).await?;
+        if !crate::local_kb::validity::historical_research_requested("rh_ft_search", &cache_params)
+        {
+            let gated = crate::local_kb::validity::sanitize_yuandian_legal_response(
+                "rh_ft_search",
+                resp.clone(),
+            );
+            if !legal_search_has_usable_result("rh_ft_search", &gated.value) {
+                if let Some(inactive) = gated.inactive_sources.into_iter().next() {
+                    return Ok(search_replacement_for_inactive_source(ctx, inactive, 10).await);
+                }
+            }
+        }
         Ok(save_and_wrap(
             ctx,
             "rh_ft_search",
             &cache_params,
-            keyword,
+            &keyword,
             resp,
         ))
     }
@@ -89,16 +352,7 @@ impl Tool for GetLawArticle {
         include_str!("descriptions/get_law_article.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "元典法条 ID(优先填)"},
-                "fgmc": {"type": "string", "description": "法规名(配 ftnum 用)"},
-                "ftnum": {"type": "string", "description": "条号,纯数字字符串"},
-                "fgid": {"type": "string", "description": "元典法规 ID(从 search_laws / law_vector_search 结果的 fgid 字段透传)。填了它 + ftnum 就走整部法规全文缓存,大幅省积分;同一法规后续条文 0 积分命中"},
-                "refer_date": {"type": "string", "description": "YYYY-MM-DD,时点版本"}
-            }
-        })
+        super::yuandian_schema::law_article_detail()
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
@@ -118,7 +372,8 @@ impl Tool for GetLawArticle {
         }
         // local-first 第一层：已知法规名+条号时，先在主库整部法规里精确抽条。
         // refer_date 是历史时点查询，不能拿未核版本的当前本地副本冒充，故仅当前版本走此路。
-        if refer_date.is_none() {
+        let direct_yuandian = crate::chat::policy::requires_direct_yuandian(ctx.message_id);
+        if !direct_yuandian && refer_date.is_none() {
             if let (Some(kb), Some(fgmc), Some(ftnum)) =
                 (ctx.local_kb, fgmc.as_deref(), ftnum.as_deref())
             {
@@ -139,20 +394,17 @@ impl Tool for GetLawArticle {
             }
         }
 
-        // 有 fgid 时按 ID 下载整部法规；没有 fgid 但法规名明确时直接按法规名下载整部。
-        // 当前官方计费：法规详情 5 分/次、法条详情 1 分/次。默认整部入库是长期复用策略；
-        // 若整部接口/抽条失败，再降级单条接口，绝不编造。
-        if let (Some(fgid), Some(ftnum)) = (fgid.as_deref(), ftnum.as_deref()) {
-            if let Some(r) =
-                try_fulltext_article(ctx, Some(fgid), None, ftnum, refer_date.as_deref()).await?
-            {
-                return Ok(r);
-            }
-        } else if let (Some(fgmc), Some(ftnum)) = (fgmc.as_deref(), ftnum.as_deref()) {
-            if let Some(r) =
-                try_fulltext_article(ctx, None, Some(fgmc), ftnum, refer_date.as_deref()).await?
-            {
-                return Ok(r);
+        // 有 fgid 时按 ID 下载整部法规；没有 fgid 时先在下方用单条详情解析精确版本 ID，
+        // 再按该 ID 拉整部。当前官方计费：法规详情 5 分/次、法条详情 1 分/次。
+        // 默认整部入库是长期复用策略；整部接口/抽条失败时仍保留单条结果，绝不编造。
+        if !direct_yuandian {
+            if let (Some(fgid), Some(ftnum)) = (fgid.as_deref(), ftnum.as_deref()) {
+                if let Some(r) =
+                    try_fulltext_article(ctx, Some(fgid), None, ftnum, refer_date.as_deref())
+                        .await?
+                {
+                    return Ok(r);
+                }
             }
         }
         let cache_key = id.clone().unwrap_or_else(|| {
@@ -166,18 +418,49 @@ impl Tool for GetLawArticle {
             "key": cache_key,
             "refer_date": refer_date.as_deref().unwrap_or("")
         });
+        let historical =
+            crate::local_kb::validity::historical_research_requested("rh_ft_detail", &cache_params);
+        if let Some(inactive) = cached_inactive_source(ctx, "rh_ft_detail", &cache_params) {
+            return Ok(search_replacement_for_inactive_source(ctx, inactive, 0).await);
+        }
         if let Some(r) = try_kb_hit(ctx, "rh_ft_detail", &cache_params) {
             return Ok(r);
         }
         let api_key = yuandian_key(ctx)?;
         ensure_yuandian_budget(ctx, 1).await?;
         let params = yuandian::FtDetailParams {
-            id,
-            fgmc,
-            ftnum,
-            refer_date,
+            id: id.clone(),
+            fgmc: fgmc.clone(),
+            ftnum: ftnum.clone(),
+            refer_date: refer_date.clone(),
         };
         let resp = yuandian::ft_detail(api_key, &params).await?;
+        if !historical {
+            if let Some(inactive) = inactive_source_from_response("rh_ft_detail", &resp) {
+                return Ok(search_replacement_for_inactive_source(ctx, inactive, 1).await);
+            }
+        }
+        // 没有 fgid 时先用 1 分单条详情解析出精确法规版本 ID，再按该 ID 拉整部法规。
+        // 绝不按法规名盲拉全文（同名不同修订版可能条号错位）。首条最多 1+5 分，
+        // 整部正式入库后，同一法规后续所有条文均为 0 分本地抽取。
+        if !direct_yuandian {
+            if let (Some(resolved_fgid), Some(ftnum)) =
+                (fgid_from_law_detail(&resp), ftnum.as_deref())
+            {
+                if let Some(mut full) = try_fulltext_article(
+                    ctx,
+                    Some(&resolved_fgid),
+                    None,
+                    ftnum,
+                    refer_date.as_deref(),
+                )
+                .await?
+                {
+                    full.yuandian_credits_used = full.yuandian_credits_used.saturating_add(1);
+                    return Ok(full);
+                }
+            }
+        }
         Ok(save_and_wrap(
             ctx,
             "rh_ft_detail",
@@ -186,6 +469,15 @@ impl Tool for GetLawArticle {
             resp,
         ))
     }
+}
+
+fn fgid_from_law_detail(resp: &Value) -> Option<String> {
+    resp.pointer("/data/fgid")
+        .or_else(|| resp.pointer("/data/lst/0/fgid"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
 }
 
 /// V0.2.2 · 法规全文路径:按 `fgid`(法规 ID,保证版本正确)拿整部法规全文,从中按条号提取单条。
@@ -220,14 +512,8 @@ async fn try_fulltext_article(
         });
         body.and_then(|s| serde_json::from_str(&s).ok())
     });
-    let (resp, hit) = match cached {
-        Some(j) => {
-            // 旧缓存首次复用时顺手按新 legal-kb 模板收口主库，不调 API。
-            if let Some(kb) = ctx.local_kb {
-                let _ = crate::local_kb::ingest::ingest_regulation_detail(kb, &j);
-            }
-            (j, true)
-        }
+    let (mut resp, hit) = match cached {
+        Some(j) => (j, true),
         None => {
             // 2) 未命中 → 按 fgid 拉整部法规全文(版本正确),顺手缓存供后续 0 积分命中
             let Ok(api_key) = yuandian_key(ctx) else {
@@ -240,23 +526,36 @@ async fn try_fulltext_article(
                 refer_date: refer_date.map(String::from),
             };
             match yuandian::fg_detail(api_key, &params).await {
-                Ok(r) => {
-                    // P1:这条「拉整部法规全文进缓存」是老板最看重的省积分路径,原来只 save_raw_response
-                    // 写了裸 .raw.json(无 .md 无索引、成了隐身孤儿,review 时最像可删垃圾)。改走
-                    // persist_detail:写可读命名全文 MD + 索引 + sidecar,跟 save_and_wrap 详情类一致。
-                    // 空全文(无 content)则不写(目录卫生)。
-                    if let Some(kb) = ctx.local_kb {
-                        if !super::response_is_empty("rh_fg_detail", &r) {
-                            let body = serde_json::to_string_pretty(&r).unwrap_or_default();
-                            super::persist_detail(kb, "rh_fg_detail", &fg_params, &r, &body);
-                        }
-                    }
-                    (r, false)
-                }
+                Ok(r) => (r, false),
                 Err(_) => return Ok(None), // 拉全文失败 → 降级单条
             }
         }
     };
+    let historical =
+        crate::local_kb::validity::historical_research_requested("rh_fg_detail", &fg_params);
+    if historical {
+        resp =
+            crate::local_kb::validity::legal_response_for_request("rh_fg_detail", &fg_params, resp)
+                .value;
+    }
+    if !historical {
+        if let Some(inactive) = inactive_source_from_response("rh_fg_detail", &resp) {
+            let base_credits = if hit { 0 } else { 5 };
+            return Ok(Some(
+                search_replacement_for_inactive_source(ctx, inactive, base_credits).await,
+            ));
+        }
+    }
+    if let Some(kb) = ctx.local_kb {
+        if hit {
+            // 旧缓存首次复用时顺手按新 legal-kb 模板收口主库，不调 API。
+            let _ = crate::local_kb::ingest::ingest_regulation_detail(kb, &resp);
+        } else if !super::response_is_empty("rh_fg_detail", &resp) {
+            // 新取全文先通过时效门禁，再写可读详情、sidecar 与主库 L1。
+            let body = serde_json::to_string_pretty(&resp).unwrap_or_default();
+            super::persist_detail(kb, "rh_fg_detail", &fg_params, &resp, &body);
+        }
+    }
     // 3) 从全文按条号提取单条
     let Some(content) = resp.pointer("/data/content").and_then(|v| v.as_str()) else {
         return Ok(None);
@@ -275,12 +574,24 @@ async fn try_fulltext_article(
                 .and_then(|v| v.as_str())
                 .or(fgid)
                 .unwrap_or("");
-            let wrapped = json!({
+            let mut wrapped = json!({
                 "fgmc": fgmc,
                 "fgid": resolved_fgid,
                 "ftnum": ftnum,
                 "content": article,
             });
+            if historical {
+                wrapped["validity"] = resp
+                    .pointer("/data/sxx")
+                    .cloned()
+                    .unwrap_or(Value::String("历史时点版本".into()));
+                wrapped["_caseboard_validity_context"] = json!({
+                    "mode": "historical_research_only",
+                    "usable_as_current_authority": false,
+                    "effective_date_must_be_verified": true,
+                    "note": "该条文来自用户明确指定的历史时点，仅供历史适用法研究，不得表述为现行有效依据。"
+                });
+            }
             Ok(Some(ToolResult {
                 content: serde_json::to_string_pretty(&wrapped).unwrap_or(article),
                 yuandian_credits_used: if hit { 0 } else { 5 },
@@ -361,6 +672,9 @@ fn find_local_law_article(
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
+        if crate::local_kb::validity::is_inactive_regulation_text(&text) {
+            continue;
+        }
         let Some(article) = super::law_fulltext::extract_article(&text, article_no) else {
             continue;
         };
@@ -398,65 +712,47 @@ impl Tool for SearchRegulations {
         include_str!("descriptions/search_regulations.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "keyword": {"type": "string"},
-                "fgmc": {"type": "string", "description": "法规名模糊匹配"},
-                "effect_level": {"type": "string"},
-                "region": {"type": "string"},
-                "valid_only": {"type": "boolean", "description": "默认 true"},
-                "publish_date_start": {"type": "string", "description": "YYYY-MM-DD"},
-                "publish_date_end": {"type": "string", "description": "YYYY-MM-DD"},
-                "top_k": {"type": "integer", "description": "默认 20"}
-            }
-        })
+        super::yuandian_schema::law_keyword_search(false)
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
-        let keyword = opt_str(args, "keyword").map(String::from);
-        let fgmc = opt_str(args, "fgmc").map(String::from);
-        if keyword.is_none() && fgmc.is_none() {
-            return Err(ToolError::InvalidArgs(
-                "keyword 跟 fgmc 至少填一个,纯过滤无关键词易返回过宽".into(),
-            ));
-        }
-        let effect_level = opt_str(args, "effect_level").map(String::from);
-        let region = opt_str(args, "region").map(String::from);
-        let valid_only = opt_bool(args, "valid_only");
-        let publish_date_start = opt_str(args, "publish_date_start").map(String::from);
-        let publish_date_end = opt_str(args, "publish_date_end").map(String::from);
-        let top_k = opt_u32(args, "top_k");
-
-        let cache_params = json!({
-            "keyword": keyword.clone().unwrap_or_default(),
-            "fgmc": fgmc.clone().unwrap_or_default(),
-            "effect_level": effect_level.clone(),
-            "region": region.clone(),
-            "valid_only": valid_only.unwrap_or(true),
-            "publish_date_start": publish_date_start.clone(),
-            "publish_date_end": publish_date_end.clone(),
-            "top_k": top_k.unwrap_or(20),
-        });
+        let params = fg_search_params_from_args(args)?;
+        let keyword = params.keyword.clone();
+        let fgmc = params.fgmc.clone();
+        let cache_params = serde_json::to_value(&params)
+            .map_err(|error| ToolError::Runtime(format!("法规检索缓存参数序列化失败:{error}")))?;
         if let Some(r) = try_kb_hit(ctx, "rh_fg_search", &cache_params) {
             return Ok(r);
         }
 
+        let summary = keyword.clone().or(fgmc.clone()).unwrap_or_default();
+        if should_apply_local_first("rh_fg_search", &cache_params) {
+            if let crate::chat::retrieval_policy::ExternalGateDecision::UseLocal(result) =
+                crate::chat::retrieval_policy::local_first_gate(
+                    ctx,
+                    crate::local_kb::retrieval::RetrievalDomain::Law,
+                    &summary,
+                )
+                .await?
+            {
+                return Ok(result);
+            }
+        }
+
         let api_key = yuandian_key(ctx)?;
-        let params = yuandian::FgSearchParams {
-            keyword: keyword.clone(),
-            fgmc: fgmc.clone(),
-            effect_level,
-            region,
-            valid_only,
-            top_k,
-            publish_date_start,
-            publish_date_end,
-            implement_date_start: None,
-            implement_date_end: None,
-        };
         let resp = yuandian::fg_search(api_key, &params).await?;
-        let summary = keyword.or(fgmc).unwrap_or_default();
+        if !crate::local_kb::validity::historical_research_requested("rh_fg_search", &cache_params)
+        {
+            let gated = crate::local_kb::validity::sanitize_yuandian_legal_response(
+                "rh_fg_search",
+                resp.clone(),
+            );
+            if !legal_search_has_usable_result("rh_fg_search", &gated.value) {
+                if let Some(inactive) = gated.inactive_sources.into_iter().next() {
+                    return Ok(search_replacement_for_inactive_source(ctx, inactive, 10).await);
+                }
+            }
+        }
         Ok(save_and_wrap(
             ctx,
             "rh_fg_search",
@@ -478,15 +774,7 @@ impl Tool for GetRegulationDetail {
         include_str!("descriptions/get_regulation_detail.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "元典法规 ID(优先填)"},
-                "fgmc": {"type": "string", "description": "法规全名"},
-                "refer_date": {"type": "string", "description": "YYYY-MM-DD"},
-                "full": {"type": "boolean", "description": "默认 false:只回法规元信息 + 正文预览(整部已缓存本地,具体条文请用 get_law_article(fgid+ftnum) 取单条,省上下文)。仅当用户明确要整部全文(如导出全文)才填 true"}
-            }
-        })
+        super::yuandian_schema::regulation_detail()
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
@@ -495,8 +783,6 @@ impl Tool for GetRegulationDetail {
         if id.is_none() && fgmc.is_none() {
             return Err(ToolError::InvalidArgs("需要填 id 或 fgmc 二选一".into()));
         }
-        // full=false(默认):不把整部全文喂主上下文,只回元信息+预览,引导走 get_law_article 取单条。
-        let full = opt_bool(args, "full").unwrap_or(false);
         let cache_key = id
             .clone()
             .unwrap_or_else(|| fgmc.clone().unwrap_or_default());
@@ -505,10 +791,13 @@ impl Tool for GetRegulationDetail {
             "key": cache_key,
             "refer_date": refer_date.as_deref().unwrap_or("")
         });
+        let historical =
+            crate::local_kb::validity::historical_research_requested("rh_fg_detail", &cache_params);
+        if let Some(inactive) = cached_inactive_source(ctx, "rh_fg_detail", &cache_params) {
+            return Ok(search_replacement_for_inactive_source(ctx, inactive, 0).await);
+        }
         if let Some(mut r) = try_kb_hit(ctx, "rh_fg_detail", &cache_params) {
-            if !full {
-                r.content = slim_regulation_for_llm(&r.content);
-            }
+            r.content = regulation_detail_for_llm(&r.content);
             return Ok(r);
         }
         let api_key = yuandian_key(ctx)?;
@@ -519,54 +808,20 @@ impl Tool for GetRegulationDetail {
             refer_date,
         };
         let resp = yuandian::fg_detail(api_key, &params).await?;
-        // 整部仍缓存本地(供 get_law_article 按条提取);喂 LLM 默认精简。
-        let mut r = save_and_wrap(ctx, "rh_fg_detail", &cache_params, &cache_key, resp);
-        if !full {
-            r.content = slim_regulation_for_llm(&r.content);
+        if !historical {
+            if let Some(inactive) = inactive_source_from_response("rh_fg_detail", &resp) {
+                return Ok(search_replacement_for_inactive_source(ctx, inactive, 5).await);
+            }
         }
+        let mut r = save_and_wrap(ctx, "rh_fg_detail", &cache_params, &cache_key, resp);
+        r.content = regulation_detail_for_llm(&r.content);
         Ok(r)
     }
 }
 
-/// 把整部法规详情精简成「喂 LLM 的元信息 + 正文预览」(不喂整部全文)。
-/// 解析失败兜底返回原文。供 get_regulation_detail 默认路径用;整部仍缓存本地。
-fn slim_regulation_for_llm(full_json: &str) -> String {
-    let Ok(v) = serde_json::from_str::<Value>(full_json) else {
-        return full_json.to_string();
-    };
-    let data = v.get("data");
-    let content = data
-        .and_then(|d| d.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-    let preview: String = content.chars().take(400).collect();
-    let truncated = content.chars().count() > 400;
-    let mut m = serde_json::Map::new();
-    // 保留 content 以外的元信息(法规名 / fgid / 发布实施日期 / 效力级别等)
-    if let Some(obj) = data.and_then(|d| d.as_object()) {
-        for (k, val) in obj {
-            if k != "content" {
-                m.insert(k.clone(), val.clone());
-            }
-        }
-    }
-    m.insert(
-        "正文预览".into(),
-        Value::String(if truncated {
-            format!("{preview}……")
-        } else {
-            preview
-        }),
-    );
-    m.insert(
-        "_note".into(),
-        Value::String(
-            "整部法规已缓存本地。**要具体某条全文,用 get_law_article(fgid+ftnum) 取单条**(省上下文);\
-             确需整部全文(如给用户导出)再调 get_regulation_detail(full=true)。"
-                .into(),
-        ),
-    );
-    serde_json::to_string_pretty(&Value::Object(m)).unwrap_or_else(|_| full_json.to_string())
+/// 元典付费详情不做二次裁剪；缓存命中与新请求都把完整响应交给模型。
+fn regulation_detail_for_llm(full_json: &str) -> String {
+    full_json.to_string()
 }
 
 pub struct LawVectorSearch;
@@ -580,43 +835,51 @@ impl Tool for LawVectorSearch {
         include_str!("descriptions/law_vector_search.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "自然语言描述,不是关键词"},
-                "effect_level": {"type": "string"},
-                "valid_only": {"type": "boolean", "description": "默认 true"},
-                "top_k": {"type": "integer", "description": "默认 10"}
-            },
-            "required": ["query"]
-        })
+        super::yuandian_schema::law_vector_search()
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
-        let query = require_str(args, "query")?;
-        let effect_level = opt_str(args, "effect_level").map(String::from);
-        let valid_only = opt_bool(args, "valid_only");
-        let top_k = opt_u32(args, "top_k");
-
-        let cache_params = json!({"query": query, "top_k": top_k.unwrap_or(10)});
+        let params = law_vector_params_from_args(args)?;
+        let query = params.query.clone();
+        let cache_params = serde_json::to_value(&params).map_err(|error| {
+            ToolError::Runtime(format!("法规语义检索缓存参数序列化失败:{error}"))
+        })?;
         if let Some(r) = try_kb_hit(ctx, "law_vector_search", &cache_params) {
             return Ok(r);
         }
+        if should_apply_local_first("law_vector_search", &cache_params) {
+            if let crate::chat::retrieval_policy::ExternalGateDecision::UseLocal(result) =
+                crate::chat::retrieval_policy::local_first_gate(
+                    ctx,
+                    crate::local_kb::retrieval::RetrievalDomain::Law,
+                    &query,
+                )
+                .await?
+            {
+                return Ok(result);
+            }
+        }
         let api_key = yuandian_key(ctx)?;
-        let params = yuandian::LawVectorSearchParams {
-            query: query.to_string(),
-            effect_level,
-            valid_only,
-            implement_date_start: None,
-            implement_date_end: None,
-            top_k,
-        };
         let resp = yuandian::law_vector_search(api_key, &params).await?;
+        if !crate::local_kb::validity::historical_research_requested(
+            "law_vector_search",
+            &cache_params,
+        ) {
+            let gated = crate::local_kb::validity::sanitize_yuandian_legal_response(
+                "law_vector_search",
+                resp.clone(),
+            );
+            if !legal_search_has_usable_result("law_vector_search", &gated.value) {
+                if let Some(inactive) = gated.inactive_sources.into_iter().next() {
+                    return Ok(search_replacement_for_inactive_source(ctx, inactive, 10).await);
+                }
+            }
+        }
         Ok(save_and_wrap(
             ctx,
             "law_vector_search",
             &cache_params,
-            query,
+            &query,
             resp,
         ))
     }

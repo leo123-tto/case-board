@@ -22,6 +22,7 @@ use tauri::{AppHandle, Emitter};
 use crate::db::documents::Document;
 use crate::ingest::extractor::{extract_one, ExtractResult};
 use crate::ingest::ocr::OcrContext;
+use crate::ingest::ocr_throttle::{global_submit_throttle, might_hit_mineru, SubmitThrottle};
 use crate::llm;
 use crate::settings;
 
@@ -34,13 +35,6 @@ const ROUND_CONCURRENCY: [usize; 3] = [8, 4, 1];
 
 /// 每轮之间的缓冲 sleep(秒),给服务端限流计数器恢复
 const INTER_ROUND_SLEEP_SEC: u64 = 3;
-
-/// MinerU "提交任务"接口最小间隔(毫秒)
-///
-/// 官网限流:**50 文件/分钟**(提交任务接口共用频控,详见 docs/MinerU精准解析API使用整理.md 第 12 节)。
-/// 1400ms 间隔 = ~43 次/分钟,留 7 次 buffer 避免撞顶。
-/// 节流只对**云端 OCR**生效(本机 vision / pdftotext / textutil 不消耗配额)。
-const SUBMIT_MIN_INTERVAL_MS: u64 = 1400;
 
 /// 全应用同一时间只跑一个案件级抽取管线。案内仍按 8→4→1 并发，所以百份材料不会退化成
 /// 单文件串行；这里防止用户在多个案件连续点击刷新/重试后形成 N×8 并发、进度事件互相覆盖。
@@ -132,71 +126,6 @@ pub fn cancel_case_extraction(case_id: &str) -> usize {
             1usize
         })
         .sum()
-}
-
-/// 真正跨案件、跨重试轮次共享的 MinerU 提交节流器。
-static GLOBAL_SUBMIT_THROTTLE: OnceLock<SubmitThrottle> = OnceLock::new();
-
-fn global_submit_throttle() -> &'static SubmitThrottle {
-    GLOBAL_SUBMIT_THROTTLE.get_or_init(SubmitThrottle::new)
-}
-
-/// 全局节流闸门 —— 控制 MinerU API 提交频率,避开 50 文件/分钟限流。
-///
-/// 跨所有 buffer_unordered task 共享(Arc 包裹),跨三轮重试也共享。
-/// 实现:Mutex 保护 last_submit 时间戳,acquire 时计算需要等多久,
-/// 释放锁后 sleep,再回去更新时间戳(避免持锁 sleep 串行化所有 task)。
-pub struct SubmitThrottle {
-    last_submit: tokio::sync::Mutex<std::time::Instant>,
-    min_interval: Duration,
-}
-
-impl Default for SubmitThrottle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SubmitThrottle {
-    pub fn new() -> Self {
-        Self {
-            // 初始化"60 秒前",首次 acquire 不等
-            last_submit: tokio::sync::Mutex::new(
-                std::time::Instant::now() - Duration::from_secs(60),
-            ),
-            min_interval: Duration::from_millis(SUBMIT_MIN_INTERVAL_MS),
-        }
-    }
-
-    pub async fn acquire(&self) {
-        loop {
-            let mut last = self.last_submit.lock().await;
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(*last);
-            if elapsed >= self.min_interval {
-                *last = now;
-                return;
-            }
-            let wait = self.min_interval - elapsed;
-            drop(last); // 关键:释放锁再 sleep,允许别的 task 排队
-            tokio::time::sleep(wait).await;
-        }
-    }
-}
-
-/// 判断这个文件名是否会触发**云端 OCR / 文档解析提交**(走 MinerU API)。
-///
-/// PDF / 图片 / office 文档(doc/rtf/odt/ppt/xls,2026-06-16 起统一走 MinerU 云端解析)
-/// **且** cloud_enabled 时才占 MinerU 配额。docx / txt / md / html 走原生解析 / 直接读,
-/// 不消耗 MinerU 配额,不必节流。
-///
-/// 注意:PDF 可能 pdf-inspector 直抽成功无需 OCR fallback,这种情况节流是"误打"——
-/// 多 sleep 1.4s 而已,可接受(简化判断,避免在调度层重复 PDF 文本探测)。
-fn might_hit_mineru(filename: &str) -> bool {
-    let f = filename.to_lowercase();
-    f.ends_with(".pdf")
-        || super::extractor::is_ocr_image_ext(&f)
-        || super::extractor::is_office_cloud_ext(&f)
 }
 
 /// 进度事件 payload,emit 给前端的 "extraction_progress" 事件。
@@ -438,6 +367,9 @@ pub async fn trigger_reextract(
     doc_id: &str,
     ocr_backend_override: Option<&str>,
 ) -> Result<String, String> {
+    let settings = settings::read_settings()
+        .map_err(|error| format!("无法读取 AI 配置：{error}。请前往「设置 → 大脑」检查配置。"))?;
+    settings.validate_material_llm_ready()?;
     crate::db::documents::reset_for_reextract(pool, doc_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -528,6 +460,16 @@ async fn run_extraction(
 
     // 2026-05-23 晚六:OCR 和 LLM 独立维度 — 先读 settings 再 emit Started(便于前端显示后端)
     let user_settings = settings::read_settings().unwrap_or_default();
+    if let Err(error) = user_settings.validate_material_llm_ready() {
+        let _ = app.emit(
+            "extraction_progress",
+            ProgressEvent::Error {
+                case_id: case_id.to_string(),
+                error,
+            },
+        );
+        return Ok(());
+    }
     let llm_config = llm::LlmConfig::from_settings(&user_settings);
     let cloud_ocr = user_settings.effective_ocr_provider() == "cloud";
     let ocr_ctx = OcrContext {

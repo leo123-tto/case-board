@@ -1,5 +1,5 @@
 #!/bin/bash
-# CaseBoard public macOS release builder · 2026-07-10
+# CaseBoard public macOS release builder · 2026-07-22
 #
 # 统一产出 Apple Silicon / Intel macOS 的 dmg + updater 包。
 #
@@ -66,6 +66,12 @@ fi
 DMG_PATH="$BUNDLE_ROOT/dmg/案件看板_${VERSION}_${FILE_ARCH}.dmg"
 APP_PATH="$BUNDLE_ROOT/macos/案件看板.app"
 UPDATER_PATH="$BUNDLE_ROOT/macos/案件看板.app.tar.gz"
+
+echo
+echo "▶ 验证安装包内置 Pi Runtime"
+pnpm verify:pi-runtime-bundle \
+  --bundle-dir "$APP_PATH/Contents/Resources/pi-runtime" \
+  --updater "$UPDATER_PATH"
 
 # 3. 后处理:往 dmg 里塞「请先阅读.txt」+ AppleScript 设置窗口布局
 # 原因:macOS 15.1+ 苹果封死「右键 → 打开」绕过 ad-hoc 签名的路径,

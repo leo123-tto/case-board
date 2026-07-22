@@ -72,10 +72,17 @@ import { cn } from "@/lib/utils";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { CalendarBoard } from "./CalendarBoard";
 import {
+  HomeProductivityCardWidthToggle,
+  HomeProductivityGrid,
+  homeProductivityCardSpan,
+  useHomeProductivityCardWidth,
+} from "./HomeProductivityGrid";
+import {
   CalendarEventActions,
   type CalendarEventEditInput,
 } from "./CalendarEventActions";
 import { DashboardAssistantCard } from "./DashboardAssistantCard";
+import { HomeFeatureCard, HomeFeatureCardScrollArea } from "./HomeFeatureCard";
 import { buildDashboardAssistantContext } from "./dashboardAssistantContext";
 import { countOpenCaseRows, isOpenCaseStatus } from "./homeCaseCounts";
 import {
@@ -120,6 +127,8 @@ export interface HomeViewProps {
   onPickCase: (caseId: string) => void;
   onOpenEvent?: (event: UpcomingEvent) => void;
   onImport: () => void;
+  /** 首页看板助手「写材料」→ 直达非诉 AI 事务工作区。 */
+  onOpenAiWorkspace: () => void;
   /** 右键卡片「删除」→ 删除案件(只删数据库记录,不动原始文件夹)。由 App 弹确认 + 刷新列表。 */
   onDeleteCase: (caseId: string) => void;
   /** 批量删除选中案件(筛选工具栏「多选」模式)。由 App 弹一次确认 + 逐个删 + 刷新列表。 */
@@ -161,6 +170,7 @@ export function HomeView({
   onPickCase,
   onOpenEvent,
   onImport,
+  onOpenAiWorkspace,
   onDeleteCase,
   onDeleteCases,
   onCaseStatusChanged,
@@ -710,12 +720,6 @@ export function HomeView({
 
   return (
     <main className="app-shell flex h-full w-full flex-col">
-      <header className="app-subheader border-b px-4 py-3 sm:px-6 xl:px-8">
-        <div className="mx-auto flex max-w-6xl items-center">
-          <h1 className="text-sm font-semibold tracking-tight text-foreground">案件看板</h1>
-        </div>
-      </header>
-
       <div className="flex-1 overflow-auto">
         <div className="app-page-enter mx-auto max-w-6xl px-4 py-6 sm:px-6 xl:px-8 xl:py-8">
           <div className="mb-10 grid grid-cols-1 gap-6 md:grid-cols-2">
@@ -729,6 +733,7 @@ export function HomeView({
                 assistantContext={dashboardAssistantContext}
                 reminderSummaries={assistantReminderSummaries}
                 dailyBrief={dailyBriefContext.brief}
+                onOpenAiWorkspace={onOpenAiWorkspace}
                 onDailyBriefAction={() => {
                   if (dailyBriefContext.actionEvent) {
                     openEvent(dailyBriefContext.actionEvent);
@@ -740,7 +745,7 @@ export function HomeView({
                 }}
               />
             ) : (
-              <div className="overflow-hidden rounded-xl border border-brand/10 bg-brand-soft/55 p-5 shadow-[inset_0_1px_0_oklch(1_0_0/0.72)]">
+              <HomeFeatureCard tone="brand">
                 <p className="font-mono text-caption uppercase tracking-wider text-brand">
                   OVERVIEW · {monthLabel}
                 </p>
@@ -750,7 +755,7 @@ export function HomeView({
                 <p className="mt-2 text-sm text-muted-foreground">
                   你正在办 {openCaseCount} 个案件,扫一眼今天的进度。
                 </p>
-              </div>
+              </HomeFeatureCard>
             )}
             <ImportantDates events={upcomingEvents} onPickCase={openEvent} />
           </div>
@@ -766,8 +771,9 @@ export function HomeView({
             </div>
           )}
 
-          {cases.length > 0 && !feishuEnabled && calendarEnabled && (
-            <div className="mb-8">
+          {/* 本地日历与滴答待办优先成对排在同一行；案件待办作为下一格自然续排。 */}
+          <HomeProductivityGrid>
+            {cases.length > 0 && !feishuEnabled && calendarEnabled && (
               <CalendarPanel
                 events={calendarEvents}
                 onPickCase={openEvent}
@@ -775,15 +781,10 @@ export function HomeView({
                 onEditEvent={handleEditCalendarEvent}
                 onDeleteEvent={handleDeleteCalendarEvent}
               />
-            </div>
-          )}
-
-          {/* 待办两卡:左=案件待办汇总,右=我的待办(滴答同步)。整个「在办案件」区上方;各自空/未连接时自动隐藏。
-              右卡(滴答)受「功能开关」tab 的 home_ticktick 控制(默认关=清爽)。 */}
-          <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-2">
-            <TodoSummary onPickCase={onPickCase} />
+            )}
             {ticktickOn && <MyTodosCard />}
-          </div>
+            <TodoSummary onPickCase={onPickCase} />
+          </HomeProductivityGrid>
 
           <section>
             <div className="mb-4 flex flex-col gap-3">
@@ -1507,7 +1508,7 @@ function ImportantDates({
     durationMs: 500,
   });
   return (
-    <div className="surface-card p-5">
+    <HomeFeatureCard>
       <div className="mb-3 flex items-baseline justify-between">
         <h2 className="text-sm font-semibold tracking-tight">重要提醒</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
@@ -1515,15 +1516,15 @@ function ImportantDates({
         </span>
       </div>
       {events.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-8 text-center">
+        <HomeFeatureCardScrollArea className="flex flex-col items-center justify-center text-center">
           <CalendarClock className="size-6 text-muted-foreground/40" />
           <p className="mt-2 text-xs text-muted-foreground">暂无近期事件</p>
           <p className="mt-1 text-caption text-muted-foreground/70">
             导入后，开庭和续封提醒会显示在这里。
           </p>
-        </div>
+        </HomeFeatureCardScrollArea>
       ) : (
-        <div
+        <HomeFeatureCardScrollArea
           ref={scrollRef}
           onMouseEnter={() => {
             pausedRef.current = true;
@@ -1531,7 +1532,7 @@ function ImportantDates({
           onMouseLeave={() => {
             pausedRef.current = false;
           }}
-          className="max-h-72 space-y-3 overflow-y-auto pr-1">
+          className="space-y-3 pr-1">
           {prominent.length > 0 && (
             <ul className="space-y-2">
               {prominent.map((e, i) => (
@@ -1563,9 +1564,9 @@ function ImportantDates({
               </ul>
             </div>
           )}
-        </div>
+        </HomeFeatureCardScrollArea>
       )}
-    </div>
+    </HomeFeatureCard>
   );
 }
 
@@ -1610,7 +1611,7 @@ function TodoSummary({ onPickCase }: { onPickCase: (caseId: string) => void }) {
   if (rows.length === 0) return null;
 
   return (
-    <div className="surface-card p-5">
+    <HomeFeatureCard>
       <div className="mb-3 flex items-baseline justify-between">
         <h2 className="text-sm font-semibold tracking-tight">待办汇总</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
@@ -1618,7 +1619,7 @@ function TodoSummary({ onPickCase }: { onPickCase: (caseId: string) => void }) {
         </span>
       </div>
       {/* 固定成一张卡片高度,待办多了内部滚动(不再随条数无限变长)。 */}
-      <div className="max-h-64 space-y-3 overflow-y-auto pr-1">
+      <HomeFeatureCardScrollArea className="space-y-3 pr-1">
         {groups.map((g) => (
             <div key={g.caseId}>
               <button
@@ -1662,8 +1663,8 @@ function TodoSummary({ onPickCase }: { onPickCase: (caseId: string) => void }) {
               </ul>
             </div>
           ))}
-        </div>
-    </div>
+      </HomeFeatureCardScrollArea>
+    </HomeFeatureCard>
   );
 }
 
@@ -1673,6 +1674,7 @@ function MyTodosCard() {
   const [items, setItems] = useState<TickTickItem[]>([]);
   const [connected, setConnected] = useState(false);
   const [title, setTitle] = useState("");
+  const [cardWidth, setCardWidth] = useHomeProductivityCardWidth("ticktick");
 
   const reload = async () => {
     try {
@@ -1734,12 +1736,19 @@ function MyTodosCard() {
   const open = items.filter((i) => !i.done);
 
   return (
-    <div className="surface-card p-5">
-      <div className="mb-3 flex items-baseline justify-between">
+    <HomeFeatureCard className={homeProductivityCardSpan(cardWidth)}>
+      <div className="mb-3 flex items-center justify-between gap-3">
         <h2 className="text-sm font-semibold tracking-tight">我的待办</h2>
-        <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-          滴答同步
-        </span>
+        <div className="flex items-center gap-1">
+          <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+            滴答同步
+          </span>
+          <HomeProductivityCardWidthToggle
+            cardLabel="滴答待办"
+            width={cardWidth}
+            onWidthChange={setCardWidth}
+          />
+        </div>
       </div>
       <div className="mb-2 flex items-center gap-2">
         <input
@@ -1750,7 +1759,7 @@ function MyTodosCard() {
           className="flex-1 rounded-md border border-border bg-background px-2.5 py-1 text-sm outline-none focus:border-sky-400"
         />
       </div>
-      <div className="max-h-64 space-y-0.5 overflow-y-auto pr-1">
+      <HomeFeatureCardScrollArea className="space-y-0.5 pr-1">
         {open.map((t) => (
           <div
             key={t.id}
@@ -1782,8 +1791,8 @@ function MyTodosCard() {
         {open.length === 0 && (
           <p className="px-1 py-2 text-xs text-muted-foreground">暂无待办,上面加一条。</p>
         )}
-      </div>
-    </div>
+      </HomeFeatureCardScrollArea>
+    </HomeFeatureCard>
   );
 }
 
@@ -2004,6 +2013,7 @@ function CalendarPanel({
 }) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
+  const [cardWidth, setCardWidth] = useHomeProductivityCardWidth("calendar");
   const [monthCursor, setMonthCursor] = useState(
     () => new Date(today.getFullYear(), today.getMonth(), 1),
   );
@@ -2056,7 +2066,8 @@ function CalendarPanel({
   };
 
   return (
-    <section className="surface-card p-5">
+    <>
+      <HomeFeatureCard className={homeProductivityCardSpan(cardWidth)}>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <CalendarDays className="size-4 text-muted-foreground" />
@@ -2066,6 +2077,11 @@ function CalendarPanel({
           </span>
         </div>
         <div className="flex items-center gap-2">
+          <HomeProductivityCardWidthToggle
+            cardLabel="日程日历"
+            width={cardWidth}
+            onWidthChange={setCardWidth}
+          />
           {!collapsed && (
             <>
               <Button type="button" variant="outline" size="icon" onClick={() => moveMonth(-1)} title="上一月">
@@ -2100,9 +2116,9 @@ function CalendarPanel({
           </Button>
         </div>
       </div>
-      {collapsed ? (
-        // 折叠态:固定高度摘要卡,日程多了内部上下滚动
-        <div className="max-h-52 space-y-1.5 overflow-y-auto rounded-lg border border-border bg-background/60 p-3">
+      <HomeFeatureCardScrollArea className="pr-1">
+        {collapsed ? (
+          <div className="space-y-1.5 rounded-lg border border-border bg-background/60 p-3">
           {summaryEvents.length === 0 ? (
             <p className="text-xs text-muted-foreground">
               暂无近期日程(开庭 / 到期日由案件分析自动汇总到这里)
@@ -2150,10 +2166,10 @@ function CalendarPanel({
               );
             })
           )}
-        </div>
-      ) : (
-        <>
-      <div className="grid grid-cols-7 gap-px overflow-hidden rounded-lg border border-border bg-border">
+          </div>
+        ) : (
+          <>
+            <div className="grid grid-cols-7 gap-px overflow-hidden rounded-lg border border-border bg-border">
         {["一", "二", "三", "四", "五", "六", "日"].map((d) => (
           <div key={d} className="bg-muted/70 px-2 py-1 text-center text-caption text-muted-foreground">
             周{d}
@@ -2202,8 +2218,8 @@ function CalendarPanel({
             </button>
           );
         })}
-      </div>
-      <div className="mt-4 rounded-lg border border-border bg-background/60 p-3">
+            </div>
+            <div className="mt-4 rounded-lg border border-border bg-background/60 p-3">
         <div className="mb-2 flex items-center justify-between">
           <span className="text-xs font-medium text-foreground">{selectedDate} 日程</span>
           <button
@@ -2306,9 +2322,11 @@ function CalendarPanel({
             })}
           </ul>
         )}
-      </div>
-        </>
-      )}
+            </div>
+          </>
+        )}
+      </HomeFeatureCardScrollArea>
+      </HomeFeatureCard>
 
       {/* 右键某天弹出的菜单:点「添加日程」→ 打开当天添加输入 */}
       {dateMenu && (
@@ -2343,7 +2361,7 @@ function CalendarPanel({
           onDelete={() => onDeleteEvent(eventMenu.event)}
         />
       )}
-    </section>
+    </>
   );
 }
 

@@ -51,12 +51,19 @@ pub fn evaluate_task_quality(input: QualityGateInput<'_>) -> QualityGateReport {
         );
     }
 
-    let incomplete = task_output_incomplete(input.task, input.content);
+    let mut incomplete = task_output_incomplete(input.task, input.content);
     if incomplete {
         warnings.push(
             "输出未完成: 模拟对抗必须形成对方主张、我方应对、待证事实/证据缺口和整体风险，不能以检索计划或中间步骤代替终稿。"
                 .into(),
         );
+    }
+
+    let operational_warnings =
+        unverified_operational_claims(input.content, input.tool_calls, input.artifact_doc_id);
+    if !operational_warnings.is_empty() {
+        incomplete = true;
+        warnings.extend(operational_warnings);
     }
 
     if matches!(
@@ -85,6 +92,82 @@ pub fn evaluate_task_quality(input: QualityGateInput<'_>) -> QualityGateReport {
         incomplete,
         warnings,
     }
+}
+
+fn unverified_operational_claims(
+    content: &str,
+    tool_calls: &[ToolCallRecord],
+    artifact_doc_id: Option<&str>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let claims_network = [
+        "已联网",
+        "已经联网",
+        "联网查到",
+        "网络查到",
+        "网上查到",
+        "上网查到",
+        "我查完了",
+        "我查齐了",
+        "都查齐了",
+        "我实际调用了",
+        "我确实调用了",
+        "实际调用的结果",
+    ]
+    .iter()
+    .any(|marker| content.contains(marker));
+    let has_network_evidence = tool_calls.iter().any(|call| {
+        call.success
+            && matches!(
+                call.tool.as_str(),
+                "web_search"
+                    | "web_fetch"
+                    | "exa_search"
+                    | "exa_contents"
+                    | "exa_find_similar"
+                    | "firecrawl_search"
+                    | "firecrawl_scrape"
+            )
+    });
+    if claims_network && !has_network_evidence {
+        warnings.push(
+            "操作证据不足: 回复声称已经联网检索，但本轮没有真实联网工具记录；相关网络结论不能视为已核验。"
+                .into(),
+        );
+    }
+
+    let claims_saved = [
+        "已保存到工作区",
+        "已经保存到工作区",
+        "已存到工作区",
+        "已经存到工作区",
+        "文档已保存",
+        "文稿已保存",
+        "已新建文稿",
+        "已创建文稿",
+    ]
+    .iter()
+    .any(|marker| content.contains(marker));
+    let has_write_evidence = artifact_doc_id.is_some()
+        || tool_calls.iter().any(|call| {
+            call.success
+                && matches!(
+                    call.tool.as_str(),
+                    "save_artifact"
+                        | "edit_artifact"
+                        | "create_workspace_file"
+                        | "write_workspace_file"
+                        | "rename_workspace_file"
+                        | "copy_workspace_file"
+                )
+        });
+    if claims_saved && !has_write_evidence {
+        warnings.push(
+            "操作证据不足: 回复声称已经保存文稿，但本轮没有真实文稿写入记录；工作区文件未确认生成。"
+                .into(),
+        );
+    }
+    warnings
 }
 
 pub fn task_output_incomplete(task: TaskType, content: &str) -> bool {

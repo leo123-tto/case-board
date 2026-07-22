@@ -40,6 +40,21 @@ const TABLES: &[TableSpec] = &[
         ],
     },
     TableSpec {
+        name: "case_visual_workspaces",
+        filter: None,
+        excluded: &[],
+    },
+    TableSpec {
+        name: "case_visual_revisions",
+        filter: None,
+        excluded: &[],
+    },
+    TableSpec {
+        name: "case_visual_proposals",
+        filter: None,
+        excluded: &[],
+    },
+    TableSpec {
         name: "parties",
         filter: None,
         excluded: &["id_doc_path"],
@@ -147,6 +162,11 @@ const TABLES: &[TableSpec] = &[
         excluded: &[],
     },
     TableSpec {
+        name: "case_chat_conversations",
+        filter: None,
+        excluded: &[],
+    },
+    TableSpec {
         name: "chat_tasks",
         filter: None,
         excluded: &[],
@@ -188,6 +208,53 @@ const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "memory_evidence",
+        filter: None,
+        excluded: &[],
+    },
+    TableSpec {
+        name: "ai_workspaces",
+        filter: None,
+        excluded: &[],
+    },
+    TableSpec {
+        name: "ai_workspace_documents",
+        filter: None,
+        excluded: &[
+            "source_path",
+            "normalized_source_path",
+            "content_path",
+            "extracted_text_path",
+            "last_error",
+            "missing",
+        ],
+    },
+    TableSpec {
+        name: "ai_workspace_conversations",
+        filter: None,
+        excluded: &[],
+    },
+    TableSpec {
+        name: "ai_workspace_messages",
+        filter: None,
+        excluded: &[],
+    },
+    TableSpec {
+        name: "ai_workspace_document_chunks",
+        filter: None,
+        excluded: &[],
+    },
+    TableSpec {
+        name: "ai_workspace_document_versions",
+        filter: None,
+        excluded: &[],
+    },
+    TableSpec {
+        name: "ai_workspace_tasks",
+        filter: None,
+        excluded: &[],
+    },
+    TableSpec {
+        name: "ai_workspace_document_proposals",
         filter: None,
         excluded: &[],
     },
@@ -397,6 +464,70 @@ async fn add_derived_markdown(
     Ok(())
 }
 
+async fn add_ai_workspace_markdown(
+    pool: &SqlitePool,
+    payload: &mut Value,
+    app_data: &Path,
+) -> Result<(), String> {
+    let Some(id) = payload.get("id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(row) = sqlx::query(
+        "SELECT kind,content_path,extracted_text_path FROM ai_workspace_documents WHERE id=?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let kind: String = row.try_get("kind").map_err(|e| e.to_string())?;
+    let content_path: Option<String> = row.try_get("content_path").map_err(|e| e.to_string())?;
+    let extracted_text_path: Option<String> = row
+        .try_get("extracted_text_path")
+        .map_err(|e| e.to_string())?;
+    let selected = if kind == "artifact" {
+        content_path
+    } else {
+        extracted_text_path
+    };
+    let mut content = None;
+    if let Some(path) = selected.map(PathBuf::from) {
+        if path_is_inside(&path, app_data)
+            && path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("md"))
+        {
+            let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+            if meta.len() as usize <= MAX_DERIVED_MD_BYTES {
+                content = Some(std::fs::read_to_string(&path).map_err(|e| e.to_string())?);
+            }
+        }
+    }
+    if content.is_none() && kind == "artifact" {
+        content = sqlx::query_scalar(
+            "SELECT content_md FROM ai_workspace_document_versions \
+             WHERE document_id=? ORDER BY version_no DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    if kind == "artifact" && content.is_none() {
+        return Err(format!("独立工作区文稿 {id} 缺少可同步 Markdown"));
+    }
+    if let Some(content) = content {
+        payload
+            .as_object_mut()
+            .ok_or("独立工作区同步记录格式错误")?
+            .insert("workspace_md".into(), Value::String(content));
+    }
+    Ok(())
+}
+
 async fn load_ledger(pool: &SqlitePool) -> Result<HashMap<(String, String), LedgerRow>, String> {
     let rows = sqlx::query_as::<_, LedgerRow>(
         "SELECT entity_type,record_id,content_hash,parent_hash,revision,origin_device_id,updated_at,deleted_at \
@@ -547,6 +678,8 @@ pub async fn build_packets(
             let mut payload: Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
             if spec.name == "documents" {
                 add_derived_markdown(pool, &mut payload, &app_data).await?;
+            } else if spec.name == "ai_workspace_documents" {
+                add_ai_workspace_markdown(pool, &mut payload, &app_data).await?;
             }
             let id = payload
                 .get("id")
@@ -748,6 +881,87 @@ async fn write_derived_md(record_id: &str, payload: &mut Map<String, Value>) -> 
     Ok(())
 }
 
+async fn write_ai_workspace_markdown(
+    record_id: &str,
+    payload: &mut Map<String, Value>,
+) -> Result<HashSet<&'static str>, String> {
+    let workspace_id = payload
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .ok_or("独立工作区文档缺 workspace_id")?
+        .to_string();
+    let kind = payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or("独立工作区文档缺 kind")?
+        .to_string();
+    let filename = payload
+        .get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or("远端材料")
+        .to_string();
+    let content = payload
+        .remove("workspace_md")
+        .and_then(|value| value.as_str().map(str::to_string));
+    if content
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_DERIVED_MD_BYTES)
+    {
+        return Err("独立工作区 Markdown 超过 8MB".into());
+    }
+    let app_data = crate::db::app_data_dir().map_err(|e| e.to_string())?;
+    let workspace_root = app_data
+        .join("ai-workspaces")
+        .join(safe_component(&workspace_id));
+    let mut insert_only = HashSet::new();
+    match kind.as_str() {
+        "artifact" => {
+            let content = content.ok_or("独立工作区文稿同步包缺 Markdown")?;
+            let path = workspace_root
+                .join("artifacts")
+                .join(format!("{}.md", safe_component(record_id)));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&path, content).map_err(|e| e.to_string())?;
+            payload.insert(
+                "content_path".into(),
+                Value::String(path.to_string_lossy().into_owned()),
+            );
+            insert_only.insert("content_path");
+        }
+        "source" => {
+            let placeholder = app_data
+                .join("device_sync/source_placeholders/ai-workspaces")
+                .join(safe_component(&workspace_id))
+                .join(safe_component(record_id))
+                .join(safe_component(&filename));
+            let placeholder = placeholder.to_string_lossy().into_owned();
+            payload.insert("source_path".into(), Value::String(placeholder.clone()));
+            payload.insert("normalized_source_path".into(), Value::String(placeholder));
+            payload.insert("missing".into(), Value::Number(1.into()));
+            insert_only.extend(["source_path", "normalized_source_path", "missing"]);
+            if let Some(content) = content {
+                let path = workspace_root
+                    .join("materials")
+                    .join(format!("{}.md", safe_component(record_id)));
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&path, content).map_err(|e| e.to_string())?;
+                payload.insert(
+                    "extracted_text_path".into(),
+                    Value::String(path.to_string_lossy().into_owned()),
+                );
+            } else {
+                payload.insert("extraction_status".into(), Value::String("missing".into()));
+            }
+        }
+        _ => return Err("独立工作区文档 kind 非法".into()),
+    }
+    Ok(insert_only)
+}
+
 async fn apply_setting(packet: &RecordPacket) -> Result<(), String> {
     if !is_shared_setting(&packet.summary.record_id) {
         return Err("收到禁止跨设备的本机设置".into());
@@ -839,6 +1053,11 @@ async fn upsert_table_record_with_pool(
             payload.insert("missing".into(), Value::Number(1.into()));
             insert_only.insert("source_path");
             insert_only.insert("missing");
+        }
+        "ai_workspace_documents" => {
+            insert_only.extend(
+                write_ai_workspace_markdown(&packet.summary.record_id, &mut payload).await?,
+            );
         }
         _ => {}
     }

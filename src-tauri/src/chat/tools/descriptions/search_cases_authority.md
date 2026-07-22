@@ -13,15 +13,14 @@ search_cases_authority — 权威案例库检索(最高法指导案例 + 公报�
 - 关键词不准 → `case_vector_search`
 
 输入字段:
-- qw: 必填,中文关键词,**支持「+」组合**(如「合同解除+违约金」)
-- top_k: 可选,默认 20
-
-**高级过滤未启用**(V0.2 D2-D3 当前版本):court / cause / region 等过滤参数本次工具层暂不暴露,LLM 自行从结果里筛选。
+- ah / title / ay / jbdw / source: 可按案号、标题、案由、法院、权威案例来源过滤
+- xzqh_p / wszl / ajlb / ja_start / ja_end: 可限制地域、文书种类、案件类别、结案日期
+- qw / search_mode: 全文关键词及 `and` / `or` 组合方式
+- top_k: 可选,默认 20,最大 50；所有字段均透传到元典
 
 注意事项:
-- **先查作者整理过的全库**:可先用 `search_local_kb` 看作者整理过的判例 / 类案笔记(0 积分),本地没有再调本工具外查
+- **宿主强制本地优先**:Rust 会先查本地案号/案例 BM25，词法不足再查本地 embedding；强命中直接返回，不调用元典
+- 本地不足时可以按准确性需要与普通案例、案例向量检索组合多轮检索；避免完全相同条件的无意义重复
 - 优先用本地缓存(权威案例不过期,0 积分命中)
-- 返回字段:`{id, ah, title, court, case_type(指导/公报/典型/参考), judge_date, content(摘要)}`
-  - **特别注意** `case_type` — 指导性案例的引用价值 > 公报 > 典型 > 参考,LLM 在 final answer 里要把这个等级告诉用户
-- 命中后用 `get_case_detail` (type="qwal") 拿全文,里面有完整裁判要旨 + 法官释法
+- 外部付费响应按元典原始 JSON 完整交给模型；注意辨认 source/case_type，并在需要指定文书详情时调用 `get_case_detail`
 - `<CITATIONS>` 标 `type: "case"`,title 写「<court> · <ah>(<case_type>)」

@@ -1,6 +1,7 @@
 export const WEATHER_REUSE_WINDOW_MS = 1000 * 60 * 5;
 export const NETWORK_LOCATION_RETRY_MS = 1000 * 60 * 5;
 export const WEATHER_CACHE_MAX_AGE_MS = 1000 * 60 * 30;
+export const WEATHER_CITY_CHANGED_EVENT = "caseboard:weather-city-changed";
 
 export interface GreetingCacheKeyInput {
   localDate: string;
@@ -62,8 +63,22 @@ export function shouldRefreshWeather(cached: CachedWeatherLike | null, now = new
 
 export function isUsableCachedWeather(cached: CachedWeatherLike | null, now = new Date()): boolean {
   if (!cached) return false;
-  if (cached.source !== "系统定位") return false;
+  if (cached.source !== "系统定位" && cached.source !== "手动城市") return false;
   return !shouldRefreshWeather(cached, now);
+}
+
+export function normalizeWeatherCity(value: string | null | undefined): string | null {
+  const city = value?.trim();
+  return city || null;
+}
+
+export function resolveGreetingWeatherSummary(
+  currentWeatherSummary: string | null,
+  options: { weatherSummaryOverride?: string | null },
+): string | null {
+  return "weatherSummaryOverride" in options
+    ? (options.weatherSummaryOverride ?? null)
+    : currentWeatherSummary;
 }
 
 export function isDisplayableCachedWeather(

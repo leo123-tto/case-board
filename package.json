@@ -1,11 +1,13 @@
 {
   "name": "caseboard",
   "private": true,
-  "version": "0.4.10",
+  "version": "0.4.15",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:pi-runtime": "node scripts/build-pi-runtime.mjs",
+    "verify:pi-runtime-bundle": "node scripts/verify-bundled-pi-runtime.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

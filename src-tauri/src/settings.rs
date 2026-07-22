@@ -34,6 +34,9 @@ pub struct Settings {
     /// 留空时显示"律师"作为兜底。2026-05-23 晚九加。
     pub user_display_name: Option<String>,
 
+    /// 首页天气手动城市。None/空白 = 自动使用系统定位；定位失败时仅展示网络粗定位。
+    pub weather_city: Option<String>,
+
     // ===== 2026-05-23 加(作者隐私分流决策,详见 docs/产品决策与理念.md 第 2 节) =====
     /// 用户是否完成过 onboarding。
     ///
@@ -46,6 +49,16 @@ pub struct Settings {
     pub ocr_provider: Option<String>,
     /// LLM 后端选择:`"local"` = 本机 MiniCPM-V chat / `"cloud"` = DeepSeek
     pub llm_provider: Option<String>,
+
+    /// AI 助手 Agent Runtime。`None` / `"native"` = CaseBoard 原生循环；`"pi"` = Pi Sidecar。
+    /// 缺省必须保持原生，确保老用户升级后行为不变；未知值同样安全回退到原生。
+    pub agent_runtime: Option<String>,
+    /// Pi Runtime 独立 provider/model 选择。只保存非敏感 ID；凭据进入系统凭据库。
+    pub pi_provider_id: Option<String>,
+    pub pi_model_id: Option<String>,
+    /// 按 Pi provider/model 记忆用户选择的原生推理强度；目录与合法档位仍以 Pi SDK 为准。
+    pub pi_model_thinking_levels:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 
     /// 本机模型目录(放 MiniCPM-V-4_6-Q8_0.gguf 和 mmproj-model-f16.gguf)
     ///
@@ -161,7 +174,7 @@ pub struct Settings {
     pub kuaidi100_key: Option<String>,
 
     /// 2026-06-01 V0.3.3:Embedding 云端模型(案件文档语义检索)。OpenAI 兼容 /embeddings。
-    /// 默认硅基流动 BAAI/bge-m3(免费);填了 api_key 才启用语义检索,否则回退关键词选材料。
+    /// 默认硅基流动 BAAI/bge-m3；填了 api_key 才启用语义检索，否则回退关键词选材料。
     /// 申请:https://cloud.siliconflow.cn/me/account/ak
     pub embedding_endpoint: Option<String>,
     pub embedding_model: Option<String>,
@@ -172,6 +185,10 @@ pub struct Settings {
     /// 本地知识库语义向量索引「自动维护」开关(出报告 / 启动后台增量索引)。
     /// `None`/`Some(true)` = 开(默认);`Some(false)` = 关(只手动重建)。
     pub kb_semantic_auto_index: Option<bool>,
+
+    /// 允许 CaseBoard 内置 AI（Native / Pi 共用 Rust 工具）新增经过约束的 L1 raw 材料。
+    /// 默认 false；仅允许 create-only 写入 raw/notes，不开放覆盖、删除、移动或 Wiki 提升。
+    pub ai_kb_maintenance_enabled: bool,
 
     /// 2026-05-24 e:匿名反馈识别码(UUID v4),首次启动时自动生成 + 持久化。
     /// 跟用户名/邮箱无关 — 作者拿到反馈 MD 后可以识别"这个 ID 之前反馈过"。
@@ -352,6 +369,77 @@ impl Settings {
             _ => None,
         };
         current.or_else(|| Self::clean_string(&self.compat_llm_api_key))
+    }
+
+    /// 当前兼容后端的验证时间。与 endpoint/model/key 一样，专属字段优先、旧共享字段兜底。
+    pub fn effective_compat_llm_verified_at(&self) -> Option<String> {
+        let current = match self.effective_cloud_llm_backend() {
+            "glm" => Self::clean_string(&self.glm_llm_verified_at),
+            "mimo" => Self::clean_string(&self.mimo_llm_verified_at),
+            "kimi" => Self::clean_string(&self.kimi_llm_verified_at),
+            "custom" => Self::clean_string(&self.custom_llm_verified_at),
+            _ => None,
+        };
+        current.or_else(|| Self::clean_string(&self.compat_llm_verified_at))
+    }
+
+    /// 案件材料处理（文档字段抽取、全案分析、报告生成）启动前的统一配置门禁。
+    ///
+    /// 不能只检查 key 非空：用户切换服务商或改过 key 后，必须重新验证成功，才能避免
+    /// 后台批量任务启动后才逐份失败。错误文本直接给出 UI 中的准确入口。
+    pub fn validate_material_llm_ready(&self) -> Result<(), String> {
+        const SETTINGS_HINT: &str = "请前往「设置 → 大脑 → 材料处理模型」填写并验证后重试。";
+        let backend = self.effective_cloud_llm_backend();
+        let (label, api_key, verified_at) = if backend == "minimax" {
+            (
+                "MiniMax",
+                Self::clean_string(&self.minimax_api_key),
+                Self::clean_string(&self.minimax_verified_at),
+            )
+        } else if self.cloud_llm_is_compat() {
+            let label = match backend {
+                "glm" => "智谱 GLM",
+                "mimo" => "小米 MiMo",
+                "kimi" => "Kimi",
+                "custom" => "自定义模型",
+                _ => "云端模型",
+            };
+            if backend == "custom" {
+                if self.effective_compat_llm_endpoint().is_none() {
+                    return Err(format!(
+                        "材料处理模型未配置完整：尚未填写自定义模型接口地址。{SETTINGS_HINT}"
+                    ));
+                }
+                if self.effective_compat_llm_model().is_none() {
+                    return Err(format!(
+                        "材料处理模型未配置完整：尚未填写自定义模型名称。{SETTINGS_HINT}"
+                    ));
+                }
+            }
+            (
+                label,
+                self.effective_compat_llm_api_key(),
+                self.effective_compat_llm_verified_at(),
+            )
+        } else {
+            (
+                "DeepSeek",
+                Self::clean_string(&self.cloud_llm_api_key),
+                Self::clean_string(&self.deepseek_verified_at),
+            )
+        };
+
+        if api_key.is_none() {
+            return Err(format!(
+                "材料处理模型未配置完整：尚未填写 {label} API Key。{SETTINGS_HINT}"
+            ));
+        }
+        if verified_at.is_none() {
+            return Err(format!(
+                "材料处理模型未配置完整：{label} API Key 尚未验证成功。{SETTINGS_HINT}"
+            ));
+        }
+        Ok(())
     }
 
     /// 一次性迁移:把旧的「共享 `compat_llm_*`」搬进**当前兼容后端**的专属字段,然后清空旧字段。

@@ -2,7 +2,7 @@
 //! 语义命中对的条文,命中后 `read_kb_file` 拿全文,0 元典积分。
 //!
 //! 跟 `kb::SearchLocalKb`(关键词)互补:语义模糊查 vs 关键词精确查(法条号/案号)。
-//! 走 `local_kb::semantic`,消耗 embedding 额度(bge-m3 免费),**不消耗元典积分**。
+//! 走 `local_kb::semantic`，消耗用户所配 embedding 服务额度，**不消耗元典积分**。
 //! 没配 embedding key → 优雅提示改用关键词工具(不报错,AI 无感)。
 
 use async_trait::async_trait;
@@ -60,7 +60,7 @@ impl Tool for SemanticSearchLocalKb {
         let Some(key) = key else {
             return Ok(ToolResult::plain(
                 "本地知识库未配置语义检索(embedding 未设置)。请改用 `search_local_kb`(关键词检索),\
-                 或提示用户在设置页配置 embedding(硅基流动 bge-m3 免费)。不要反复调用本工具。",
+                 或提示用户在设置页配置 embedding 服务。不要反复调用本工具。",
             ));
         };
         let endpoint = ctx.settings.embedding_endpoint.as_deref().unwrap_or("");

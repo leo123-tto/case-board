@@ -15,6 +15,7 @@ src-tauri/WixTools/
 node_modules/
 dist/
 dist-ssr/
+.compile-target-cache/
 output/playwright/
 .playwright-cli/
 *.tsbuildinfo
@@ -36,6 +37,7 @@ feedback-inbox/
 
 # Superpowers scratch
 .superpowers/
+.worktrees/
 
 # Python bytecode (court_filing_cli 等内置 Python 模块)
 __pycache__/

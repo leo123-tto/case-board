@@ -1,6 +1,6 @@
 [package]
 name = "caseboard"
-version = "0.4.10"
+version = "0.4.15"
 description = "案件看板 · CaseBoard"
 authors = ["CaseBoard Contributors"]
 edition = "2021"
@@ -36,6 +36,9 @@ futures = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 directories = "5"
 thiserror = "1"
+# Pi Runtime provider 凭据只进系统凭据库，不回写 settings.json。
+# 3.6.3 的 MSRV 为 Rust 1.75；只启用 macOS Keychain / Windows Credential Manager。
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
 # OCR 同步调用 + 临时 PDF 转 PNG 用(2026-05-23 加,本机 vision OCR 路径)
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
@@ -47,6 +50,8 @@ pulldown-cmark = { version = "0.12", default-features = false, features = ["html
 # 队伍 HMAC 鉴权(仓里只有诊断用 md5;RustCrypto 标准件,极小)。详 docs/提案-团队版 §6.5
 mdns-sd = "0.13"
 sha2 = "0.10"
+semver = "1"
+minisign-verify = "0.2.5"
 hmac = "0.12"
 # 个人设备工作区同步：正文不能像团队登记快照一样只签名明传，跨 Mac/Windows 统一做 AEAD。
 chacha20poly1305 = "0.10"

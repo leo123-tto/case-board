@@ -191,10 +191,23 @@ impl serde::Serialize for YuandianError {
     }
 }
 
-/// 拿一个 reqwest client(共享 timeout / TLS)。
-fn build_client() -> Result<reqwest::Client, YuandianError> {
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+const HALL_DETECT_TIMEOUT_SECS: u64 = 120;
+
+fn request_timeout_secs(path: &str) -> u64 {
+    if path == "/hall_detect" {
+        HALL_DETECT_TIMEOUT_SECS
+    } else {
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    }
+}
+
+/// 拿一个 reqwest client。幻觉核验需要服务端抽取并逐条比对引用，使用独立长超时；
+/// 其它查询仍保持 30 秒，避免普通检索长时间挂起。
+fn build_client(path: &str) -> Result<reqwest::Client, YuandianError> {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(request_timeout_secs(path)))
         .build()
         .map_err(|e| YuandianError::Network(e.to_string()))
 }
@@ -205,7 +218,7 @@ async fn yd_get(
     path: &str,
     params: &[(&str, String)],
 ) -> Result<Value, YuandianError> {
-    let client = build_client()?;
+    let client = build_client(path)?;
     let resp = client
         .get(format!("{}{}", BASE_URL, path))
         .header("X-Api-Key", api_key)
@@ -230,7 +243,7 @@ async fn yd_get(
 
 /// 通用 POST 请求(裁判文书 / 法规等检索是 POST + JSON body)。
 async fn yd_post(api_key: &str, path: &str, body: &Value) -> Result<Value, YuandianError> {
-    let client = build_client()?;
+    let client = build_client(path)?;
     let resp = client
         .post(format!("{}{}", BASE_URL, path))
         .header("X-Api-Key", api_key)
@@ -279,13 +292,28 @@ pub(crate) fn validate_business_response(value: Value) -> Result<Value, Yuandian
 /* ============ 企业类(C1-C4)============ */
 
 /// 企业名称 / 关键字搜索 — 拿候选 + id + 统一信用代码
-pub async fn enterprise_search(api_key: &str, name: &str) -> Result<Value, YuandianError> {
+fn enterprise_search_query(name: &str, top_k: u32) -> Vec<(&'static str, String)> {
+    vec![
+        ("name", name.to_string()),
+        ("top_k", top_k.clamp(1, 50).to_string()),
+    ]
+}
+
+pub async fn enterprise_search_with_limit(
+    api_key: &str,
+    name: &str,
+    top_k: u32,
+) -> Result<Value, YuandianError> {
     yd_get(
         api_key,
         "/rh_enterpriseSearch",
-        &[("name", name.to_string()), ("top_k", "10".to_string())],
+        &enterprise_search_query(name, top_k),
     )
     .await
+}
+
+pub async fn enterprise_search(api_key: &str, name: &str) -> Result<Value, YuandianError> {
+    enterprise_search_with_limit(api_key, name, 10).await
 }
 
 /// 企业聚合摘要 — 一次拿所有维度(主体 / 风险 / 涉诉 / 财产线索摘要)
@@ -455,35 +483,130 @@ pub async fn enterprise_corporate_tax(
     yd_get(api_key, "/rh_enterpriseCorporateTax", &params).await
 }
 
-/// 2026-05-25 V0.1.9 加 · 企业年报详情(POST,按年份)
+const ENTERPRISE_ANNUAL_REPORT_METHOD: &str = "GET";
+
+fn enterprise_annual_report_query(id_or_uscc: &EntityId, year: u32) -> Vec<(&'static str, String)> {
+    let mut params = id_or_uscc.to_params();
+    params.push(("year", year.to_string()));
+    params
+}
+
+/// 2026-05-25 V0.1.9 加 · 企业年报详情(GET,按年份)
 /// 拒执判断要拿"立案前一年 + 当年"两份年报,对比股东出资 / 总资产变化
 pub async fn enterprise_annual_report(
     api_key: &str,
     id_or_uscc: &EntityId,
     year: u32,
 ) -> Result<Value, YuandianError> {
-    let mut body = serde_json::Map::new();
-    match id_or_uscc {
-        EntityId::Id(id) => {
-            body.insert("id".to_string(), Value::String(id.clone()));
-        }
-        EntityId::Uscc(u) => {
-            body.insert("tyshxydm".to_string(), Value::String(u.clone()));
-        }
-    }
-    body.insert("year".to_string(), Value::String(year.to_string()));
-    yd_post(api_key, "/rh_enterpriseAnnualReport", &Value::Object(body)).await
+    debug_assert_eq!(ENTERPRISE_ANNUAL_REPORT_METHOD, "GET");
+    yd_get(
+        api_key,
+        "/rh_enterpriseAnnualReport",
+        &enterprise_annual_report_query(id_or_uscc, year),
+    )
+    .await
 }
 
 /* ============ 案例 / 文书检索(对自然人有用)============ */
 
-/// 普通案例库关键词检索 — 给自然人被执行人查涉诉文书
+#[derive(Serialize, Default, Debug, Clone)]
+pub struct PtalSearchParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ah: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssqy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ay: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jbdw: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xzqh_p: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wszl: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ajlb: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ja_start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ja_end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qw: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fxgc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub yyft: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ft_search_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+}
+
+fn build_ptal_search_body(params: &PtalSearchParams) -> Result<Value, YuandianError> {
+    serde_json::to_value(params).map_err(|error| YuandianError::Json(error.to_string()))
+}
+
+/// 普通案例库关键词检索 — 给自然人被执行人查涉诉文书。
+pub async fn search_ptal_with_params(
+    api_key: &str,
+    params: &PtalSearchParams,
+) -> Result<Value, YuandianError> {
+    let body = build_ptal_search_body(params)?;
+    yd_post(api_key, "/rh_ptal_search", &body).await
+}
+
+/// 兼容旧调用；高级工具路径使用 `search_ptal_with_params`。
 pub async fn search_ptal(api_key: &str, keyword: &str, top_k: u32) -> Result<Value, YuandianError> {
     let body = serde_json::json!({
         "qw": keyword,
         "top_k": top_k,
     });
     yd_post(api_key, "/rh_ptal_search", &body).await
+}
+
+#[derive(Serialize, Default, Debug, Clone)]
+pub struct QwalSearchParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ah: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ay: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jbdw: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xzqh_p: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wszl: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ajlb: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ja_start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ja_end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qw: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+}
+
+fn build_qwal_search_body(params: &QwalSearchParams) -> Result<Value, YuandianError> {
+    serde_json::to_value(params).map_err(|error| YuandianError::Json(error.to_string()))
+}
+
+pub async fn search_qwal_with_params(
+    api_key: &str,
+    params: &QwalSearchParams,
+) -> Result<Value, YuandianError> {
+    let body = build_qwal_search_body(params)?;
+    yd_post(api_key, "/rh_qwal_search", &body).await
 }
 
 /// 权威案例库检索(指导性 / 典型 / 公报案例)
@@ -498,11 +621,14 @@ pub async fn search_qwal(api_key: &str, keyword: &str, top_k: u32) -> Result<Val
 /// 案例详情(GET)。官方接口支持按案例库类型 + 案号/ID 查询，返回 `data` 列表（最多 10 条）。
 pub async fn case_details(
     api_key: &str,
-    case_type: &str,
+    case_type: Option<&str>,
     id: Option<&str>,
     case_no: Option<&str>,
 ) -> Result<Value, YuandianError> {
-    let mut params = vec![("type", case_type.to_string())];
+    let mut params = Vec::new();
+    if let Some(case_type) = case_type.filter(|value| !value.trim().is_empty()) {
+        params.push(("type", case_type.to_string()));
+    }
     if let Some(id) = id.filter(|s| !s.trim().is_empty()) {
         params.push(("id", id.to_string()));
     }
@@ -542,11 +668,17 @@ impl EntityId {
 pub struct FtSearchParams {
     pub keyword: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fgmc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effect_level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -590,11 +722,17 @@ pub struct FgSearchParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyword: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fgmc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effect_level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -635,6 +773,14 @@ pub async fn fg_detail(api_key: &str, params: &FgDetailParams) -> Result<Value, 
 pub struct LawVectorSearchParams {
     pub query: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite_flag: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effect_levels: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_num: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effect_level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_only: Option<bool>,
@@ -658,28 +804,38 @@ pub async fn law_vector_search(
 #[derive(Serialize, Default, Debug, Clone)]
 pub struct WenshuFilter {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub case_lb: Option<String>,
+    pub wenshu_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ay: Option<String>,
+    pub ay: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ws_type: Option<String>,
+    pub wszl: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fydj: Option<String>,
+    pub ja_start: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
+    pub ja_end: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub jiean_date_start: Option<String>,
+    pub dianxing: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub jiean_date_end: Option<String>,
+    pub fayuan: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dxal: Option<bool>,
+    pub source: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cj: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xzqh_p: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xzqh_c: Option<String>,
 }
 
 #[derive(Serialize, Default, Debug, Clone)]
 pub struct CaseVectorSearchParams {
     pub query: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite_flag: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub wenshu_filter: Option<WenshuFilter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_num: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
 }
@@ -712,6 +868,8 @@ fn normalize_keyword_law_fields(body: &mut Value) {
     for (from, to) in [
         ("effect_level", "xljb_1"),
         ("region", "dy"),
+        ("validity", "sxx"),
+        ("publisher", "fbbm"),
         ("publish_date_start", "fbrq_start"),
         ("publish_date_end", "fbrq_end"),
         ("implement_date_start", "ssrq_start"),
@@ -726,19 +884,40 @@ fn normalize_keyword_law_fields(body: &mut Value) {
             obj.insert(to.to_string(), value);
         }
     }
-    if let Some(valid_only) = obj.remove("valid_only").and_then(|v| v.as_bool()) {
-        if valid_only {
-            obj.insert("sxx".into(), Value::String("现行有效".into()));
+    if obj.get("sxx").is_none() {
+        if let Some(valid_only) = obj.remove("valid_only").and_then(|v| v.as_bool()) {
+            if valid_only {
+                obj.insert("sxx".into(), Value::String("现行有效".into()));
+            }
+        }
+    } else {
+        obj.remove("valid_only");
+    }
+    if let Some(search_mode) = obj.get_mut("search_mode") {
+        if let Some(mode) = search_mode.as_str() {
+            *search_mode = Value::String(mode.to_ascii_uppercase());
         }
     }
 }
 
 fn build_law_vector_body(params: &LawVectorSearchParams) -> Value {
     let mut filter = serde_json::Map::new();
-    if let Some(effect) = params.effect_level.as_deref() {
+    if let Some(effects) = params
+        .effect_levels
+        .as_ref()
+        .filter(|values| !values.is_empty())
+    {
+        filter.insert("effect1".into(), json!(effects));
+    } else if let Some(effect) = params.effect_level.as_deref() {
         filter.insert("effect1".into(), json!([effect]));
     }
-    if params.valid_only == Some(true) {
+    if let Some(validities) = params
+        .validities
+        .as_ref()
+        .filter(|values| !values.is_empty())
+    {
+        filter.insert("sxx".into(), json!(validities));
+    } else if params.valid_only == Some(true) {
         filter.insert("sxx".into(), json!(["现行有效"]));
     }
     if let Some(start) = params.implement_date_start.as_deref() {
@@ -749,8 +928,8 @@ fn build_law_vector_body(params: &LawVectorSearchParams) -> Value {
     }
     let mut body = json!({
         "query": params.query,
-        "rewrite_flag": true,
-        "return_num": params.top_k.unwrap_or(10),
+        "rewrite_flag": params.rewrite_flag.unwrap_or(true),
+        "return_num": params.return_num.or(params.top_k).unwrap_or(45),
     });
     if !filter.is_empty() {
         body["fatiao_filter"] = Value::Object(filter);
@@ -761,39 +940,16 @@ fn build_law_vector_body(params: &LawVectorSearchParams) -> Value {
 fn build_case_vector_body(params: &CaseVectorSearchParams) -> Value {
     let mut body = json!({
         "query": params.query,
-        "rewrite_flag": true,
-        "return_num": params.top_k.unwrap_or(10),
+        "rewrite_flag": params.rewrite_flag.unwrap_or(true),
+        "return_num": params.return_num.or(params.top_k).unwrap_or(45),
     });
     let Some(filter) = params.wenshu_filter.as_ref() else {
         return body;
     };
-    let mut wire = serde_json::Map::new();
-    if let Some(v) = filter.case_lb.as_deref() {
-        wire.insert("wenshu_type".into(), json!(v));
-    }
-    if let Some(v) = filter.ay.as_deref() {
-        wire.insert("ay".into(), json!([v]));
-    }
-    if let Some(v) = filter.ws_type.as_deref() {
-        wire.insert("wszl".into(), json!([v]));
-    }
-    if let Some(v) = filter.fydj.as_deref() {
-        wire.insert("cj".into(), json!(v));
-    }
-    if let Some(v) = filter.region.as_deref() {
-        wire.insert("xzqh_p".into(), json!(normalize_region(v)));
-    }
-    if let Some(v) = filter.jiean_date_start.as_deref() {
-        wire.insert("ja_start".into(), json!(v));
-    }
-    if let Some(v) = filter.jiean_date_end.as_deref() {
-        wire.insert("ja_end".into(), json!(v));
-    }
-    if let Some(v) = filter.dxal {
-        wire.insert("dianxing".into(), json!(v));
-    }
-    if !wire.is_empty() {
-        body["wenshu_filter"] = Value::Object(wire);
+    if let Ok(filter) = serde_json::to_value(filter) {
+        if filter.as_object().is_some_and(|object| !object.is_empty()) {
+            body["wenshu_filter"] = filter;
+        }
     }
     body
 }

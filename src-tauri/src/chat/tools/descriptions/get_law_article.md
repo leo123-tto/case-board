@@ -15,15 +15,15 @@ get_law_article — 拿单条法条的完整正文(必须先有 id 或 法规名
 - id: 优先填,元典内部法条 ID,从 `search_laws` 结果里拿
 - fgmc: 法规名(全称或常用简称都行,如「民法典」「中华人民共和国民法典」「侵权责任法」)。**不能跟 id 同时填**
 - ftnum: 条号,纯数字字符串(如 "563" 不带「第」「条」)。配 fgmc 一起用
-- fgid: 可选,元典法规 ID,从 `search_laws` / `law_vector_search` 结果里的 `fgid` 字段透传。没有 fgid 但有明确 `fgmc+ftnum` 也可以：工具会先查本地主库，未命中再按法规名拉整部
+- fgid: 可选,元典法规 ID,从 `search_laws` / `law_vector_search` 结果里的 `fgid` 字段透传。没有 fgid 但有明确 `fgmc+ftnum` 也可以：工具先查本地主库；未命中时先用单条详情取得精确版本 fgid，再按 ID 拉整部，避免同名修订版错位
 - refer_date: 可选,YYYY-MM-DD,查询截止该日期生效的版本
 
 注意事项:
 - **本地第一**：先在主库整部法规中按「法规名+条号」精确抽条，命中 0 积分；不要先调元典检索
-- **整部入库策略**：本地没有时，默认调用法规详情一次下载整部法规（当前官方价 5 积分），同步写入 `raw/notes + wiki/sources`，之后该法规所有条文 0 积分；整部接口或抽条失败才降级法条详情（1 积分）
-- `refer_date` 查询历史版本时使用独立缓存键，不会误拿当前版本
+- **整部写回策略**：本地没有时，默认调用法规详情一次下载整部法规（当前官方价 5 积分）。普通请求仅现行有效全文可作为当前依据；失效、废止或尚未生效内容会被隐去并触发现行替代法源检索
+- `refer_date` 查询历史版本时使用独立缓存键，不会误拿当前版本；明确历史时点取得的全文会带 `historical_research_only` 写入 raw/cache，默认现行法检索和向量索引会排除
 - 返回字段:`{id, content, ftnum, fgmc, valid, publish_date, implement_date}`
-  - `valid` 是布尔,**false 时务必告诉用户该条已失效**,不能继续用
+  - 普通请求遇到 `valid=false` 或失效状态时，Rust 会隐去正文并返回替代检索状态；明确 `refer_date` 时可以返回历史正文，但回答、报告或引用必须标明适用时点和非现行状态
   - 法律修订过的条款,默认拿现行版;要查旧版本配 `refer_date`
 - 在 final answer 引用本条时,`<CITATIONS>` 标 `type: "law"`,title 写「<fgmc> 第 <ftnum> 条」
-- 如果 `valid` 是 false,LLM 应该自动调一次 `search_laws` 用同 keyword 拿现行可用版本
+- 替代检索没有找到现行有效结果，或因 API key/积分/接口错误未执行时，必须照实说明，不得自行补写替代法源

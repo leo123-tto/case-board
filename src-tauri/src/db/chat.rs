@@ -24,6 +24,7 @@ use sqlx::{FromRow, SqlitePool};
 pub struct ChatMessage {
     pub id: String,
     pub case_id: String,
+    pub conversation_id: Option<String>,
     /// 'user' / 'assistant'
     pub role: String,
     pub content: String,
@@ -58,6 +59,7 @@ pub struct ChatMessage {
 pub struct NewChatMessage<'a> {
     pub id: &'a str,
     pub case_id: &'a str,
+    pub conversation_id: Option<&'a str>,
     pub role: &'a str,
     pub content: &'a str,
     pub task_type: Option<&'a str>,
@@ -83,14 +85,15 @@ pub async fn insert_chat_message(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO chat_messages \
-         (id, case_id, role, content, task_type, model, \
+         (id, case_id, conversation_id, role, content, task_type, model, \
           prompt_tokens, completion_tokens, latency_ms, \
           based_on, artifact_doc_id, error_short, \
           attached_doc_ids, citations_json, task_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(msg.id)
     .bind(msg.case_id)
+    .bind(msg.conversation_id)
     .bind(msg.role)
     .bind(msg.content)
     .bind(msg.task_type)
@@ -107,6 +110,54 @@ pub async fn insert_chat_message(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn list_chat_messages_in_conversation(
+    pool: &SqlitePool,
+    case_id: &str,
+    conversation_id: &str,
+    limit: Option<i64>,
+) -> Result<Vec<ChatMessage>, sqlx::Error> {
+    match limit {
+        Some(limit) => {
+            sqlx::query_as(
+                "SELECT * FROM ( \
+                   SELECT * FROM chat_messages \
+                   WHERE case_id = ? AND conversation_id = ? \
+                   ORDER BY created_at DESC, id DESC LIMIT ? \
+                 ) ORDER BY created_at ASC, id ASC",
+            )
+            .bind(case_id)
+            .bind(conversation_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT * FROM chat_messages \
+                 WHERE case_id = ? AND conversation_id = ? \
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .bind(case_id)
+            .bind(conversation_id)
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
+pub async fn delete_chat_history_for_conversation(
+    pool: &SqlitePool,
+    case_id: &str,
+    conversation_id: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM chat_messages WHERE case_id = ? AND conversation_id = ?")
+        .bind(case_id)
+        .bind(conversation_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 /// 列出某案件下所有聊天记录,按 created_at 升序(老的在前)。

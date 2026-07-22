@@ -1,3 +1,4 @@
+pub mod ai_workspace;
 pub mod chat;
 pub mod contract_draft;
 pub mod contract_review;
@@ -25,6 +26,8 @@ pub mod llm;
 pub mod local_kb;
 pub mod memory_vault;
 pub mod native_location;
+pub mod network_research;
+pub mod pi_runtime_update;
 pub mod proc_util;
 // 私人专属功能 Rust 侧(双轨发布模型)。开源仓此文件为桩(命令返回 Err),照样编译。
 pub mod case_bundle;
@@ -423,6 +426,7 @@ async fn import_case_folder(
     pool: tauri::State<'_, SqlitePool>,
     path: String,
 ) -> Result<ImportResult, String> {
+    material_llm_settings()?;
     let p = Path::new(&path);
     if !p.exists() {
         return Err(format!("路径不存在: {}", path));
@@ -586,6 +590,7 @@ async fn commit_import_folder(
     cases: Vec<CommitCase>,
     shared_dirs: Vec<String>,
 ) -> Result<Vec<ImportResult>, String> {
+    material_llm_settings()?;
     // 2026-06-16 防呆(反馈 ea761d3d):一次最多导入 3 个案件,保护后面 OCR 不被批量打爆限流。
     // 前端 SplitImportDialog 也会在选 >3 时禁用「拆成 N 个」按钮;这里是后端兜底。
     // (「合并成 1 个案件」走 import_case_folder 单案路径,不经这里,不受 3 案上限影响。)
@@ -1051,6 +1056,151 @@ fn get_settings() -> Result<settings::Settings, String> {
     settings::read_settings().map(|s| s.with_defaults_for_display())
 }
 
+/// 所有主动触发案件材料 LLM 处理的命令共用同一配置门禁。
+fn material_llm_settings() -> Result<settings::Settings, String> {
+    let settings = settings::read_settings()
+        .map_err(|error| format!("无法读取 AI 配置：{error}。请前往「设置 → 大脑」检查配置。"))?;
+    settings.validate_material_llm_ready()?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn get_network_research_statuses() -> Result<Vec<network_research::ResearchCredentialStatus>, String>
+{
+    network_research::get_statuses()
+}
+
+#[tauri::command]
+fn save_network_research_key(
+    provider: network_research::ResearchProvider,
+    key: String,
+) -> Result<(), String> {
+    network_research::save_provider_key(provider, &key)
+}
+
+#[tauri::command]
+async fn verify_network_research_provider(
+    provider: network_research::ResearchProvider,
+) -> Result<network_research::ResearchVerificationResult, String> {
+    network_research::verify_provider(provider).await
+}
+
+#[tauri::command]
+fn remove_network_research_key(provider: network_research::ResearchProvider) -> Result<(), String> {
+    network_research::remove_provider_key(provider)
+}
+
+/// 只做 Pi Sidecar 二进制解析和无凭据 health_check，不读取模型 key 或案件内容。
+#[tauri::command]
+async fn get_pi_runtime_status(app: tauri::AppHandle) -> chat::runtime::PiRuntimeStatus {
+    chat::runtime::get_pi_runtime_status(&app).await
+}
+
+#[tauri::command]
+async fn get_pi_provider_catalog(
+    app: tauri::AppHandle,
+) -> Result<chat::runtime::pi_protocol::PiProviderCatalog, String> {
+    chat::runtime::get_pi_provider_catalog(&app).await
+}
+
+#[tauri::command]
+fn get_pi_credential_status(
+    provider_id: String,
+) -> Result<chat::runtime::pi_credentials::PiCredentialStatus, String> {
+    chat::runtime::get_pi_credential_status(&provider_id)
+}
+
+#[tauri::command]
+async fn begin_pi_provider_auth(
+    app: tauri::AppHandle,
+    provider_id: String,
+    auth_type: String,
+    login_method: Option<String>,
+) -> Result<String, String> {
+    chat::runtime::begin_pi_provider_auth(&app, provider_id, auth_type, login_method).await
+}
+
+#[tauri::command]
+fn respond_pi_provider_auth(
+    auth_session_id: String,
+    prompt_id: String,
+    value: String,
+) -> Result<(), String> {
+    chat::runtime::respond_pi_provider_auth(&auth_session_id, &prompt_id, value)
+}
+
+#[tauri::command]
+fn cancel_pi_provider_auth(auth_session_id: String) -> Result<(), String> {
+    chat::runtime::cancel_pi_provider_auth(&auth_session_id)
+}
+
+#[tauri::command]
+fn remove_pi_provider_credential(provider_id: String) -> Result<(), String> {
+    chat::runtime::remove_pi_provider_credential(&provider_id)
+}
+
+#[tauri::command]
+async fn verify_pi_provider(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    provider_id: String,
+    model_id: String,
+    thinking_level: Option<String>,
+) -> Result<chat::runtime::PiProviderVerificationResult, String> {
+    chat::runtime::verify_pi_provider(
+        &app,
+        pool.inner(),
+        &provider_id,
+        &model_id,
+        thinking_level.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+fn open_agent_runtime_log_directory() -> Result<(), String> {
+    chat::diagnostics::open_runtime_log_directory()
+}
+
+#[tauri::command]
+fn list_legal_skills() -> Result<Vec<chat::skills::LegalSkillSummary>, String> {
+    chat::skills::list()
+}
+
+#[tauri::command]
+fn import_legal_skill(path: String) -> Result<chat::skills::LegalSkillSummary, String> {
+    chat::skills::import(Path::new(&path))
+}
+
+#[tauri::command]
+fn read_legal_skill_content(name: String) -> Result<String, String> {
+    chat::skills::resolve(&name).map(|skill| skill.body)
+}
+
+#[tauri::command]
+fn remove_legal_skill(name: String) -> Result<(), String> {
+    chat::skills::remove_imported(&name)
+}
+
+/// 仅在设置页用户主动触发；未启用 Pi Runtime 时不做后台联网。
+#[tauri::command]
+async fn check_pi_runtime_update() -> pi_runtime_update::PiRuntimeUpdateInfo {
+    pi_runtime_update::check_pi_runtime_update().await
+}
+
+#[tauri::command]
+async fn install_pi_runtime_update(
+    app: tauri::AppHandle,
+    expected_version: String,
+) -> Result<pi_runtime_update::PiRuntimeInstallResult, String> {
+    pi_runtime_update::install_pi_runtime_update(&app, &expected_version).await
+}
+
+#[tauri::command]
+fn rollback_pi_runtime() -> Result<pi_runtime_update::PiRuntimeInstallResult, String> {
+    pi_runtime_update::rollback_pi_runtime()
+}
+
 #[tauri::command]
 async fn generate_home_greeting(
     pool: tauri::State<'_, SqlitePool>,
@@ -1184,7 +1334,7 @@ async fn ensure_local_ready() -> Result<(), String> {
 /// 来就报"LLM 提取失败"。现改成 `from_settings`,跟主 pipeline 保持一致。
 #[tauri::command]
 async fn extract_fields_from_text(text: String) -> Result<llm::ExtractedFields, String> {
-    let settings = settings::read_settings().unwrap_or_default();
+    let settings = material_llm_settings()?;
     let config = llm::LlmConfig::from_settings(&settings);
     llm::extract_case_fields(&config, &text)
         .await
@@ -1202,7 +1352,7 @@ async fn extract_fields_from_text(text: String) -> Result<llm::ExtractedFields, 
 async fn reaggregate_all_cases(
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<ingest::global_pipeline::ReaggregateReport, String> {
-    let settings = settings::read_settings().unwrap_or_default();
+    let settings = material_llm_settings()?;
     let llm_config = llm::LlmConfig::from_settings(&settings);
     ingest::global_pipeline::rerun_all_cases(pool.inner(), &llm_config)
         .await
@@ -4416,6 +4566,24 @@ async fn export_md_docx(
     Ok(p.to_string_lossy().to_string())
 }
 
+/// Milkdown 案件内文书工作区与独立 AI 文稿工作区的统一导出入口。
+#[tauri::command]
+async fn export_editor_document(
+    md_path: String,
+    title: String,
+    format: String,
+    save_path: String,
+) -> Result<String, String> {
+    let p = export::export_editor_document_to(
+        std::path::Path::new(&md_path),
+        &title,
+        &format,
+        std::path::Path::new(&save_path),
+    )
+    .await?;
+    Ok(p.to_string_lossy().to_string())
+}
+
 /// 2026-05-31 V0.3 M1 · 把 save_artifact 生成的文书导出为 **Word(法律格式)**。
 ///
 /// 走 `docx_filing` **filing 档**(MD→原生 OOXML),复刻 quote.law 样本排版(方正小标宋标题 /
@@ -4541,7 +4709,7 @@ async fn global_extract_case(
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
 ) -> Result<ingest::global_pipeline::GlobalExtractReport, String> {
-    let settings = settings::read_settings().unwrap_or_default();
+    let settings = material_llm_settings()?;
     let llm_config = llm::LlmConfig::from_settings(&settings);
     let report =
         ingest::global_pipeline::run_global_extract(pool.inner(), &case_id, &llm_config).await;
@@ -4638,8 +4806,9 @@ async fn save_feedback_md(
 async fn upload_feedback_report(
     info: feedback::DiagnosticInfo,
     description: String,
+    screenshots: Option<Vec<feedback::FeedbackScreenshotInput>>,
 ) -> Result<(), String> {
-    feedback::upload_to_cloud(&info, &description).await
+    feedback::upload_to_cloud(&info, &description, &screenshots.unwrap_or_default()).await
 }
 
 /// 2026-05-27 V0.1.13+:打开默认邮件客户端发反馈给作者。
@@ -4769,6 +4938,7 @@ async fn recompute_case_extraction(
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
 ) -> Result<usize, String> {
+    material_llm_settings()?;
     // 1) 重置 done → pending,清抽取产物
     let res = sqlx::query(
         "UPDATE documents \
@@ -4819,6 +4989,7 @@ async fn retry_failed_case_documents(
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
 ) -> Result<usize, String> {
+    material_llm_settings()?;
     let res = sqlx::query(
         "UPDATE documents SET extraction_status = 'pending', last_error = NULL \
          WHERE case_id = ? AND extraction_status = 'failed' \
@@ -5553,9 +5724,92 @@ fn detached_chat_init_script(
 async fn list_chat_history(
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
+    conversation_id: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<crate::db::chat::ChatMessage>, String> {
-    chat::list_chat_history_impl(pool.inner(), &case_id, limit).await
+    chat::list_chat_history_impl(pool.inner(), &case_id, conversation_id.as_deref(), limit).await
+}
+
+#[tauri::command]
+async fn list_case_chat_conversations(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<crate::db::case_chat_conversations::CaseChatConversation>, String> {
+    crate::db::case_chat_conversations::list_conversations(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn ensure_case_chat_conversation(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<crate::db::case_chat_conversations::CaseChatConversation, String> {
+    crate::db::case_chat_conversations::ensure_conversation(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn create_case_chat_conversation(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    title: Option<String>,
+) -> Result<crate::db::case_chat_conversations::CaseChatConversation, String> {
+    crate::db::case_chat_conversations::create_conversation(
+        pool.inner(),
+        &case_id,
+        title.as_deref(),
+    )
+    .await
+    .map_err(db_err)
+}
+
+#[tauri::command]
+async fn rename_case_chat_conversation(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    conversation_id: String,
+    title: String,
+) -> Result<crate::db::case_chat_conversations::CaseChatConversation, String> {
+    crate::db::case_chat_conversations::rename_conversation(
+        pool.inner(),
+        &case_id,
+        &conversation_id,
+        &title,
+    )
+    .await
+    .map_err(db_err)
+}
+
+#[tauri::command]
+async fn select_case_chat_conversation(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    conversation_id: String,
+) -> Result<(), String> {
+    crate::db::case_chat_conversations::select_conversation(
+        pool.inner(),
+        &case_id,
+        &conversation_id,
+    )
+    .await
+    .map_err(db_err)
+}
+
+#[tauri::command]
+async fn archive_case_chat_conversation(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    conversation_id: String,
+) -> Result<crate::db::case_chat_conversations::CaseChatConversation, String> {
+    crate::db::case_chat_conversations::archive_conversation(
+        pool.inner(),
+        &case_id,
+        &conversation_id,
+    )
+    .await
+    .map_err(db_err)
 }
 
 #[tauri::command]
@@ -5669,13 +5923,39 @@ fn cancel_chat(registry: tauri::State<'_, chat::ChatCancelRegistry>, message_id:
     chat::cancel_chat_impl(registry.inner(), &message_id)
 }
 
+#[tauri::command]
+async fn steer_case_chat(
+    pool: tauri::State<'_, SqlitePool>,
+    registry: tauri::State<'_, chat::ChatCancelRegistry>,
+    message_id: String,
+    case_id: String,
+    conversation_id: String,
+    content: String,
+) -> Result<String, String> {
+    chat::steer_case_chat_impl(
+        pool.inner(),
+        registry.inner(),
+        &message_id,
+        &case_id,
+        &conversation_id,
+        &content,
+    )
+    .await
+}
+
 /// 清空某案件下全部聊天记录(用户主动)。
 #[tauri::command]
 async fn clear_chat_history(
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
+    conversation_id: Option<String>,
 ) -> Result<u64, String> {
-    chat::clear_chat_history_impl(pool.inner(), &case_id).await
+    match conversation_id.as_deref() {
+        Some(conversation_id) => {
+            chat::clear_chat_conversation_impl(pool.inner(), &case_id, conversation_id).await
+        }
+        None => chat::clear_chat_history_impl(pool.inner(), &case_id).await,
+    }
 }
 
 // ============================================================================
@@ -6527,7 +6807,7 @@ async fn prune_yuandian_cache(max_age_days: u32) -> Result<local_kb::cache::Prun
 
 /// 重建/更新本地知识库语义向量索引(整部法律按法条切片 embed)。增量:只对变了的文件重 embed。
 /// 首建会 embed 整库,耗时可能分钟级 —— 显式按钮触发,避免首次 chat 检索时卡住。
-/// 返回索引规模(文件数 / 切片数)。需先在设置配 embedding(硅基流动 bge-m3 免费)。
+/// 返回索引规模（文件数 / 切片数）。需先在设置配置 embedding 服务。
 #[tauri::command]
 async fn build_local_kb_semantic_index(
     app: tauri::AppHandle,
@@ -6541,7 +6821,7 @@ async fn build_local_kb_semantic_index(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            "未配置 embedding API key,请到设置里填写(硅基流动 bge-m3 免费)".to_string()
+            "未配置 embedding API key，请到设置里配置并验证 embedding 服务".to_string()
         })?;
     let endpoint = settings.embedding_endpoint.as_deref().unwrap_or("");
     let model = settings.embedding_model.as_deref().unwrap_or("");
@@ -6555,6 +6835,26 @@ async fn build_local_kb_semantic_index(
 #[tauri::command]
 async fn get_local_kb_index_stats() -> Result<local_kb::semantic::KbIndexStats, String> {
     Ok(local_kb::semantic::index_stats().await)
+}
+
+/// 设置页与 AI 工具共用的知识库检索/维护说明；动态注入当前真实绑定路径。
+#[tauri::command]
+async fn get_local_kb_guide() -> Result<String, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    let kb = local_kb::cache::LocalKb::auto_detect(&settings);
+    Ok(local_kb::guide::render(
+        kb.as_ref().map(|kb| kb.root.as_path()),
+    ))
+}
+
+/// 为 Codex、Claude Code、WorkBuddy 等可访问本机文件的外部 AI 安装统一入口。
+/// 只创建缺失的标准目录和 CaseBoard 管理块，不覆盖用户已有规则正文。
+#[tauri::command]
+fn install_local_kb_ai_entry() -> Result<local_kb::guide::ExternalAiEntry, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    let kb = local_kb::cache::LocalKb::auto_detect(&settings)
+        .ok_or_else(|| "本地知识库未启用，请先在设置中选择知识库目录".to_string())?;
+    local_kb::guide::install_external_ai_entry(&kb.root).map_err(|error| error.to_string())
 }
 
 /// 后台自动增量索引:读设置(开关 + embedding key)→ 没开/没配则跳过 → 否则 spawn 后台增量。
@@ -6592,7 +6892,7 @@ async fn embedding_speed_test(n: u32) -> Result<serde_json::Value, String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            "未配置 embedding API key,请到设置里填写(硅基流动 bge-m3 免费)".to_string()
+            "未配置 embedding API key，请到设置里配置并验证 embedding 服务".to_string()
         })?;
     let endpoint = settings.embedding_endpoint.as_deref().unwrap_or("");
     let model = settings.embedding_model.as_deref().unwrap_or("");
@@ -6722,6 +7022,10 @@ fn ensure_webview2_runtime() {
     std::process::exit(0);
 }
 
+fn should_exit_after_window_destroyed(window_label: &str) -> bool {
+    window_label == "main"
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 2026-05-26 V0.1.11:启动早期装 panic hook,把 panic 信息落到 diagnostic_log
@@ -6772,6 +7076,24 @@ pub fn run() {
                         db::chat_tasks::resume_orphaned_chat_tasks(&pool_for_resume, 5 * 60).await;
                     if n > 0 {
                         crate::dlog!("[startup] resume_orphaned_chat_tasks 标记 {} 个 orphan", n);
+                    }
+                });
+            }
+            {
+                let pool_for_workspace_resume = pool.clone();
+                tauri::async_runtime::spawn(async move {
+                    match db::ai_workspace_chat::recover_interrupted_runs(
+                        &pool_for_workspace_resume,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            crate::dlog!("[startup] AI 事务工作区恢复 {} 个未完成对话任务", n)
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            crate::dlog!("[startup] AI 事务工作区恢复中断任务失败: {}", error)
+                        }
                     }
                 });
             }
@@ -6865,6 +7187,26 @@ pub fn run() {
             open_url,
             reveal_in_finder,
             get_settings,
+            get_network_research_statuses,
+            save_network_research_key,
+            verify_network_research_provider,
+            remove_network_research_key,
+            get_pi_runtime_status,
+            get_pi_provider_catalog,
+            get_pi_credential_status,
+            begin_pi_provider_auth,
+            respond_pi_provider_auth,
+            cancel_pi_provider_auth,
+            remove_pi_provider_credential,
+            verify_pi_provider,
+            open_agent_runtime_log_directory,
+            list_legal_skills,
+            import_legal_skill,
+            read_legal_skill_content,
+            remove_legal_skill,
+            check_pi_runtime_update,
+            install_pi_runtime_update,
+            rollback_pi_runtime,
             generate_home_greeting,
             chat_dashboard_assistant,
             native_location::get_native_location,
@@ -6966,7 +7308,43 @@ pub fn run() {
             yuandian_full_report,
             export_md_html,
             export_md_docx,
+            export_editor_document,
             export_filing_docx,
+            // 非诉 · 独立 AI 事务工作区
+            ai_workspace::commands::list_ai_workspaces,
+            ai_workspace::commands::create_ai_workspace,
+            ai_workspace::commands::open_ai_workspace,
+            ai_workspace::commands::update_ai_workspace,
+            ai_workspace::commands::archive_ai_workspace,
+            ai_workspace::commands::list_ai_workspace_conversations,
+            ai_workspace::commands::ensure_ai_workspace_conversation,
+            ai_workspace::commands::create_ai_workspace_conversation,
+            ai_workspace::commands::rename_ai_workspace_conversation,
+            ai_workspace::commands::select_ai_workspace_conversation,
+            ai_workspace::commands::archive_ai_workspace_conversation,
+            ai_workspace::commands::list_ai_workspace_messages,
+            ai_workspace::commands::list_ai_workspace_tasks,
+            ai_workspace::chat::ai_workspace_chat,
+            ai_workspace::chat::cancel_ai_workspace_chat,
+            ai_workspace::chat::steer_ai_workspace_chat,
+            ai_workspace::commands::add_ai_workspace_sources,
+            ai_workspace::commands::list_ai_workspace_documents,
+            ai_workspace::commands::retry_ai_workspace_source,
+            ai_workspace::commands::relink_ai_workspace_source,
+            ai_workspace::commands::archive_ai_workspace_document,
+            ai_workspace::commands::read_ai_workspace_text,
+            ai_workspace::commands::allow_ai_workspace_assets,
+            ai_workspace::commands::read_ai_workspace_file_bytes,
+            ai_workspace::commands::create_ai_workspace_artifact,
+            ai_workspace::commands::create_ai_workspace_artifact_from_message,
+            ai_workspace::commands::read_ai_workspace_artifact,
+            ai_workspace::commands::save_ai_workspace_artifact,
+            ai_workspace::commands::create_ai_workspace_artifact_version,
+            ai_workspace::commands::list_ai_workspace_artifact_versions,
+            ai_workspace::commands::restore_ai_workspace_artifact_version,
+            ai_workspace::commands::create_ai_workspace_document_proposal,
+            ai_workspace::commands::list_ai_workspace_document_proposals,
+            ai_workspace::commands::resolve_ai_workspace_document_proposal,
             // 合同审查(非诉 tab)
             contract_review::review_contract_docx,
             contract_review::convert_doc_to_docx,
@@ -6996,6 +7374,12 @@ pub fn run() {
             case_chat,
             detach_chat_window,
             list_chat_history,
+            list_case_chat_conversations,
+            ensure_case_chat_conversation,
+            create_case_chat_conversation,
+            rename_case_chat_conversation,
+            select_case_chat_conversation,
+            archive_case_chat_conversation,
             list_case_memories,
             list_global_memories,
             load_memory_vault,
@@ -7007,6 +7391,7 @@ pub fn run() {
             update_case_memory,
             disable_case_memory,
             cancel_chat,
+            steer_case_chat,
             clear_chat_history,
             // MCP 数据源接入(粘贴识别 + 连接测试)
             parse_mcp_paste,
@@ -7046,6 +7431,8 @@ pub fn run() {
             prune_yuandian_cache,
             build_local_kb_semantic_index,
             get_local_kb_index_stats,
+            get_local_kb_guide,
+            install_local_kb_ai_entry,
             embedding_speed_test,
             get_yuandian_monthly_stats,
             get_yuandian_credits_overview,
@@ -7067,9 +7454,14 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             match event {
-                // 仅主窗口销毁才视为 App 退出。独立 AI 助手窗口关闭时不能误杀
-                // llama-server 等生命周期子进程。
-                tauri::WindowEvent::Destroyed if window.label() == "main" => lifecycle::shutdown(),
+                // macOS 关闭最后一个窗口默认不退出应用；主窗口销毁后需显式结束
+                // Tauri 事件循环。独立 AI 助手窗口关闭时仍不能误杀 App。
+                tauri::WindowEvent::Destroyed
+                    if should_exit_after_window_destroyed(window.label()) =>
+                {
+                    lifecycle::shutdown();
+                    window.app_handle().exit(0);
+                }
                 // 切回 App(窗口重新获得焦点)→ 触发一次滴答同步(已连接 + 开了自动同步才真跑)。
                 tauri::WindowEvent::Focused(true) => {
                     ticktick::sync_on_focus(window.app_handle().clone());

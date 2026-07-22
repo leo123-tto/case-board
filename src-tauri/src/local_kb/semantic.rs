@@ -15,79 +15,38 @@
 
 use std::path::{Path, PathBuf};
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use walkdir::WalkDir;
 
 use crate::embedding::index::{chunk_text, Chunk};
 
-/// 普通文件切片目标字数(跟案件索引一致)。
-const CHUNK_TARGET_CHARS: usize = 500;
+/// 普通材料的目标切片长度。法规仍严格逐条切，不受这个下限影响。
+const CHUNK_TARGET_CHARS: usize = 700;
+/// 案例、专题和普通笔记不保留孤立的标题/短段；会与相邻正文合并。
+const MIN_PROSE_CHUNK_CHARS: usize = 120;
 /// 单次 embed 批量上限(兼容硅基/智谱)。
 const EMBED_BATCH: usize = 32;
 /// 整库切片硬上限:超过只索引前 N 片并 dlog 告警(不静默截断,防索引爆炸)。
 const MAX_TOTAL_CHUNKS: usize = 80_000;
+/// 大索引若每完成一个文件就重写整份 JSON，会对 500MB 级索引产生巨量重复 IO。
+/// 按切片数或文件数做有界 checkpoint：异常退出最多重做这一小段，不会整库归零。
+const CHECKPOINT_CHUNKS: usize = 512;
+const CHECKPOINT_FILES: usize = 25;
 /// 单文件大小上限(跟 search.rs 对齐),超过跳过。
 const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024;
+/// 向量语料/切片规则版本。旧索引仍可只读查询，但更新时不得复用旧规则生成的向量。
+const INDEX_SCHEMA_VERSION: u32 = 3;
 
-/// **小而精的目录**:整目录纳入(文件少、价值高)。企业=companies / 案例经验=cases-experience / 专题=topics。
-const ALWAYS_DIRS: &[&str] = &["raw/cases-experience", "raw/companies", "wiki/topics"];
-
-/// 判定「整部法律全文」的最少条文数(「第X条」标题行)。
-/// 注:`raw/notes` 有 2500+ 文件、大多是判例,只挑「核心常用法整部全文」入索引(关键词+内容+去重),
-/// 不整目录纳入(否则索引爆炸);`raw/yuandian-cache` 的 法规/法条/案例 详情直接收(排除 SEARCH 碎片)。
+/// 判定「整部法律全文」的最少条文数（“第 X 条”标题行）。
+/// 达到阈值的法规按条文正文指纹去重；普通 raw/notes 仍按原始正文进入语料。
 const LAW_ARTICLE_THRESHOLD: usize = 20;
-
-/// 核心常用法关键词:文件名含其一,才作为候选核心法(老板选的「核心常用法,去重」)。
-/// 偏民商 + 诉讼 + 常用司法解释 + 老板常办的建工/公司类。需要扩就往这加。
-const CORE_LAW_KEYWORDS: &[&str] = &[
-    "民法典",
-    "民事诉讼法",
-    "民诉",
-    "公司法",
-    "合伙企业法",
-    "个人独资企业",
-    "担保",
-    "物权",
-    "合同编",
-    "买卖合同",
-    "建设工程",
-    "物业服务",
-    "劳动合同法",
-    "劳动法",
-    "劳动争议",
-    "社会保险法",
-    "婚姻家庭",
-    "继承",
-    "侵权责任",
-    "仲裁法",
-    "企业破产",
-    "破产法",
-    "证券法",
-    "票据法",
-    "保险法",
-    "行政诉讼法",
-    "行政处罚法",
-    "行政许可法",
-    "行政复议法",
-    "行政强制法",
-    "国家赔偿法",
-    "刑法",
-    "刑事诉讼",
-];
-
-/// 文件名含这些 → 是判例/个案,**不是**法律全文,直接跳过(避免读 2500 个判决书)。
-const CASE_NAME_MARKERS: &[&str] = &[
-    "判决书",
-    "裁定书",
-    "调解书",
-    "决定书",
-    "案例",
-    "纠纷",
-    "_deprecated",
-];
 
 // =============================================================================
 // 落盘结构
@@ -107,6 +66,8 @@ pub struct KbFileIndex {
 pub struct KbIndex {
     /// `<endpoint>|<model>`;变了 → 整库失效重建(维度也会变)。
     pub signature: String,
+    #[serde(default)]
+    pub schema_version: u32,
     /// 2026-06-15:索引对应的 KB 根目录(canonical 绝对路径字符串)。用户改了
     /// `settings.local_kb_root` 后,旧索引里的 rel_path 已对不上新根,必须视作废索引
     /// 全量重建,否则 `search_local_kb` 会召回旧根的内容(用户视角=搜到不存在的文件)。
@@ -114,6 +75,11 @@ pub struct KbIndex {
     /// 文件(无此字段 → 空串 → 必定视为根不一致 → 一次性全量重建)。
     #[serde(default)]
     pub kb_root: String,
+    /// 本次增量计划的目标文件/切片总量。中途退出后仍可显示稳定的「已完成 / 总量」。
+    #[serde(default)]
+    pub target_files: u32,
+    #[serde(default)]
+    pub target_chunks: u32,
     pub files: Vec<KbFileIndex>,
 }
 
@@ -130,14 +96,69 @@ pub struct KbHit {
 pub struct KbIndexStats {
     pub files: u32,
     pub chunks: u32,
+    pub total_files: u32,
+    pub total_chunks: u32,
 }
 
 impl KbIndex {
     pub fn stats(&self) -> KbIndexStats {
+        let files = self.files.len() as u32;
+        let chunks = self.files.iter().map(|f| f.chunks.len()).sum::<usize>() as u32;
         KbIndexStats {
-            files: self.files.len() as u32,
-            chunks: self.files.iter().map(|f| f.chunks.len()).sum::<usize>() as u32,
+            files,
+            chunks,
+            // 兼容旧索引：旧 JSON 没有 target_*，反序列化为 0；至少不能小于已完成量。
+            total_files: self.target_files.max(files),
+            total_chunks: self.target_chunks.max(chunks),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProgressCounts {
+    done: usize,
+    total: usize,
+    remaining: usize,
+}
+
+fn calculate_progress(
+    reused_chunks: usize,
+    completed_pending_chunks: usize,
+    pending_chunks: usize,
+) -> ProgressCounts {
+    let completed_pending_chunks = completed_pending_chunks.min(pending_chunks);
+    let total = reused_chunks.saturating_add(pending_chunks);
+    let done = reused_chunks.saturating_add(completed_pending_chunks);
+    ProgressCounts {
+        done,
+        total,
+        remaining: total.saturating_sub(done),
+    }
+}
+
+fn should_checkpoint(chunks_since_last: usize, files_since_last: usize) -> bool {
+    chunks_since_last >= CHECKPOINT_CHUNKS || files_since_last >= CHECKPOINT_FILES
+}
+
+static INDEX_BUILD_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 手动按钮与后台自动维护共用同一把进程内租约，避免设置页重进或自动任务重叠后重复 embed。
+struct IndexBuildLease<'a> {
+    running: &'a AtomicBool,
+}
+
+impl<'a> IndexBuildLease<'a> {
+    fn acquire(running: &'a AtomicBool) -> Result<Self, String> {
+        running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| "知识库向量索引已有任务运行中，请等待当前任务完成".to_string())?;
+        Ok(Self { running })
+    }
+}
+
+impl Drop for IndexBuildLease<'_> {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
     }
 }
 
@@ -177,22 +198,75 @@ pub fn file_cache_key(meta: &std::fs::Metadata) -> String {
 /// 整部法律(含足够多「第X条」)→ **按法条切片**,每条独立 chunk;否则走 `chunk_text`。
 /// 条文级切片是本功能核心:让 query 直接命中对的那一条,而不是整部 334K 一个块。
 /// 按**内容**(条标题行数)判定,不看目录 —— 法律全文在 yuandian-cache 也在 raw/notes。
-pub fn chunk_kb_file(_rel_path: &str, text: &str) -> Vec<String> {
+pub fn chunk_kb_file(rel_path: &str, text: &str) -> Vec<String> {
     if count_article_markers(text) >= 5 {
         let arts = split_by_article(text);
         if !arts.is_empty() {
-            return arts;
+            let title = law_display_name(rel_path);
+            return arts
+                .into_iter()
+                .map(|article| format!("【法规：{title}】\n{article}"))
+                .collect();
         }
     }
-    chunk_text(text, CHUNK_TARGET_CHARS)
+    balanced_prose_chunks(text)
 }
 
-/// 文件名是否「核心常用法候选」:含核心法关键词、且不含判例/个案标记。
-pub fn is_core_law_candidate(file_name: &str) -> bool {
-    if CASE_NAME_MARKERS.iter().any(|m| file_name.contains(m)) {
-        return false;
+fn law_display_name(rel_path: &str) -> String {
+    let file_name = Path::new(rel_path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("未命名法规");
+    let mut name = file_name.to_string();
+    if name.len() >= 11 {
+        let bytes = name.as_bytes();
+        if bytes[0..4].iter().all(u8::is_ascii_digit)
+            && bytes[4] == b'-'
+            && bytes[5..7].iter().all(u8::is_ascii_digit)
+            && bytes[7] == b'-'
+            && bytes[8..10].iter().all(u8::is_ascii_digit)
+            && bytes[10] == b'-'
+        {
+            name = name[11..].to_string();
+        }
     }
-    CORE_LAW_KEYWORDS.iter().any(|k| file_name.contains(k))
+    for prefix in ["[国法]", "[元典法规]", "[元典法条]"] {
+        name = name.trim_start_matches(prefix).trim_start().to_string();
+    }
+    for prefix in ["法规-", "法条-"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            if let Some(separator) = rest.find('_') {
+                let id = &rest[..separator];
+                if !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    name = rest[separator + 1..].to_string();
+                }
+            }
+        }
+    }
+    name.trim().to_string()
+}
+
+fn balanced_prose_chunks(text: &str) -> Vec<String> {
+    let mut chunks = chunk_text(text, CHUNK_TARGET_CHARS);
+    let mut index = 0usize;
+    while index < chunks.len() {
+        if chunks.len() == 1 || chunks[index].chars().count() >= MIN_PROSE_CHUNK_CHARS {
+            index += 1;
+            continue;
+        }
+        if index + 1 < chunks.len() {
+            let next = chunks.remove(index + 1);
+            chunks[index].push('\n');
+            chunks[index].push_str(&next);
+        } else if index > 0 {
+            let tail = chunks.remove(index);
+            chunks[index - 1].push('\n');
+            chunks[index - 1].push_str(&tail);
+        } else {
+            index += 1;
+        }
+    }
+    chunks
 }
 
 /// 把文件名归一成「法律规范名」用于去重:剥日期前缀 / `[国法]` / `法规-<hex>_` 前缀 /
@@ -218,8 +292,10 @@ pub fn normalize_law_name(file_name: &str) -> String {
             s = s[11..].to_string();
         }
     }
-    // 去 [国法] 前缀(可能带空格)
-    s = s.trim_start_matches("[国法]").trim_start().to_string();
+    // 去来源标签前缀(可能带空格)。这些标签不属于法规正式名称。
+    for prefix in ["[国法]", "[元典法规]", "[元典法条]"] {
+        s = s.trim_start_matches(prefix).trim_start().to_string();
+    }
     // 去 yuandian 详情前缀 法规-/法条-/案例- 后跟 <hex>_
     for pfx in ["法规-", "法条-", "案例-"] {
         let stripped = s.strip_prefix(pfx).and_then(|rest| {
@@ -314,19 +390,57 @@ fn strip_version_parens(s: &str) -> String {
     out
 }
 
-/// 去重:同一 `normalize_law_name` 的多个副本只留一个 —— 留**条文最多**(最全),并列取路径最短。
-/// 入参 `(canonical, articles, rel)`,返回保留的 `rel` 集合(HashSet 便于 collect 过滤)。
+/// 去重：同一正文指纹的多个法规副本只留一个。正文指纹由调用方传入；不同历史版本只要
+/// 条文实质不同就会保留，不再因为规范化名称相同而误删。优先保留已提升的 `raw/notes`。
+/// 入参 `(body_fingerprint, articles, rel)`，返回保留的 `rel` 集合。
 pub fn dedup_law_rels(items: &[(String, usize, String)]) -> std::collections::HashSet<String> {
     use std::collections::HashMap;
-    let mut best: HashMap<&str, (usize, &str)> = HashMap::new(); // canonical -> (articles, rel)
-    for (canon, arts, rel) in items {
-        let e = best.entry(canon.as_str()).or_insert((*arts, rel.as_str()));
-        let better = *arts > e.0 || (*arts == e.0 && rel.len() < e.1.len());
+    let mut best: HashMap<&str, (usize, &str)> = HashMap::new();
+    for (fingerprint, arts, rel) in items {
+        let e = best
+            .entry(fingerprint.as_str())
+            .or_insert((*arts, rel.as_str()));
+        let better = *arts > e.0
+            || (*arts == e.0
+                && (corpus_source_priority(rel), rel.len())
+                    < (corpus_source_priority(e.1), e.1.len()));
         if better {
             *e = (*arts, rel.as_str());
         }
     }
     best.values().map(|(_, rel)| rel.to_string()).collect()
+}
+
+fn normalized_text_digest<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        for token in part.split_whitespace() {
+            digest.update(token.as_bytes());
+        }
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn law_body_fingerprint(text: &str) -> String {
+    let articles = split_by_article(text);
+    if articles.is_empty() {
+        normalized_text_digest([text])
+    } else {
+        normalized_text_digest(articles.iter().map(String::as_str))
+    }
+}
+
+fn corpus_source_priority(rel: &str) -> u8 {
+    if rel.starts_with("raw/notes/") {
+        0
+    } else if rel.starts_with("wiki/topics/") || rel.starts_with("raw/cases-experience/") {
+        1
+    } else if rel.starts_with("raw/yuandian-cache/") {
+        2
+    } else {
+        3
+    }
 }
 
 /// 数「第X条」条标题行的数量(判断是不是整部法律)。
@@ -396,7 +510,8 @@ pub fn plan_update(
     new_signature: &str,
     current: &[(String, String)], // (rel_path, cache_key)
 ) -> (Vec<String>, Vec<String>) {
-    let sig_ok = existing.signature == new_signature;
+    let sig_ok =
+        existing.signature == new_signature && existing.schema_version == INDEX_SCHEMA_VERSION;
     let mut reuse = Vec::new();
     let mut embed = Vec::new();
     for (rel, ck) in current {
@@ -420,6 +535,9 @@ pub fn plan_update(
 pub fn rank_hits(index: &KbIndex, query_vec: &[f32], top_n: usize) -> Vec<KbHit> {
     let mut scored: Vec<KbHit> = Vec::new();
     for f in &index.files {
+        if should_exclude_semantic_hit(&f.rel_path) {
+            continue;
+        }
         for c in &f.chunks {
             scored.push(KbHit {
                 rel_path: f.rel_path.clone(),
@@ -432,9 +550,34 @@ pub fn rank_hits(index: &KbIndex, query_vec: &[f32], top_n: usize) -> Vec<KbHit>
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                corpus_source_priority(&a.rel_path).cmp(&corpus_source_priority(&b.rel_path))
+            })
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+    let mut seen_text = std::collections::HashSet::new();
+    scored.retain(|hit| {
+        let normalized = hit.text.split_whitespace().collect::<String>();
+        seen_text.insert(normalized)
     });
     scored.truncate(top_n);
     scored
+}
+
+fn should_exclude_semantic_hit(rel: &str) -> bool {
+    let normalized = rel.replace('\\', "/");
+    let is_raw_note = normalized.starts_with("raw/notes/");
+    let is_detail_cache = normalized
+        .strip_prefix("raw/yuandian-cache/")
+        .and_then(|rest| rest.rsplit('/').next())
+        .is_some_and(|name| {
+            (name.starts_with("法规-") || name.starts_with("法条-") || name.starts_with("案例-"))
+                && !name.starts_with("SEARCH-")
+        });
+    (!is_raw_note && !is_detail_cache)
+        || normalized
+            .split('/')
+            .any(|segment| matches!(segment, "_inbox" | "_deprecated" | "00_ARCHIVE"))
 }
 
 // =============================================================================
@@ -450,9 +593,57 @@ async fn load_index() -> KbIndex {
     let Ok(path) = index_path() else {
         return KbIndex::default();
     };
-    match tokio::fs::read_to_string(&path).await {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => KbIndex::default(),
+    match load_index_at(&path).await {
+        Ok(index) => index,
+        Err(e) => {
+            // 解析失败不能再静默伪装成「从未建过」，否则下一次会误走整库冷启动。
+            crate::dlog!("[kb-semantic] 读取索引失败: {}", e);
+            KbIndex::default()
+        }
+    }
+}
+
+fn index_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("local_kb.json");
+    path.with_file_name(format!("{name}.{suffix}"))
+}
+
+async fn parse_index_file(path: &Path) -> Result<KbIndex, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file =
+            std::fs::File::open(&path).map_err(|e| format!("读取 {} 失败:{e}", path.display()))?;
+        let reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+        serde_json::from_reader(reader).map_err(|e| format!("解析 {} 失败:{e}", path.display()))
+    })
+    .await
+    .map_err(|e| format!("读取 KB 索引任务失败:{e}"))?
+}
+
+/// 主文件若在旧版本的覆盖写期间被中断，优先恢复原子替换留下的最后一份完整备份。
+async fn load_index_at(path: &Path) -> Result<KbIndex, String> {
+    let main_existed = tokio::fs::metadata(path).await.is_ok();
+    match parse_index_file(path).await {
+        Ok(index) => Ok(index),
+        Err(main_error) => {
+            let backup = index_sidecar_path(path, "bak");
+            let recovered = parse_index_file(&backup)
+                .await
+                .map_err(|backup_error| format!("{main_error}; 备份也不可用:{backup_error}"))?;
+
+            // 主文件原本不存在，通常表示写入者正处于 main→backup→main 的替换窗口；
+            // 此时只读备份，不能把它抢走。主文件原本存在但损坏，才执行一次恢复。
+            if main_existed {
+                let _ = tokio::fs::remove_file(path).await;
+                if let Err(e) = tokio::fs::rename(&backup, path).await {
+                    crate::dlog!("[kb-semantic] 恢复索引备份失败: {}", e);
+                }
+            }
+            Ok(recovered)
+        }
     }
 }
 
@@ -554,24 +745,104 @@ async fn load_index_cached() -> Arc<KbIndex> {
     arc
 }
 
-async fn save_index(index: &KbIndex) -> Result<(), String> {
-    let path = index_path()?;
+#[derive(Serialize)]
+struct KbIndexSnapshot<'a> {
+    signature: &'a str,
+    schema_version: u32,
+    kb_root: &'a str,
+    target_files: u32,
+    target_chunks: u32,
+    files: &'a [KbFileIndex],
+}
+
+/// 先完整写同目录临时文件并 sync，再用 backup 两段 rename 替换主文件。
+/// 这兼容 Windows 的「rename 不能覆盖现有文件」，任一时刻至少保留主文件或备份之一。
+async fn save_serializable_at<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| format!("建 embeddings 目录失败: {e}"))?;
     }
-    let json = serde_json::to_string(index).map_err(|e| format!("序列化 KB 索引失败: {e}"))?;
-    tokio::fs::write(&path, json)
-        .await
-        .map_err(|e| format!("写 KB 索引失败: {e}"))?;
+
+    let temp = index_sidecar_path(path, "tmp");
+    let backup = index_sidecar_path(path, "bak");
+    {
+        use std::io::{BufWriter, Write};
+
+        let file =
+            std::fs::File::create(&temp).map_err(|e| format!("创建 KB 索引临时文件失败:{e}"))?;
+        let mut writer = BufWriter::new(&file);
+        serde_json::to_writer(&mut writer, value).map_err(|e| format!("序列化 KB 索引失败:{e}"))?;
+        writer
+            .flush()
+            .map_err(|e| format!("刷新 KB 索引临时文件失败:{e}"))?;
+        drop(writer);
+        file.sync_all()
+            .map_err(|e| format!("同步 KB 索引临时文件失败:{e}"))?;
+    }
+
+    if tokio::fs::metadata(&backup).await.is_ok() {
+        tokio::fs::remove_file(&backup)
+            .await
+            .map_err(|e| format!("清理旧 KB 索引备份失败:{e}"))?;
+    }
+    let had_main = tokio::fs::metadata(path).await.is_ok();
+    if had_main {
+        tokio::fs::rename(path, &backup)
+            .await
+            .map_err(|e| format!("备份现有 KB 索引失败:{e}"))?;
+    }
+    if let Err(e) = tokio::fs::rename(&temp, path).await {
+        if had_main {
+            let _ = tokio::fs::rename(&backup, path).await;
+        }
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(format!("安装新 KB 索引失败:{e}"));
+    }
+    if had_main {
+        // 主文件已完整安装，备份仅用于替换窗口中的崩溃恢复，不长期占用数百 MB 磁盘。
+        if let Err(e) = tokio::fs::remove_file(&backup).await {
+            crate::dlog!("[kb-semantic] 清理 KB 索引备份失败: {}", e);
+        }
+    }
     Ok(())
 }
 
-/// 采集语料,覆盖**三块:法条 + 案例 + 企业**。返回 (rel_path, abs_path, cache_key)。
-/// - 企业 = `raw/companies`(整目录);案例经验 = `raw/cases-experience`(整目录);专题 = `wiki/topics`。
+async fn save_index_at(path: &Path, index: &KbIndex) -> Result<(), String> {
+    save_serializable_at(path, index).await
+}
+
+async fn save_index(index: &KbIndex) -> Result<(), String> {
+    let path = index_path()?;
+    save_index_at(&path, index).await
+}
+
+async fn save_index_checkpoint(
+    signature: &str,
+    kb_root: &str,
+    target_files: usize,
+    target_chunks: usize,
+    files: &[KbFileIndex],
+) -> Result<(), String> {
+    let path = index_path()?;
+    let snapshot = KbIndexSnapshot {
+        signature,
+        schema_version: INDEX_SCHEMA_VERSION,
+        kb_root,
+        target_files: target_files.min(u32::MAX as usize) as u32,
+        target_chunks: target_chunks.min(u32::MAX as usize) as u32,
+        files,
+    };
+    save_serializable_at(&path, &snapshot).await
+}
+
+/// 采集 embedding 语料。返回 `(rel_path, abs_path, cache_key)`。
 /// - 案例(元典)= `yuandian-cache/案例-*`(get_case_detail 详情,元典 id 唯一,直接收)。
-/// - 法条 = `yuandian-cache/法规-·法条-` + `raw/notes` 核心常用法全文,**跨目录去重**(同一部法多副本留最全)。
+/// - 法规 = `yuandian-cache/法规-·法条-` + `raw/notes` 所有整部法规；按条文正文指纹
+///   跨目录去重，保留实质不同的历史版本。
+/// - 普通 `raw/notes` 案例/笔记继续纳入。
+/// - `wiki/*`、企业档案、办案经验卡、自建导航目录、管理文件和归档由目录/BM25 层承担，
+///   不重复 embedding。也就是说，向量层只切原始或近原始的完整正文。
 fn collect_corpus(kb_root: &Path) -> Vec<(String, PathBuf, String)> {
     let root = match kb_root.canonicalize() {
         Ok(p) => p,
@@ -579,17 +850,12 @@ fn collect_corpus(kb_root: &Path) -> Vec<(String, PathBuf, String)> {
     };
     let mut out: Vec<(String, PathBuf, String)> = Vec::new();
 
-    // ① 小而精目录:整目录纳入(企业档案 / 办案经验 / 专题)
-    for dir in ALWAYS_DIRS {
-        collect_dir_all(&root, dir, &mut out);
-    }
-
     // 法律去重池(法规/法条,跨 yuandian-cache 与 raw/notes 去重)
-    let mut law_candidates: Vec<(String, usize, String)> = Vec::new(); // (canonical, articles, rel)
+    let mut law_candidates: Vec<(String, usize, String)> = Vec::new(); // (body fingerprint, articles, rel)
     let mut law_meta: std::collections::HashMap<String, (PathBuf, String)> =
         std::collections::HashMap::new(); // rel -> (abs, cache_key)
-    let mut push_law = |rel: String, abs: PathBuf, ck: String, file_name: &str, arts: usize| {
-        law_candidates.push((normalize_law_name(file_name), arts, rel.clone()));
+    let mut push_law = |rel: String, abs: PathBuf, ck: String, text: &str, arts: usize| {
+        law_candidates.push((law_body_fingerprint(text), arts, rel.clone()));
         law_meta.insert(rel, (abs, ck));
     };
 
@@ -625,14 +891,18 @@ fn collect_corpus(kb_root: &Path) -> Vec<(String, PathBuf, String)> {
                 // 案例详情:元典 id 命名唯一,直接收
                 out.push((rel, p.to_path_buf(), file_cache_key(&meta)));
             } else if file_name.starts_with("法规-") || file_name.starts_with("法条-") {
-                let arts = count_article_markers(&std::fs::read_to_string(p).unwrap_or_default());
-                push_law(rel, p.to_path_buf(), file_cache_key(&meta), file_name, arts);
+                let text = std::fs::read_to_string(p).unwrap_or_default();
+                if super::validity::is_inactive_regulation_text(&text) {
+                    continue;
+                }
+                let arts = count_article_markers(&text);
+                push_law(rel, p.to_path_buf(), file_cache_key(&meta), &text, arts);
             }
             // 其余(企业 SEARCH 碎片等)不在此收
         }
     }
 
-    // ③ raw/notes 全收(排除废止法):**法律**走去重池(多副本留最全);**案例原文 / 笔记**直接索引。
+    // ③ raw/notes 全收(排除废止法):所有整部法规走正文指纹去重池；案例原文 / 笔记直接索引。
     //   案例原文(判决书/裁定书…)也在这里,老板要三块齐全 → 不再排除判例。
     let notes = root.join("raw/notes");
     if notes.exists() {
@@ -662,13 +932,14 @@ fn collect_corpus(kb_root: &Path) -> Vec<(String, PathBuf, String)> {
             if meta.len() > MAX_FILE_SIZE {
                 continue;
             }
-            // 核心法命名 + 内容确认是整部法律 → 去重池;否则(案例原文 / 笔记)直接索引
-            if is_core_law_candidate(file_name) {
-                let arts = count_article_markers(&std::fs::read_to_string(p).unwrap_or_default());
-                if arts >= LAW_ARTICLE_THRESHOLD {
-                    push_law(rel, p.to_path_buf(), file_cache_key(&meta), file_name, arts);
-                    continue;
-                }
+            let text = std::fs::read_to_string(p).unwrap_or_default();
+            if super::validity::is_inactive_regulation_text(&text) {
+                continue;
+            }
+            let arts = count_article_markers(&text);
+            if arts >= LAW_ARTICLE_THRESHOLD {
+                push_law(rel, p.to_path_buf(), file_cache_key(&meta), &text, arts);
+                continue;
             }
             out.push((rel, p.to_path_buf(), file_cache_key(&meta)));
         }
@@ -683,109 +954,54 @@ fn collect_corpus(kb_root: &Path) -> Vec<(String, PathBuf, String)> {
         }
     }
 
-    // ④ 整根目录补扫:不同系统 / 不同知识库迁移过来时,文件夹命名未必遵守
-    //    `raw/*` + `wiki/*`。标准目录先走特殊逻辑(法律去重 / 元典详情过滤 SEARCH),
-    //    然后把未覆盖的 .md/.txt 从整根补进来,避免自建分类漏索引。
-    collect_root_remaining(&root, &mut out);
+    dedup_exact_corpus_files(out)
+}
 
+fn dedup_exact_corpus_files(
+    files: Vec<(String, PathBuf, String)>,
+) -> Vec<(String, PathBuf, String)> {
+    let mut best: std::collections::HashMap<String, (String, PathBuf, String)> =
+        std::collections::HashMap::new();
+    for (rel, abs, cache_key) in files {
+        let text = std::fs::read_to_string(&abs).unwrap_or_default();
+        if is_low_value_semantic_text(&text) {
+            continue;
+        }
+        let fingerprint = normalized_text_digest([text.as_str()]);
+        let keep_existing = matches!(
+            best.get(&fingerprint),
+            Some((kept_rel, _, _))
+                if (corpus_source_priority(kept_rel), kept_rel.len())
+                    <= (corpus_source_priority(&rel), rel.len())
+        );
+        if !keep_existing {
+            best.insert(fingerprint, (rel, abs, cache_key));
+        }
+    }
+    let mut out = best.into_values().collect::<Vec<_>>();
+    out.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     out
 }
 
-/// 把一个目录下所有可索引文件加入 out(给 ALWAYS_DIRS 用)。
-fn collect_dir_all(root: &Path, dir: &str, out: &mut Vec<(String, PathBuf, String)>) {
-    let target = root.join(dir);
-    if !target.exists() {
-        return;
-    }
-    for entry in WalkDir::new(&target)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let p = entry.path();
-        if !p.is_file() {
-            continue;
-        }
-        let Some(file_name) = p.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let rel = p
-            .strip_prefix(root)
-            .map(|r| r.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| p.to_string_lossy().into_owned());
-        if !is_indexable_file(&rel, file_name) {
-            continue;
-        }
-        let Ok(meta) = std::fs::metadata(p) else {
-            continue;
-        };
-        if meta.len() > MAX_FILE_SIZE {
-            continue;
-        }
-        out.push((rel, p.to_path_buf(), file_cache_key(&meta)));
-    }
-}
-
-/// 补扫整根 KB 目录,只补当前 out 里还没有的 `.md/.txt`。
-///
-/// 排除:
-/// - `raw/yuandian-cache`:上面已经用详情规则专门收集,这里不能把 `SEARCH-*` 碎片卷进来;
-/// - `_deprecated` / `00_ARCHIVE`:沿用旧语义索引的排除口径;
-/// - `.git` / `node_modules` / `target` / `dist`:明显不是知识库正文。
-fn collect_root_remaining(root: &Path, out: &mut Vec<(String, PathBuf, String)>) {
-    let mut seen: std::collections::HashSet<String> =
-        out.iter().map(|(rel, _, _)| rel.clone()).collect();
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let p = entry.path();
-        if !p.is_file() {
-            continue;
-        }
-        let Some(file_name) = p.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let rel = p
-            .strip_prefix(root)
-            .map(|r| r.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"));
-        if seen.contains(&rel) || should_skip_root_corpus_path(&rel) {
-            continue;
-        }
-        if !is_indexable_file(&rel, file_name) {
-            continue;
-        }
-        let Ok(meta) = std::fs::metadata(p) else {
-            continue;
-        };
-        if meta.len() > MAX_FILE_SIZE {
-            continue;
-        }
-        seen.insert(rel.clone());
-        out.push((rel, p.to_path_buf(), file_cache_key(&meta)));
-    }
-}
-
-fn should_skip_root_corpus_path(rel: &str) -> bool {
-    if rel == "raw/yuandian-cache" || rel.starts_with("raw/yuandian-cache/") {
+fn is_low_value_semantic_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.chars().count() < 20 {
         return true;
     }
-    rel.split('/').any(|seg| {
-        matches!(
-            seg,
-            "_deprecated" | "00_ARCHIVE" | ".git" | "node_modules" | "target" | "dist"
-        )
-    })
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("请求参数json异常")
+        || lower.contains("调用频率超过限制")
+        || lower.contains("<title>502 bad gateway")
+        || lower.contains("<title>503 service unavailable")
 }
 
 /// 进度事件名。前端 `listen("kb_index_progress", ...)` 拿 `{done, total, phase}`。
 pub const PROGRESS_EVENT: &str = "kb_index_progress";
 
 /// 懒加载 + 增量建/更新 KB 向量索引。没配 key / 网络错 → 透传，调用方静默回退。
-/// `app=Some` 时按切片批次 emit 进度(给「重建索引」按钮显示 X/Y);`None`(工具内懒建)不发。
-/// **每个文件 embed 完就落盘一次**:长任务可观察(文件在长大)、中断也保住已完成部分(下次增量续)。
+/// `app=Some` 时按切片批次 emit 进度；分母始终是「已复用 + 待处理」的全量目标，
+/// 所以中断续跑时会从已完成量继续，而不是把剩余量误显示成新的总量。
+/// 索引按有界批次原子 checkpoint：避免 500MB 级 JSON 每个文件都全量重写，同时保住续跑进度。
 pub async fn build_or_update_index(
     kb_root: &Path,
     endpoint: &str,
@@ -795,6 +1011,7 @@ pub async fn build_or_update_index(
 ) -> Result<KbIndex, String> {
     use tauri::Emitter;
 
+    let _lease = IndexBuildLease::acquire(&INDEX_BUILD_RUNNING)?;
     let sig = crate::embedding::index::signature(endpoint, model);
     // 根切换 → 全量重建(见 load_index_for_root)。
     let (existing, current_root) = load_index_for_root(kb_root).await;
@@ -839,23 +1056,69 @@ pub async fn build_or_update_index(
         pending.push((rel.clone(), ck.clone(), pieces));
     }
 
-    let grand_total: usize = pending.iter().map(|(_, _, p)| p.len()).sum();
-    let mut done = 0usize;
-    let emit = |phase: &str, done: usize| {
+    let pending_total: usize = pending.iter().map(|(_, _, p)| p.len()).sum();
+    let reused_chunks = files.iter().map(|file| file.chunks.len()).sum::<usize>();
+    let target_files = files.len().saturating_add(pending.len());
+    let target_chunks = reused_chunks.saturating_add(pending_total);
+    let mut completed_pending = 0usize;
+    let emit = |phase: &str, completed_pending: usize| {
         if let Some(a) = app {
+            let progress = calculate_progress(reused_chunks, completed_pending, pending_total);
             let _ = a.emit(
                 PROGRESS_EVENT,
-                serde_json::json!({"done": done, "total": grand_total, "phase": phase}),
+                serde_json::json!({
+                    "done": progress.done,
+                    "total": progress.total,
+                    "remaining": progress.remaining,
+                    "phase": phase
+                }),
             );
         }
     };
-    emit("start", 0);
+    emit("start", completed_pending);
 
-    // 逐文件 embed(文件内按 EMBED_BATCH 分批,每批后报进度);每个文件完成后落盘一次。
+    let metadata_changed = existing.signature != sig
+        || existing.schema_version != INDEX_SCHEMA_VERSION
+        || existing.kb_root != current_root
+        || existing.target_files != target_files as u32
+        || existing.target_chunks != target_chunks as u32
+        || existing.files.len() != target_files
+        || !to_embed.is_empty();
+    let has_pending = !pending.is_empty();
+    let mut last_saved_file_count = None;
+    if has_pending {
+        // 先持久化计划总量与已复用切片。即使第一批网络请求前退出，下次也能显示稳定总量。
+        save_index_checkpoint(&sig, &current_root, target_files, target_chunks, &files).await?;
+        last_saved_file_count = Some(files.len());
+    }
+
+    let mut chunks_since_checkpoint = 0usize;
+    let mut files_since_checkpoint = 0usize;
+    // 逐文件 embed(文件内按 EMBED_BATCH 分批,每批后报全库稳定进度)。
     for (rel, ck, pieces) in pending {
+        let file_chunk_count = pieces.len();
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(pieces.len());
         for batch in pieces.chunks(EMBED_BATCH) {
-            let v = crate::embedding::embed(endpoint, model, key, batch).await?;
+            let v = match crate::embedding::embed(endpoint, model, key, batch).await {
+                Ok(v) => v,
+                Err(e) => {
+                    // 已完成但尚未达到常规 checkpoint 阈值的文件也要在报错前保住。
+                    if files_since_checkpoint > 0 {
+                        if let Err(save_error) = save_index_checkpoint(
+                            &sig,
+                            &current_root,
+                            target_files,
+                            target_chunks,
+                            &files,
+                        )
+                        .await
+                        {
+                            return Err(format!("{e}; 同时保存已完成进度失败:{save_error}"));
+                        }
+                    }
+                    return Err(e);
+                }
+            };
             if v.len() != batch.len() {
                 return Err(format!(
                     "embedding 返回数量不符:期望 {} 得到 {}",
@@ -864,8 +1127,8 @@ pub async fn build_or_update_index(
                 ));
             }
             vectors.extend(v);
-            done += batch.len();
-            emit("embedding", done);
+            completed_pending += batch.len();
+            emit("embedding", completed_pending);
         }
         let chunks = pieces
             .into_iter()
@@ -877,14 +1140,13 @@ pub async fn build_or_update_index(
             cache_key: ck,
             chunks,
         });
-        // 每个文件完成即落盘:长任务可中断续跑 + 文件可见增长。
-        let snapshot = KbIndex {
-            signature: sig.clone(),
-            kb_root: current_root.clone(),
-            files: files.clone(),
-        };
-        if let Err(e) = save_index(&snapshot).await {
-            crate::dlog!("[kb-semantic] 增量落盘失败: {}", e);
+        chunks_since_checkpoint += file_chunk_count;
+        files_since_checkpoint += 1;
+        if should_checkpoint(chunks_since_checkpoint, files_since_checkpoint) {
+            save_index_checkpoint(&sig, &current_root, target_files, target_chunks, &files).await?;
+            last_saved_file_count = Some(files.len());
+            chunks_since_checkpoint = 0;
+            files_since_checkpoint = 0;
         }
     }
     if capped {
@@ -896,20 +1158,18 @@ pub async fn build_or_update_index(
 
     let index = KbIndex {
         signature: sig,
+        schema_version: INDEX_SCHEMA_VERSION,
         kb_root: current_root,
+        target_files: target_files.min(u32::MAX as usize) as u32,
+        target_chunks: target_chunks.min(u32::MAX as usize) as u32,
         files,
     };
-    // 兜底再存一次(纯复用、无 pending 时上面循环不落盘,这里确保 signature/集合落地)。
-    let changed = existing.signature != index.signature
-        || grand_total > 0
-        || index.files.len() != existing.files.len();
-    if changed {
-        if let Err(e) = save_index(&index).await {
-            crate::dlog!("[kb-semantic] 写索引失败: {}", e);
-        }
+    // 兜底保存最后一个未满阈值的批次；纯复用且元数据没变化时不重写数百 MB 文件。
+    if last_saved_file_count != Some(index.files.len()) || (!has_pending && metadata_changed) {
+        save_index(&index).await?;
     }
     invalidate_cache().await; // 重建后清内存缓存,下次检索重载新索引
-    emit("done", grand_total);
+    emit("done", pending_total);
     Ok(index)
 }
 
@@ -946,7 +1206,18 @@ pub async fn semantic_search(
     }
     let qv = crate::embedding::embed(endpoint, model, key, &[query.to_string()]).await?;
     let qv = qv.into_iter().next().ok_or("query embedding 返回空")?;
-    Ok(rank_hits(&index, &qv, top_n))
+    let overfetch = top_n.saturating_mul(4).max(top_n);
+    Ok(filter_inactive_semantic_hits(
+        kb_root,
+        rank_hits(&index, &qv, overfetch),
+        top_n,
+    ))
+}
+
+fn filter_inactive_semantic_hits(kb_root: &Path, mut hits: Vec<KbHit>, top_n: usize) -> Vec<KbHit> {
+    hits.retain(|hit| !super::validity::is_inactive_regulation_file(&kb_root.join(&hit.rel_path)));
+    hits.truncate(top_n);
+    hits
 }
 
 /// 只读现有索引规模(不建/不改);给设置页状态显示。无索引返回全 0。
@@ -983,7 +1254,9 @@ pub async fn auto_update_index(
         .map(|(rel, _, ck)| (rel.clone(), ck.clone()))
         .collect();
     let (_, to_embed) = plan_update(&existing, &sig, &current);
-    let cold = existing.files.is_empty() || existing.signature != sig;
+    let cold = existing.files.is_empty()
+        || existing.signature != sig
+        || existing.schema_version != INDEX_SCHEMA_VERSION;
     if to_embed.is_empty() && !cold {
         AUTO_RUNNING.store(false, Ordering::SeqCst);
         return; // 没新增、签名也没变 → 无需动

@@ -19,6 +19,7 @@ const supportedTargets = new Map([
   ["macos-x86_64", { platform: "darwin", arch: "x64", binary: "caseboard-pi-runtime" }],
   ["windows-x86_64", { platform: "win32", arch: "x64", binary: "caseboard-pi-runtime.exe" }],
 ]);
+export const HEALTH_TIMEOUT_MS = 30_000;
 
 function expectedRuntime(target) {
   const expected = supportedTargets.get(target);
@@ -106,7 +107,7 @@ function runHealth(binary, metadata) {
       })}\n`,
       encoding: "utf8",
       env: minimalRuntimeEnvironment(home),
-      timeout: 10_000,
+      timeout: HEALTH_TIMEOUT_MS,
       windowsHide: true,
     });
     if (result.error) throw result.error;

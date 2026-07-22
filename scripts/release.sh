@@ -26,11 +26,13 @@ case "$REQUESTED_ARCH" in
   aarch64|arm64)
     ARCH="aarch64"
     FILE_ARCH="aarch64"
+    CASEBOARD_PI_RUNTIME_TARGET="${CASEBOARD_PI_RUNTIME_TARGET:-bun-darwin-arm64}"
     BUNDLE_ROOT="target/release/bundle"
     ;;
   x86_64|x64|intel)
     ARCH="x86_64"
     FILE_ARCH="x64"
+    CASEBOARD_PI_RUNTIME_TARGET="${CASEBOARD_PI_RUNTIME_TARGET:-bun-darwin-x64-baseline}"
     BUNDLE_ROOT="target/x86_64-apple-darwin/release/bundle"
     ;;
   *)
@@ -38,6 +40,7 @@ case "$REQUESTED_ARCH" in
     exit 2
     ;;
 esac
+export CASEBOARD_PI_RUNTIME_TARGET
 
 echo "════════════════════════════════════════════════════════"
 echo "  CaseBoard release · v${VERSION} · ${ARCH}"
@@ -98,7 +101,10 @@ if [ -f "$DMG_PATH" ]; then
   # 2026-05-25 V0.1.10 删:之前塞过 安装助手.command,但 macOS 15.1+ 也会拦 .command(同 quarantine),
   # 用户照样打不开。改成「请先阅读.txt」主推一行终端命令,更稳。
 
-  osascript <<APPLESCRIPT
+  if [ "${CI:-false}" = "true" ] || [ "${CASEBOARD_SKIP_DMG_FINDER:-0}" = "1" ]; then
+    echo "  · 无界面构建：跳过 Finder 窗口布局"
+  else
+    osascript <<APPLESCRIPT
 tell application "Finder"
     tell disk "$VOLNAME"
         open
@@ -121,6 +127,7 @@ tell application "Finder"
     end tell
 end tell
 APPLESCRIPT
+  fi
 
   sleep 2
   sync

@@ -11,13 +11,15 @@ const runtimeRelease = JSON.parse(
   readFileSync(join(sidecarRoot, "runtime-release.json"), "utf8"),
 );
 const targetArgIndex = process.argv.indexOf("--target");
-const requestedTarget = targetArgIndex >= 0 ? process.argv[targetArgIndex + 1] : undefined;
+const requestedTarget = targetArgIndex >= 0
+  ? process.argv[targetArgIndex + 1]
+  : process.env.CASEBOARD_PI_RUNTIME_TARGET;
 if (targetArgIndex >= 0 && !requestedTarget) {
   throw new Error("--target 后必须提供 Bun target，例如 bun-darwin-arm64");
 }
 
 const defaultTarget = process.platform === "darwin"
-  ? (process.arch === "arm64" ? "bun-darwin-arm64" : "bun-darwin-x64")
+  ? (process.arch === "arm64" ? "bun-darwin-arm64" : "bun-darwin-x64-baseline")
   : process.platform === "win32" && process.arch === "x64"
     ? "bun-windows-x64-baseline"
     : undefined;
@@ -25,6 +27,7 @@ const target = requestedTarget ?? defaultTarget;
 const runtimeTargets = new Map([
   ["bun-darwin-arm64", "macos-aarch64"],
   ["bun-darwin-x64", "macos-x86_64"],
+  ["bun-darwin-x64-baseline", "macos-x86_64"],
   ["bun-windows-x64", "windows-x86_64"],
   ["bun-windows-x64-baseline", "windows-x86_64"],
 ]);

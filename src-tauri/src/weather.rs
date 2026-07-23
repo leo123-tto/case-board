@@ -7,12 +7,14 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const IP_LOCATION_URL: &str = "https://ipwho.is/";
+const GEOCODING_URL: &str = "https://geocoding-api.open-meteo.com/v1/search";
 const WEATHER_URL: &str = "https://api.open-meteo.com/v1/forecast";
 const REQUEST_TIMEOUT_SECS: u64 = 8;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WeatherRequest {
+    city_name: Option<String>,
     latitude: Option<f64>,
     longitude: Option<f64>,
     warning: Option<String>,
@@ -34,6 +36,19 @@ struct IpLocation {
     city: Option<String>,
     region: Option<String>,
     message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeocodingResult {
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    name: Option<String>,
+    admin1: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeocodingResponse {
+    results: Option<Vec<GeocodingResult>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -60,6 +75,7 @@ struct DailyWeather {
     rain_sum: Option<Vec<f64>>,
 }
 
+#[derive(Debug)]
 struct ResolvedLocation {
     latitude: f64,
     longitude: f64,
@@ -109,6 +125,10 @@ async fn resolve_location(
     client: &reqwest::Client,
     request: WeatherRequest,
 ) -> Result<ResolvedLocation, String> {
+    if let Some(city_name) = normalized_city_name(&request) {
+        return resolve_location_by_city(client, &city_name).await;
+    }
+
     match (request.latitude, request.longitude) {
         (Some(latitude), Some(longitude)) => {
             validate_coordinates(latitude, longitude)?;
@@ -160,6 +180,75 @@ async fn resolve_location(
             })
         }
     }
+}
+
+fn normalized_city_name(request: &WeatherRequest) -> Option<String> {
+    request
+        .city_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|city_name| !city_name.is_empty())
+        .map(str::to_string)
+}
+
+async fn resolve_location_by_city(
+    client: &reqwest::Client,
+    city_name: &str,
+) -> Result<ResolvedLocation, String> {
+    let response = client
+        .get(GEOCODING_URL)
+        .query(&[
+            ("name", city_name),
+            ("count", "1"),
+            ("language", "zh"),
+            ("format", "json"),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("城市定位请求失败: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("城市定位服务返回错误: {error}"))?
+        .json::<GeocodingResponse>()
+        .await
+        .map_err(|error| format!("城市定位数据解析失败: {error}"))?;
+
+    geocoded_location(city_name, response)
+}
+
+fn geocoded_location(
+    city_name: &str,
+    response: GeocodingResponse,
+) -> Result<ResolvedLocation, String> {
+    let result = response
+        .results
+        .and_then(|results| results.into_iter().next())
+        .ok_or_else(|| format!("未找到城市：{city_name}"))?;
+    let latitude = result
+        .latitude
+        .ok_or_else(|| format!("城市定位未返回纬度：{city_name}"))?;
+    let longitude = result
+        .longitude
+        .ok_or_else(|| format!("城市定位未返回经度：{city_name}"))?;
+    validate_coordinates(latitude, longitude)?;
+
+    let label = [result.name, result.admin1]
+        .into_iter()
+        .flatten()
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    Ok(ResolvedLocation {
+        latitude,
+        longitude,
+        source: "手动城市",
+        label: Some(if label.is_empty() {
+            city_name.to_string()
+        } else {
+            label.join(" · ")
+        }),
+        warning: None,
+    })
 }
 
 fn validate_coordinates(latitude: f64, longitude: f64) -> Result<(), String> {

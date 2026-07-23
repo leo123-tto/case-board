@@ -19,6 +19,7 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  ImagePlus,
   Loader2,
   MessageCircle,
   Send,
@@ -35,6 +36,11 @@ import {
   uploadFeedbackReport,
 } from "@/lib/api";
 import { snapshotConsoleErrors } from "@/lib/console-tap";
+import {
+  feedbackScreenshotDataUrl,
+  prepareFeedbackScreenshotFiles,
+  type PreparedFeedbackScreenshot,
+} from "@/lib/feedbackScreenshots";
 import {
   OPEN_FEEDBACK_EVENT,
   type OpenFeedbackDetail,
@@ -115,6 +121,9 @@ function FeedbackModal({
   const [uploaded, setUploaded] = useState(false);
   const [uploadErr, setUploadErr] = useState<string | null>(null);
   const [savedPath, setSavedPath] = useState<string | null>(null);
+  const [screenshots, setScreenshots] = useState<PreparedFeedbackScreenshot[]>([]);
+  const [screenshotErr, setScreenshotErr] = useState<string | null>(null);
+  const [readingScreenshots, setReadingScreenshots] = useState(false);
 
   // 启动时拉诊断(把已累积的 console 错误一起带过去)
   useEffect(() => {
@@ -150,12 +159,37 @@ function FeedbackModal({
     setUploading(true);
     setUploadErr(null);
     try {
-      await uploadFeedbackReport(diag, description);
+      await uploadFeedbackReport(
+        diag,
+        description,
+        screenshots.map(({ filename, mimeType, dataBase64 }) => ({
+          filename,
+          mimeType,
+          dataBase64,
+        })),
+      );
       setUploaded(true);
     } catch (e) {
       setUploadErr(String(e));
     } finally {
       setUploading(false);
+    }
+  };
+
+  const addScreenshotFiles = async (files: Iterable<File>) => {
+    setReadingScreenshots(true);
+    setScreenshotErr(null);
+    try {
+      const prepared = await prepareFeedbackScreenshotFiles(
+        files,
+        screenshots.length,
+        screenshots.reduce((total, item) => total + item.sizeBytes, 0),
+      );
+      setScreenshots((current) => [...current, ...prepared]);
+    } catch (error) {
+      setScreenshotErr(error instanceof Error ? error.message : String(error));
+    } finally {
+      setReadingScreenshots(false);
     }
   };
 
@@ -213,11 +247,96 @@ function FeedbackModal({
             id="feedback-desc"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
-            placeholder="描述遇到的问题、bug、建议…(可以贴报错信息;或截图后单独发)"
+            onPaste={(event) => {
+              const images = Array.from(event.clipboardData.files).filter((file) =>
+                file.type.startsWith("image/"),
+              );
+              if (images.length === 0) return;
+              event.preventDefault();
+              void addScreenshotFiles(images);
+            }}
+            placeholder="描述遇到的问题、bug、建议…也可以直接在这里粘贴截图"
             rows={6}
             className="w-full resize-none rounded-md border border-border bg-card px-3 py-2 text-sm outline-none focus:border-foreground focus:ring-1 focus:ring-foreground/20"
             autoFocus
           />
+        </div>
+
+        <div className="space-y-2 rounded-md border border-border bg-muted/20 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <p className="text-xs font-medium text-foreground">截图（可选）</p>
+              <p className="mt-0.5 text-caption text-muted-foreground">
+                可选择图片，或直接在上方输入框粘贴；最多 3 张。
+              </p>
+            </div>
+            <label
+              htmlFor="feedback-screenshots"
+              className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-md border border-border bg-card px-3 text-xs font-medium text-foreground transition-colors hover:bg-accent"
+            >
+              {readingScreenshots ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <ImagePlus className="size-3.5" />
+              )}
+              选择截图
+            </label>
+            <input
+              id="feedback-screenshots"
+              aria-label="选择截图"
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              multiple
+              className="sr-only"
+              disabled={readingScreenshots || uploading || uploaded}
+              onChange={(event) => {
+                const files = Array.from(event.currentTarget.files ?? []);
+                event.currentTarget.value = "";
+                void addScreenshotFiles(files);
+              }}
+            />
+          </div>
+
+          {screenshots.length > 0 && (
+            <div className="grid grid-cols-3 gap-2">
+              {screenshots.map((screenshot, index) => (
+                <div
+                  key={`${screenshot.filename}-${index}`}
+                  className="group relative min-w-0 overflow-hidden rounded-md border border-border bg-card"
+                >
+                  <img
+                    src={feedbackScreenshotDataUrl(screenshot)}
+                    alt={`反馈截图 ${index + 1}`}
+                    className="h-20 w-full object-cover"
+                  />
+                  <div className="truncate px-2 py-1 text-caption text-muted-foreground">
+                    {screenshot.filename}
+                  </div>
+                  <button
+                    type="button"
+                    aria-label={`移除 ${screenshot.filename}`}
+                    title="移除截图"
+                    disabled={uploading || uploaded}
+                    onClick={() =>
+                      setScreenshots((current) =>
+                        current.filter((_, itemIndex) => itemIndex !== index),
+                      )
+                    }
+                    className="absolute right-1 top-1 rounded bg-black/65 p-1 text-white opacity-90 transition-opacity hover:opacity-100 disabled:cursor-not-allowed"
+                  >
+                    <X className="size-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {screenshotErr && (
+            <p className="text-xs text-destructive">{screenshotErr}</p>
+          )}
+          <p className="text-caption leading-relaxed text-amber-700">
+            截图可能包含案件或个人信息，请确认后再上传；系统只发送你主动添加的图片。
+          </p>
         </div>
 
         {/* 按钮行 */}
@@ -228,7 +347,7 @@ function FeedbackModal({
         )}
         {uploadErr && (
           <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-            上传失败:{uploadErr}。可以先保存到本地后手工发送。
+            上传失败:{uploadErr}。可以先保存本地 MD，并把截图另行发送。
           </div>
         )}
         <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
@@ -243,7 +362,7 @@ function FeedbackModal({
               className="inline-flex items-center gap-1 text-left text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline disabled:cursor-not-allowed disabled:opacity-50"
             >
               {submitting && <Loader2 className="size-3 animate-spin" />}
-              仅生成本地 MD
+              {screenshots.length > 0 ? "仅生成本地 MD（截图需另发）" : "仅生成本地 MD"}
             </button>
           </div>
           <div className="flex flex-wrap justify-end gap-2">

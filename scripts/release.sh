@@ -1,5 +1,5 @@
 #!/bin/bash
-# CaseBoard public macOS release builder · 2026-07-10
+# CaseBoard public macOS release builder · 2026-07-22
 #
 # 统一产出 Apple Silicon / Intel macOS 的 dmg + updater 包。
 #
@@ -26,11 +26,13 @@ case "$REQUESTED_ARCH" in
   aarch64|arm64)
     ARCH="aarch64"
     FILE_ARCH="aarch64"
+    CASEBOARD_PI_RUNTIME_TARGET="${CASEBOARD_PI_RUNTIME_TARGET:-bun-darwin-arm64}"
     BUNDLE_ROOT="target/release/bundle"
     ;;
   x86_64|x64|intel)
     ARCH="x86_64"
     FILE_ARCH="x64"
+    CASEBOARD_PI_RUNTIME_TARGET="${CASEBOARD_PI_RUNTIME_TARGET:-bun-darwin-x64-baseline}"
     BUNDLE_ROOT="target/x86_64-apple-darwin/release/bundle"
     ;;
   *)
@@ -38,6 +40,7 @@ case "$REQUESTED_ARCH" in
     exit 2
     ;;
 esac
+export CASEBOARD_PI_RUNTIME_TARGET
 
 echo "════════════════════════════════════════════════════════"
 echo "  CaseBoard release · v${VERSION} · ${ARCH}"
@@ -67,6 +70,12 @@ DMG_PATH="$BUNDLE_ROOT/dmg/案件看板_${VERSION}_${FILE_ARCH}.dmg"
 APP_PATH="$BUNDLE_ROOT/macos/案件看板.app"
 UPDATER_PATH="$BUNDLE_ROOT/macos/案件看板.app.tar.gz"
 
+echo
+echo "▶ 验证安装包内置 Pi Runtime"
+pnpm verify:pi-runtime-bundle \
+  --bundle-dir "$APP_PATH/Contents/Resources/pi-runtime" \
+  --updater "$UPDATER_PATH"
+
 # 3. 后处理:往 dmg 里塞「请先阅读.txt」+ AppleScript 设置窗口布局
 # 原因:macOS 15.1+ 苹果封死「右键 → 打开」绕过 ad-hoc 签名的路径,
 # 用户必须走「系统设置 → 隐私与安全 → 仍要打开」。
@@ -92,7 +101,10 @@ if [ -f "$DMG_PATH" ]; then
   # 2026-05-25 V0.1.10 删:之前塞过 安装助手.command,但 macOS 15.1+ 也会拦 .command(同 quarantine),
   # 用户照样打不开。改成「请先阅读.txt」主推一行终端命令,更稳。
 
-  osascript <<APPLESCRIPT
+  if [ "${CI:-false}" = "true" ] || [ "${CASEBOARD_SKIP_DMG_FINDER:-0}" = "1" ]; then
+    echo "  · 无界面构建：跳过 Finder 窗口布局"
+  else
+    osascript <<APPLESCRIPT
 tell application "Finder"
     tell disk "$VOLNAME"
         open
@@ -115,6 +127,7 @@ tell application "Finder"
     end tell
 end tell
 APPLESCRIPT
+  fi
 
   sleep 2
   sync

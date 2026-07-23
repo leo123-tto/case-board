@@ -1,9 +1,9 @@
 /**
- * 利息 / 执行款核心计算 — 由旧版网页计算器迁移而来。
+ * 利息 / 执行款核心计算 — 由早期网页原型迁移。
  *
  * 含:
  *   - daysBetween: 两日期之间天数(Math.ceil,半天算一天)
- *   - calculateInterestByPeriod: 按 LPR 变化点分段算利息(本金 × 年率 ÷ 365 × 天数)
+ *   - calculateInterestByPeriod: 按 LPR 变化点分段算利息(本金 × 年率 ÷ 360/365 × 天数)
  *   - calcFiveStage: 执行款五阶段清偿(费用 → 一般利息 → 本金,迟延履行利息独立累计)
  *   - calcExecution: 多案合并 / 单独计算的入口
  */
@@ -55,6 +55,7 @@ function effectiveLprRate(baseRate: number, multiplier?: number): number {
 export const PRIVATE_LENDING_CAP_SWITCH_DATE = "2020-08-20";
 
 export type RateType = "custom" | "lpr" | "hybrid";
+export type AnnualDayBasis = 360 | 365;
 
 export interface InterestPrincipal {
   id: number;
@@ -75,6 +76,7 @@ function calculateInterestRaw(
   customRate: number,
   lprTerm: LprTerm,
   lprMultiplier = 1,
+  annualDayBasis: AnnualDayBasis = 365,
 ): number {
   if (!principal || principal <= 0 || !startDate || !endDate) return 0;
   const start = new Date(startDate);
@@ -84,7 +86,7 @@ function calculateInterestRaw(
   if (rateType === "custom") {
     if (!customRate || isNaN(customRate)) return 0;
     const days = daysBetween(startDate, endDate);
-    return (principal * customRate) / 100 / 365 * days;
+    return (principal * customRate) / 100 / annualDayBasis * days;
   }
 
   if (rateType === "hybrid") {
@@ -98,7 +100,7 @@ function calculateInterestRaw(
         end < switchDate ? endDate : PRIVATE_LENDING_CAP_SWITCH_DATE;
       const legacyDays = daysBetween(startDate, legacyEndDate);
       totalInterest +=
-        (principal * customRate) / 100 / 365 * legacyDays;
+        (principal * customRate) / 100 / annualDayBasis * legacyDays;
     }
 
     const postStartDate =
@@ -112,6 +114,7 @@ function calculateInterestRaw(
         0,
         lprTerm,
         lprMultiplier,
+        annualDayBasis,
       );
     }
 
@@ -133,7 +136,8 @@ function calculateInterestRaw(
     const segDays = daysBetween(segStart, segEnd);
 
     if (segDays > 0) {
-      totalInterest += (principal * currentRate) / 100 / 365 * segDays;
+      totalInterest +=
+        (principal * currentRate) / 100 / annualDayBasis * segDays;
     }
 
     currentDate = lprDate;
@@ -143,7 +147,8 @@ function calculateInterestRaw(
 
   const lastDays = daysBetween(isoLocal(currentDate), endDate);
   if (lastDays > 0 && currentRate) {
-    totalInterest += (principal * currentRate) / 100 / 365 * lastDays;
+    totalInterest +=
+      (principal * currentRate) / 100 / annualDayBasis * lastDays;
   }
 
   return totalInterest;
@@ -162,6 +167,7 @@ export function calculateInterestByPeriod(
   customRate: number,
   lprTerm: LprTerm,
   lprMultiplier = 1,
+  annualDayBasis: AnnualDayBasis = 365,
 ): number {
   const totalInterest = calculateInterestRaw(
     principal,
@@ -171,6 +177,7 @@ export function calculateInterestByPeriod(
     customRate,
     lprTerm,
     lprMultiplier,
+    annualDayBasis,
   );
   return Math.round(totalInterest * 100) / 100;
 }
@@ -198,6 +205,7 @@ export function calculateInterestSegments(
   customRate: number,
   lprTerm: LprTerm,
   lprMultiplier = 1,
+  annualDayBasis: AnnualDayBasis = 365,
 ): InterestSegment[] {
   if (!principal || principal <= 0 || !startDate || !endDate) return [];
   const start = new Date(startDate);
@@ -216,7 +224,10 @@ export function calculateInterestSegments(
         baseRate: customRate,
         multiplier: 1,
         rate: customRate,
-        interest: Math.round((principal * customRate / 100 / 365 * days) * 100) / 100,
+        interest:
+          Math.round(
+            (principal * customRate / 100 / annualDayBasis * days) * 100,
+          ) / 100,
       },
     ];
   }
@@ -243,7 +254,7 @@ export function calculateInterestSegments(
           rate: customRate,
           interest:
             Math.round(
-              (principal * customRate / 100 / 365 * legacyDays) *
+              (principal * customRate / 100 / annualDayBasis * legacyDays) *
                 100,
             ) / 100,
         });
@@ -262,6 +273,7 @@ export function calculateInterestSegments(
           0,
           lprTerm,
           lprMultiplier,
+          annualDayBasis,
         ).map((seg) => ({
           ...seg,
           rateType: "hybrid" as const,
@@ -298,7 +310,10 @@ export function calculateInterestSegments(
           baseRate: currentBaseRate,
           multiplier,
           rate: currentRate,
-          interest: Math.round((principal * currentRate / 100 / 365 * segDays) * 100) / 100,
+          interest:
+            Math.round(
+              (principal * currentRate / 100 / annualDayBasis * segDays) * 100,
+            ) / 100,
         });
       }
       segStartDate = lprDate;
@@ -318,7 +333,10 @@ export function calculateInterestSegments(
       baseRate: currentBaseRate,
       multiplier,
       rate: currentRate,
-      interest: Math.round((principal * currentRate / 100 / 365 * lastDays) * 100) / 100,
+      interest:
+        Math.round(
+          (principal * currentRate / 100 / annualDayBasis * lastDays) * 100,
+        ) / 100,
     });
   }
 
@@ -393,6 +411,7 @@ export function calcFiveStage(
   caseInfo: ExecCaseInput,
   repayments: Repayment[],
   includeDelayed: boolean,
+  annualDayBasis: AnnualDayBasis = 365,
 ): FiveStageResult {
   const principal0 = caseInfo.principal;
   const startDate = caseInfo.startDate;
@@ -418,6 +437,7 @@ export function calcFiveStage(
       caseInfo.rate,
       caseInfo.lprTerm,
       caseInfo.lprMultiplier,
+      annualDayBasis,
     );
     const interestSegments = calculateInterestSegments(
       remainingPrincipal,
@@ -427,6 +447,7 @@ export function calcFiveStage(
       caseInfo.rate,
       caseInfo.lprTerm,
       caseInfo.lprMultiplier,
+      annualDayBasis,
     );
     accumulatedInterest += newInterest;
 
@@ -485,6 +506,7 @@ export function calcFiveStage(
     caseInfo.rate,
     caseInfo.lprTerm,
     caseInfo.lprMultiplier,
+    annualDayBasis,
   );
   const finalInterestSegments = calculateInterestSegments(
     remainingPrincipal,
@@ -494,6 +516,7 @@ export function calcFiveStage(
     caseInfo.rate,
     caseInfo.lprTerm,
     caseInfo.lprMultiplier,
+    annualDayBasis,
   );
   accumulatedInterest += finalInterest;
 

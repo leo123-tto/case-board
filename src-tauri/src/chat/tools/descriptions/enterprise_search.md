@@ -16,6 +16,7 @@ enterprise_search — 按企业名称模糊匹配,拿候选企业列表(id + 统
 - top_k: 可选,默认 10,最大 20
 
 注意事项:
+- Rust 宿主会先查 `raw/companies` 和相同参数的 30 天缓存；新鲜本地企业报告强命中时直接返回，不调用元典
 - 优先用本地缓存(企业类 30 天 TTL,过期 stale 仍可返回但标 ⚠️)
 - 返回字段:`[{id, name, tyshxydm(USCC), reg_status, legal_person, est_date}]`
 - 命中后挑出唯一匹配那条,**记下 id 或 USCC**,后续企业类调用都用这个 id

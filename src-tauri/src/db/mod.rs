@@ -18,8 +18,13 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
 pub mod ai_jobs;
+pub mod ai_workspace_chat;
+pub mod ai_workspace_documents;
+pub mod ai_workspace_proposals;
+pub mod ai_workspaces;
 pub mod bookmarks;
 pub mod calendar_events;
+pub mod case_chat_conversations;
 pub mod case_instances;
 pub mod case_logs;
 pub mod case_memories;
@@ -100,8 +105,8 @@ pub async fn init_pool(db_path: &str) -> Result<SqlitePool, DbError> {
         .map_err(|e| DbError::Connect(e.to_string()))?;
 
     // 2026-06-15:跑迁移前先对齐 _sqlx_migrations 校验值,根治「migration N ... has been modified」
-    // 启动崩溃。病根 = 双轨发布(私人仓 vs 开源仓)对**同一批已发布迁移**做了去身份化注释改动
-    // (公开更新元数据域名、本地路径等表述泛化),SQL 一字未改但 SHA-384 变了 → 老用户 DB 里
+    // 启动崩溃。病根 = 不同发布分支对**同一批已发布迁移**做了注释与示例文字改动，
+    // SQL 一字未改但 SHA-384 变了 → 老用户 DB 里
     // 存的旧校验值对不上新二进制内嵌值 → sqlx 启动中止(release 是 panic=abort,直接闪退)。
     // 详见 docs/反馈问题排查-2026-06-15.md。
     reconcile_migration_checksums(&pool).await?;
@@ -117,7 +122,143 @@ pub async fn init_pool(db_path: &str) -> Result<SqlitePool, DbError> {
         .await
         .map_err(|e| DbError::Migrate(e.to_string()))?;
 
+    // 少数装过 0045/0046 中间构建的数据库已经登记了迁移版本，但实际 schema 没落全。
+    // SQLx 会把这些版本视为已应用而不再执行，因此必须按真实 schema 条件修复。
+    repair_case_chat_conversation_schema(&pool).await?;
+
     Ok(pool)
+}
+
+async fn table_has_column(pool: &SqlitePool, table: &str, column: &str) -> Result<bool, DbError> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2")
+            .bind(table)
+            .bind(column)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| DbError::Migrate(e.to_string()))?;
+    Ok(count > 0)
+}
+
+async fn add_column_if_missing(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<bool, DbError> {
+    if table_has_column(pool, table, column).await? {
+        return Ok(false);
+    }
+    sqlx::query(ddl)
+        .execute(pool)
+        .await
+        .map_err(|e| DbError::Migrate(e.to_string()))?;
+    Ok(true)
+}
+
+/// 修复“0046 已登记但案件多会话 schema 未实际落下”的中间构建数据库。
+///
+/// SQLite 不支持可移植的 `ADD COLUMN IF NOT EXISTS`，所以这里先检查真实 schema，
+/// 再逐列补齐。每一步都可安全重入；若进程在中途退出，下次启动会继续补剩余部分。
+async fn repair_case_chat_conversation_schema(pool: &SqlitePool) -> Result<(), DbError> {
+    sqlx::raw_sql(
+        r#"CREATE TABLE IF NOT EXISTS case_chat_conversations (
+             id TEXT PRIMARY KEY,
+             case_id TEXT NOT NULL,
+             title TEXT NOT NULL CHECK (length(trim(title)) > 0),
+             title_is_manual INTEGER NOT NULL DEFAULT 0 CHECK (title_is_manual IN (0, 1)),
+             last_message_at TEXT,
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+             archived_at TEXT,
+             FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE CASCADE
+           );"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| DbError::Migrate(e.to_string()))?;
+
+    let mut repaired = false;
+    repaired |= add_column_if_missing(
+        pool,
+        "cases",
+        "last_chat_conversation_id",
+        "ALTER TABLE cases ADD COLUMN last_chat_conversation_id TEXT",
+    )
+    .await?;
+    repaired |= add_column_if_missing(
+        pool,
+        "chat_messages",
+        "conversation_id",
+        "ALTER TABLE chat_messages ADD COLUMN conversation_id TEXT",
+    )
+    .await?;
+    repaired |= add_column_if_missing(
+        pool,
+        "chat_tasks",
+        "conversation_id",
+        "ALTER TABLE chat_tasks ADD COLUMN conversation_id TEXT",
+    )
+    .await?;
+
+    sqlx::raw_sql(
+        r#"CREATE INDEX IF NOT EXISTS idx_case_chat_conversations_active
+             ON case_chat_conversations(case_id, archived_at, last_message_at DESC, updated_at DESC);
+           INSERT OR IGNORE INTO case_chat_conversations
+             (id, case_id, title, title_is_manual, last_message_at, created_at, updated_at)
+           SELECT
+             'legacy-' || c.id,
+             c.id,
+             '历史对话',
+             1,
+             COALESCE(
+               (SELECT MAX(m.created_at) FROM chat_messages m WHERE m.case_id = c.id),
+               (SELECT MAX(t.started_at) FROM chat_tasks t WHERE t.case_id = c.id)
+             ),
+             COALESCE(
+               (SELECT MIN(m.created_at) FROM chat_messages m WHERE m.case_id = c.id),
+               (SELECT MIN(t.started_at) FROM chat_tasks t WHERE t.case_id = c.id),
+               datetime('now')
+             ),
+             datetime('now')
+           FROM cases c
+           WHERE EXISTS (
+                   SELECT 1 FROM chat_messages m
+                   WHERE m.case_id = c.id AND m.conversation_id IS NULL
+                 )
+              OR EXISTS (
+                   SELECT 1 FROM chat_tasks t
+                   WHERE t.case_id = c.id AND t.conversation_id IS NULL
+                 );
+           UPDATE chat_messages
+           SET conversation_id = 'legacy-' || case_id
+           WHERE conversation_id IS NULL;
+           UPDATE chat_tasks
+           SET conversation_id = COALESCE(
+             (SELECT m.conversation_id FROM chat_messages m WHERE m.id = chat_tasks.message_id),
+             'legacy-' || case_id
+           )
+           WHERE conversation_id IS NULL;
+           UPDATE cases
+           SET last_chat_conversation_id = 'legacy-' || id
+           WHERE last_chat_conversation_id IS NULL
+             AND EXISTS (
+               SELECT 1 FROM case_chat_conversations c
+               WHERE c.id = 'legacy-' || cases.id
+             );
+           CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation
+             ON chat_messages(case_id, conversation_id, created_at, id);
+           CREATE INDEX IF NOT EXISTS idx_chat_tasks_conversation
+             ON chat_tasks(case_id, conversation_id, started_at DESC);"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| DbError::Migrate(e.to_string()))?;
+
+    if repaired {
+        crate::dlog!("[db] 已按真实 schema 补齐案件多会话迁移 0046");
+    }
+    Ok(())
 }
 
 /// 把已存在的 `_sqlx_migrations.checksum` 对齐到本二进制内嵌的迁移校验值。
@@ -126,6 +267,11 @@ pub async fn init_pool(db_path: &str) -> Result<SqlitePool, DbError> {
 /// SQL 一字未改(只是注释/项目名漂移),已应用的迁移 sqlx 本就不会重跑 —— 对齐校验值不改变任何
 /// 已执行的 SQL、不动数据,只是消掉「文件被动过」这道与双轨发布天然冲突的 tripwire。
 async fn reconcile_migration_checksums(pool: &SqlitePool) -> Result<(), DbError> {
+    // 只允许对齐 0046 及以前已经确认存在「私仓/公开版注释漂移」的历史迁移。
+    // 若 0046 来自中间构建且真实 schema 不完整，迁移完成后的条件修复会补齐。
+    // 新迁移若 checksum 不同必须让 sqlx fail-loud，避免再次出现“记录已应用、schema 未落下”。
+    const LAST_KNOWN_COMMENT_DRIFT_VERSION: i64 = 46;
+
     // 全新库还没这张表 → 无需对齐(后续 migrate 会正常建表并全量应用)。
     let table_exists: Option<(i64,)> = sqlx::query_as(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations'",
@@ -138,6 +284,9 @@ async fn reconcile_migration_checksums(pool: &SqlitePool) -> Result<(), DbError>
     }
 
     for m in sqlx::migrate!("./migrations").iter() {
+        if m.version > LAST_KNOWN_COMMENT_DRIFT_VERSION {
+            continue;
+        }
         let embedded: &[u8] = &m.checksum;
         let stored: Option<(Vec<u8>,)> =
             sqlx::query_as("SELECT checksum FROM _sqlx_migrations WHERE version = ?1")

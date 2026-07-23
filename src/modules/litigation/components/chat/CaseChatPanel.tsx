@@ -60,26 +60,37 @@ import {
 } from "lucide-react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Button } from "@/components/ui/button";
+import { AiRunTrace } from "@/components/AiRunTrace";
+import { ConversationSwitcher } from "@/components/ConversationSwitcher";
 import { cn } from "@/lib/utils";
 import {
   type AskQuestion,
   acceptMemoryCandidate,
+  archiveCaseChatConversation,
   caseChat,
   cancelChat,
   type CaseChatTaskType,
+  type CaseChatConversation,
   type ChatMessage,
   clearChatHistory,
+  createCaseChatConversation,
   createCaseMemory,
   disableCaseMemory,
   getCaseVisualWorkspace,
   getCaseWithDocs,
+  getSettings,
+  ensureCaseChatConversation,
   ignoreMemoryCandidate,
   listChatHistory,
+  listCaseChatConversations,
   listCaseMemories,
   listCaseVisualSummaries,
   listGlobalMemories,
   listMemoryCandidates,
   openUrl,
+  renameCaseChatConversation,
+  selectCaseChatConversation,
+  steerCaseChat,
   updateCaseMemory,
 } from "@/lib/api";
 import type {
@@ -89,8 +100,8 @@ import type {
   Document,
   GlobalMemory,
   MemoryCandidate,
-  ToolCallRecord,
 } from "@/lib/types";
+import { effectiveAgentRuntime } from "@/lib/piRuntime";
 import { confirmDialog } from "@/lib/dialog";
 import type {
   VisualWorkspace,
@@ -101,7 +112,6 @@ import { AskUserCard } from "./AskUserCard";
 import { AttachmentChips } from "./AttachmentChips";
 import { AttachmentPicker } from "./AttachmentPicker";
 import { CitationsCard } from "./CitationsCard";
-import { ToolCallTrace } from "./ToolCallTrace";
 import VisualizationPreviewCard, {
   indexVisualSummariesByMessageId,
 } from "../visualization/VisualizationPreviewCard";
@@ -324,6 +334,8 @@ export function CaseChatPanel({
    */
   const [poppedOut, setPoppedOut] = useState(false);
   const [history, setHistory] = useState<ChatMessage[]>([]);
+  const [conversations, setConversations] = useState<CaseChatConversation[]>([]);
+  const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [visualSummaries, setVisualSummaries] = useState<VisualWorkspaceSummary[]>([]);
   const [openedVisualWorkspace, setOpenedVisualWorkspace] = useState<VisualWorkspace | null>(null);
@@ -338,10 +350,11 @@ export function CaseChatPanel({
     useState<CaseChatTaskType | null>(null);
   // 2026-05-31 · 流式状态来自模块级 registry(跨面板卸载存活)。forceRerender 强制重渲染。
   const [, forceRerender] = useState(0);
-  const run = getRun(caseId);
+  const caseRun = getRun(caseId);
+  const run = caseRun?.conversationId === currentConversationId ? caseRun : null;
   const streamingText = run?.status === "running" ? run.text : "";
   const streamingSegments = run?.status === "running" ? run.segments : [];
-  const isStreaming = run?.status === "running";
+  const isStreaming = caseRun?.status === "running";
   // thinking 模型本段推理已累计字数(>0 时显示「深度推理中…(N 字)」,字数在涨=没卡死)
   const streamingReasoningChars =
     run?.status === "running" ? run.reasoningChars : 0;
@@ -370,9 +383,16 @@ export function CaseChatPanel({
     : "检索全国相似判例,按本案法院所在地优先排序;外地高相关案例仍正常纳入,再判断对我方诉求的支持度和风险点";
 
   const refreshHistory = useCallback(async () => {
-    if (!caseId) return;
-    const rows = await listChatHistory(caseId);
+    if (!caseId || !currentConversationId) return;
+    const rows = await listChatHistory(caseId, currentConversationId);
     setHistory(rows);
+  }, [caseId, currentConversationId]);
+
+  const refreshConversations = useCallback(async () => {
+    if (!caseId) return [];
+    const rows = await listCaseChatConversations(caseId);
+    setConversations(rows);
+    return rows;
   }, [caseId]);
 
   const refreshVisualSummaries = useCallback(async () => {
@@ -538,6 +558,9 @@ export function CaseChatPanel({
     setPendingAskTaskType(null);
     setVisualSummaries([]);
     setOpenedVisualWorkspace(null);
+    setConversations([]);
+    setCurrentConversationId(null);
+    setHistory([]);
     if (!caseId || collapsed) return;
     let abort = false;
     setHistoryLoading(true);
@@ -545,9 +568,15 @@ export function CaseChatPanel({
       caseData && externalDocuments
         ? Promise.resolve({ case: caseData, documents: externalDocuments })
         : getCaseWithDocs(caseId);
-    Promise.all([listChatHistory(caseId), docsPromise])
-      .then(([rows, withDocs]) => {
+    Promise.all([ensureCaseChatConversation(caseId), docsPromise])
+      .then(async ([selected, withDocs]) => {
+        const [conversationRows, rows] = await Promise.all([
+          listCaseChatConversations(caseId),
+          listChatHistory(caseId, selected.id),
+        ]);
         if (abort) return;
+        setConversations(conversationRows);
+        setCurrentConversationId(selected.id);
         setHistory(rows);
         setLoadedCaseData(withDocs.case);
         setCaseDocs(withDocs.documents);
@@ -637,17 +666,37 @@ export function CaseChatPanel({
     return unsub;
   }, [caseId, refreshHistory, refreshVisualSummaries]);
 
-  const disabled = !caseId || isStreaming;
+  const disabled = !caseId;
 
-  async function send(text: string, taskType: CaseChatTaskType | null) {
-    if (!caseId) return;
+  async function send(
+    text: string,
+    taskType: CaseChatTaskType | null,
+    skillName: string | null = null,
+  ) {
+    if (!caseId || !currentConversationId) return;
     const trimmed = text.trim();
     if (!trimmed && !taskType) return;
 
     // 2026-05-31 · 去重锁:同案件已有运行在跑(可能在你切去首页时仍后台进行),拦住
     // 重复发起 —— 根治「以为卡住了重新点 → 出两份摘要」。
     if (isRunning(caseId)) {
-      setError("当前案件已有一个 AI 任务在进行,请等它完成(切到首页也会在后台继续跑)。");
+      if (taskType || skillName || !caseRun || caseRun.conversationId !== currentConversationId) {
+        setError("当前案件已有一个 AI 任务在进行；可以在输入框继续补充引导，或先停止当前任务。");
+        return;
+      }
+      try {
+        await steerCaseChat({
+          messageId: caseRun.messageId,
+          caseId,
+          conversationId: currentConversationId,
+          content: trimmed,
+        });
+        setInput("");
+        setError(null);
+        await refreshHistory();
+      } catch (cause) {
+        setError(`发送引导失败：${String(cause)}`);
+      }
       return;
     }
 
@@ -658,7 +707,15 @@ export function CaseChatPanel({
     setPendingAskTaskType(null);
 
     // 在模块级 registry 起监听(跨面板卸载存活)
-    const ok = await startRun(caseId, messageId);
+    const runtimeHint = await getSettings()
+      .then((settings) => effectiveAgentRuntime(settings.agent_runtime))
+      .catch(() => "native" as const);
+    const ok = await startRun(
+      caseId,
+      currentConversationId,
+      messageId,
+      runtimeHint,
+    );
     if (!ok) {
       setError("当前案件已有一个 AI 任务在进行,请等它完成。");
       return;
@@ -680,16 +737,19 @@ export function CaseChatPanel({
     try {
       const result = await caseChat({
         case_id: caseId,
+        conversation_id: currentConversationId,
         user_message: trimmed,
         task_type: taskType,
+        skill_name: skillName,
         message_id: messageId,
         attached_doc_ids: attachedSnapshot,
         editing_doc_id: editingDocId ?? null,
       });
       finishRun(caseId);
       // 拿最新历史(后端已经 INSERT 完两条);registry 的 done 订阅也会刷,这里立即刷一次
-      const fresh = await listChatHistory(caseId);
+      const fresh = await listChatHistory(caseId, currentConversationId);
       setHistory(fresh);
+      await refreshConversations();
       // V0.3 · 模型这轮发起了选项式追问 → 末尾渲染选项卡片,等用户点选/填写
       setPendingAsk(result.ask_user ?? null);
       setPendingAskTaskType(result.ask_user?.length ? taskType : null);
@@ -729,7 +789,7 @@ export function CaseChatPanel({
       finishRun(caseId, msg);
       // 即便错了也刷新历史(后端会写一行 error_short)
       try {
-        const fresh = await listChatHistory(caseId);
+        const fresh = await listChatHistory(caseId, currentConversationId);
         setHistory(fresh);
       } catch {
         /* swallow */
@@ -751,21 +811,77 @@ export function CaseChatPanel({
   }
 
   async function clearAll() {
-    if (!caseId) return;
+    if (!caseId || !currentConversationId) return;
     if (
       !(await confirmDialog(
-        "确定清空当前案件的所有聊天记录?(只清记录,不影响已生成的 artifact)",
+        "确定清空当前对话的聊天记录?(只清记录,不影响已生成的 artifact)",
         { danger: true, okLabel: "清空" },
       ))
     ) {
       return;
     }
     try {
-      await clearChatHistory(caseId);
+      await clearChatHistory(caseId, currentConversationId);
       setHistory([]);
       setError(null);
     } catch (e) {
       setError(formatError(e));
+    }
+  }
+
+  async function selectConversation(conversationId: string) {
+    if (!caseId || isStreaming || conversationId === currentConversationId) return;
+    setHistoryLoading(true);
+    setError(null);
+    try {
+      await selectCaseChatConversation(caseId, conversationId);
+      const rows = await listChatHistory(caseId, conversationId);
+      setCurrentConversationId(conversationId);
+      setHistory(rows);
+      setPendingAsk(null);
+      setPendingAskTaskType(null);
+    } catch (reason) {
+      setError(formatError(reason));
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  async function createConversation() {
+    if (!caseId || isStreaming) return;
+    try {
+      const created = await createCaseChatConversation(caseId);
+      await refreshConversations();
+      setCurrentConversationId(created.id);
+      setHistory([]);
+      setPendingAsk(null);
+      setPendingAskTaskType(null);
+    } catch (reason) {
+      setError(formatError(reason));
+    }
+  }
+
+  async function renameConversation(conversationId: string, title: string) {
+    if (!caseId || isStreaming) return;
+    try {
+      await renameCaseChatConversation(caseId, conversationId, title);
+      await refreshConversations();
+    } catch (reason) {
+      setError(formatError(reason));
+    }
+  }
+
+  async function archiveConversation(conversationId: string) {
+    if (!caseId || isStreaming) return;
+    try {
+      const selected = await archiveCaseChatConversation(caseId, conversationId);
+      await refreshConversations();
+      setCurrentConversationId(selected.id);
+      setHistory(await listChatHistory(caseId, selected.id));
+      setPendingAsk(null);
+      setPendingAskTaskType(null);
+    } catch (reason) {
+      setError(formatError(reason));
     }
   }
 
@@ -930,7 +1046,7 @@ export function CaseChatPanel({
             onClick={clearAll}
             disabled={!caseId || isStreaming || history.length === 0}
             className="icon-action size-7 hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
-            title="清空当前案件的聊天记录"
+            title="清空当前对话的聊天记录"
             aria-label="清空聊天记录"
           >
             <Trash2 className="size-3.5" />
@@ -975,6 +1091,19 @@ export function CaseChatPanel({
           )}
         </div>
       </header>
+
+      {caseId && (
+        <ConversationSwitcher
+          conversations={conversations}
+          currentId={currentConversationId}
+          onSelect={(conversationId) => void selectConversation(conversationId)}
+          onCreate={() => void createConversation()}
+          onRename={(conversationId, title) => void renameConversation(conversationId, title)}
+          onArchive={(conversationId) => void archiveConversation(conversationId)}
+          disabled={isStreaming || historyLoading}
+          disableSelection={isStreaming || historyLoading}
+        />
+      )}
 
       {/* Messages 区:外层 relative 容器承载「回到底部」浮钮(不随内容滚动);min-h-0 保证 flex 子项可滚 */}
       <div className="relative flex min-h-0 flex-1 flex-col">
@@ -1025,11 +1154,16 @@ export function CaseChatPanel({
         {isStreaming && (
           <div className="flex animate-in flex-col items-start fade-in-0 slide-in-from-bottom-1 duration-300">
             <div className="max-w-[95%] rounded-lg bg-card/92 px-3 py-2 text-foreground shadow-sm ring-1 ring-border">
-              {/* 交错时间线:思考文字 → 调工具 → 继续文字 → 再调工具,按事件到达顺序 */}
+              <AiRunTrace
+                status="streaming"
+                elapsedMs={run ? Date.now() - run.startedAtMs : 0}
+                reasoningObserved={streamingReasoningChars > 0}
+                toolCalls={run?.toolCalls ?? []}
+                activities={run?.activities ?? []}
+                runtimeHint={run?.runtime}
+              />
               <ChatSegments
                 segments={streamingSegments}
-                live
-                reasoningChars={streamingReasoningChars}
               />
               {streamingSegments.length === 0 &&
                 (streamingReasoningChars > 0 ? (
@@ -1046,7 +1180,7 @@ export function CaseChatPanel({
         {pendingAsk && pendingAsk.length > 0 && !isStreaming && (
           <AskUserCard
             questions={pendingAsk}
-            disabled={disabled}
+            disabled={!caseId}
             onSubmit={(text) => send(text, pendingAskTaskType)}
           />
         )}
@@ -1290,7 +1424,7 @@ export function CaseChatPanel({
             icon={Scale}
             label="刑事深度分析"
             hint="三阶层犯罪论+鉴定式刑事深度分析:先确认候选罪名清单,再确认三阶层检视大纲(构成要件该当性→违法性→有责性),然后逐要件论证(法条逐条校验),落一份刑事深度分析报告。会停下来问你两次(推理模式)。方法论借鉴游初 gutachten-criminal-case(Apache 2.0)"
-            onClick={() => send("", "criminal_deep_analysis")}
+            onClick={() => send("", "criminal_deep_analysis", "criminal-case-analysis")}
             disabled={disabled}
           />
           <QuickChip
@@ -1319,6 +1453,7 @@ export function CaseChatPanel({
             send(
               "",
               attachedDocIds.length > 0 ? "verify_my_draft" : "compile_legal_basis",
+              "compile-legal-basis",
             )
           }
           disabled={disabled}
@@ -1327,21 +1462,21 @@ export function CaseChatPanel({
           icon={Swords}
           label="模拟对抗"
           hint="站在对方律师立场推演他会怎么打、援引什么法条/类案,再给我方反驳点。庭前攻防演练用(推演,非法律意见)"
-          onClick={() => send("", "simulate_opposition")}
+          onClick={() => send("", "simulate_opposition", "simulate-opposition")}
           disabled={disabled}
         />
         <QuickChip
           icon={Search}
           label="类案检索"
           hint={similarCasesHint}
-          onClick={() => send("", "find_similar_cases")}
+          onClick={() => send("", "find_similar_cases", "find-similar-cases")}
           disabled={disabled}
         />
         <QuickChip
           icon={Microscope}
           label="深度分析"
           hint="请求权基础+鉴定式深度分析:先让你确认候选请求权清单,再确认分析大纲,然后逐要件论证(法条逐条校验),落一份深度分析报告。复杂疑难案件用(会停下来问你两次,推理模式)"
-          onClick={() => send("", "deep_analysis")}
+          onClick={() => send("", "deep_analysis", "deep-case-analysis")}
           disabled={disabled}
         />
         <QuickChip
@@ -1358,7 +1493,7 @@ export function CaseChatPanel({
           label="写起诉状"
           hint="根据本案材料起草一份正式民事起诉状,落成可编辑文书、可导出 Word(法律格式)。信息不全会先弹选项问你"
           onClick={() =>
-            send("请根据本案已有材料,先按已整理的材料标签筛选我方起诉材料和我方证据,帮我起草一份民事起诉状。", null)
+            send("请根据本案已有材料,先按已整理的材料标签筛选我方起诉材料和我方证据,帮我起草一份民事起诉状。", null, "legal-document-writing")
           }
           disabled={disabled}
         />
@@ -1370,6 +1505,7 @@ export function CaseChatPanel({
             send(
               "请站在被告方/答辩人立场,根据本案已整理的材料标签筛选:对方起诉材料、对方证据、我方被告证据,先解析原告诉讼请求和事实理由,再起草一份有针对性的民事答辩状。若案件快照显示我方不是被告方,请先提醒我确认立场。",
               null,
+              "legal-document-writing",
             )
           }
           disabled={disabled}
@@ -1379,7 +1515,7 @@ export function CaseChatPanel({
           label="写证据目录"
           hint="根据本案证据材料起草一份正式证据目录(表格形式),落成可编辑文书、可导出 Word"
           onClick={() =>
-            send("请根据本案已整理的材料标签,只选我方一侧的证据材料,并结合起诉状诉讼请求或答辩状抗辩意见,帮我起草一份证据目录(表格形式)。", null)
+            send("请根据本案已整理的材料标签,只选我方一侧的证据材料,并结合起诉状诉讼请求或答辩状抗辩意见,帮我起草一份证据目录(表格形式)。", null, "legal-document-writing")
           }
           disabled={disabled}
         />
@@ -1391,6 +1527,7 @@ export function CaseChatPanel({
             send(
               "请根据本案已整理的材料标签,优先读取对方提交的证据材料、对方起诉状/证据目录,结合我方被告证据,为被告方出一份质证意见。请逐项围绕真实性、合法性、关联性、证明目的和证明力进行质证,并指出可用的我方反证或需补强材料。",
               null,
+              "legal-document-writing",
             )
           }
           disabled={disabled}
@@ -1429,13 +1566,15 @@ export function CaseChatPanel({
             disabled={disabled}
             placeholder={
               caseId
-                ? "向当前案件提问…(Enter 发送,Shift+Enter 换行)"
+                ? isStreaming
+                  ? "继续补充要求，作为当前任务的引导…"
+                  : "向当前案件提问…(Enter 发送,Shift+Enter 换行)"
                 : "请先选择一个案件"
             }
             rows={2}
             className="min-h-[44px] flex-1 resize-none rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/60 transition-[border-color,box-shadow] focus:border-foreground focus:outline-none focus:ring-1 focus:ring-foreground/20 disabled:cursor-not-allowed disabled:opacity-50"
           />
-          {isStreaming ? (
+          {isStreaming && (
             <Button
               size="sm"
               variant="outline"
@@ -1446,18 +1585,17 @@ export function CaseChatPanel({
               <CircleStop className="size-3.5" />
               停止
             </Button>
-          ) : (
-            <Button
-              size="sm"
-              onClick={() => send(input, null)}
-              disabled={disabled || !input.trim()}
-              title="发送(Enter)"
-              className="shrink-0"
-            >
-              <Send className="size-3.5" />
-              发送
-            </Button>
           )}
+          <Button
+            size="sm"
+            onClick={() => send(input, null)}
+            disabled={disabled || !input.trim()}
+            title={isStreaming ? "引导当前任务(Enter)" : "发送(Enter)"}
+            className="shrink-0"
+          >
+            <Send className="size-3.5" />
+            {isStreaming ? "引导" : "发送"}
+          </Button>
         </div>
         <p className="mt-1.5 text-caption text-muted-foreground/70">
           AI 依据已抽取材料回答，关键判断请律师核对。
@@ -1694,47 +1832,21 @@ const markdownComponents: MarkdownComponents = {
   },
 };
 
-// 把交错 segments 渲染成:text 段 → MarkdownView,连续 tool 段合并成一个 ToolCallTrace
-// (同一轮的多个工具显示在一个 trace 框里)。live 时最后一组 trace 显示「正在思考下一步」。
+// 工具调用统一收进上方紧凑执行过程；正文仍按流式分段渲染，避免重复展示两套 trace。
 function ChatSegments({
   segments,
-  live = false,
-  reasoningChars = 0,
 }: {
   segments: ChatSegment[];
-  live?: boolean;
-  /** 末组 trace 的 live 行用:>0 显示「深度推理中…(N 字)」替代「正在思考下一步…」 */
-  reasoningChars?: number;
 }) {
-  const blocks: (
-    | { kind: "text"; text: string }
-    | { kind: "tools"; records: ToolCallRecord[] }
-  )[] = [];
-  for (const seg of segments) {
-    if (seg.kind === "text") {
-      blocks.push({ kind: "text", text: seg.text });
-    } else {
-      const last = blocks[blocks.length - 1];
-      if (last && last.kind === "tools") last.records.push(seg.record);
-      else blocks.push({ kind: "tools", records: [seg.record] });
-    }
-  }
+  const blocks = segments.filter(
+    (segment): segment is Extract<ChatSegment, { kind: "text" }> =>
+      segment.kind === "text",
+  );
   return (
     <>
-      {blocks.map((b, i) =>
-        b.kind === "text" ? (
-          <MarkdownView key={i} text={b.text} />
-        ) : (
-          <ToolCallTrace
-            key={i}
-            records={b.records}
-            live={live && i === blocks.length - 1}
-            reasoningChars={
-              live && i === blocks.length - 1 ? reasoningChars : 0
-            }
-          />
-        ),
-      )}
+      {blocks.map((block, index) => (
+        <MarkdownView key={index} text={block.text} />
+      ))}
     </>
   );
 }

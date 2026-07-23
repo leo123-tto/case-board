@@ -26,6 +26,7 @@ export function HomeDropZone({
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
+    let disposed = false;
     getCurrentWebview()
       .onDragDropEvent((event) => {
         const p = event.payload;
@@ -41,11 +42,16 @@ export function HomeDropZone({
         }
       })
       .then((fn) => {
-        unlisten = fn;
+        if (disposed) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
       })
       .catch((e) => console.warn("listen drag-drop failed", e));
     return () => {
-      if (unlisten) unlisten();
+      disposed = true;
+      unlisten?.();
     };
   }, [onImportPath]);
 

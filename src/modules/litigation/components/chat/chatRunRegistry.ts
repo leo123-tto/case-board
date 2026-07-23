@@ -16,7 +16,8 @@
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-import type { ChatStreamEvent } from "@/lib/api";
+import type { ChatActivity, ChatStreamEvent } from "@/lib/api";
+import type { AgentRuntime } from "@/lib/piRuntime";
 import type { ToolCallRecord } from "@/lib/types";
 
 /** 流式时间线的一段:正文文字 或 一次工具调用。按事件到达顺序排列 → 实现
@@ -27,9 +28,15 @@ export type ChatSegment =
 
 export interface ChatRunState {
   caseId: string;
+  conversationId: string;
   messageId: string;
   text: string;
   toolCalls: ToolCallRecord[];
+  activities: ChatActivity[];
+  /** 发起任务时已确定的 Runtime；activity 尚未到达时也不回退成含糊的 AI。 */
+  runtime: AgentRuntime;
+  /** 本轮开始时间，用于两处助手共用的紧凑执行耗时展示。 */
+  startedAtMs: number;
   /** 交错时间线(渲染用);text/toolCalls 保留作兼容 + autoScroll 依赖。 */
   segments: ChatSegment[];
   /** thinking 模型本轮已累计的 reasoning_content 字数(深度推理进度反馈用,涨=活着没卡死)。 */
@@ -98,9 +105,13 @@ export function getRun(caseId: string | null): ChatRunState | null {
   if (!r) return null;
   return {
     caseId: r.caseId,
+    conversationId: r.conversationId,
     messageId: r.messageId,
     text: r.text,
     toolCalls: r.toolCalls,
+    activities: r.activities,
+    runtime: r.runtime,
+    startedAtMs: r.startedAtMs,
     segments: r.segments,
     reasoningChars: r.reasoningChars,
     error: r.error,
@@ -121,14 +132,20 @@ export function isRunning(caseId: string | null): boolean {
  */
 export async function startRun(
   caseId: string,
+  conversationId: string,
   messageId: string,
+  runtime: AgentRuntime = "native",
 ): Promise<boolean> {
   if (isRunning(caseId)) return false;
   const run: InternalRun = {
     caseId,
+    conversationId,
     messageId,
     text: "",
     toolCalls: [],
+    activities: [],
+    runtime,
+    startedAtMs: Date.now(),
     segments: [],
     reasoningChars: 0,
     error: null,
@@ -145,6 +162,11 @@ export async function startRun(
         const cur = runs.get(caseId);
         if (!cur || cur.messageId !== messageId) return;
         const p = e.payload;
+        if (p.kind === "activity") {
+          cur.activities = [...cur.activities, p.activity];
+          notify(caseId);
+          return;
+        }
         if (p.kind === "reasoning") {
           // thinking 模型推理增量:只累加字数做进度反馈。高频 → 节流通知 + 必须 return,
           // 否则落到末尾的即时 notify 会每个 token 全量重渲染(O(n²) 卡顿)。

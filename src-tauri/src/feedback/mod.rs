@@ -13,6 +13,7 @@
 //!   - "最近错误"只列文件名后缀(.docx / .pdf)+ 错误信息,不带文件路径
 //!   - 云端上传必须由用户点击确认触发,不做静默上送
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::{
@@ -22,9 +23,13 @@ use std::{
 
 const FEEDBACK_SUPABASE_URL: Option<&str> = option_env!("CASEBOARD_TELEMETRY_URL");
 const FEEDBACK_SUPABASE_KEY: Option<&str> = option_env!("CASEBOARD_TELEMETRY_KEY");
-const FEEDBACK_UPLOAD_TIMEOUT_SECS: u64 = 8;
+const FEEDBACK_UPLOAD_TIMEOUT_SECS: u64 = 20;
 const FEEDBACK_REPORT_MAX_CHARS: usize = 200_000;
 const FEEDBACK_DESCRIPTION_PREVIEW_CHARS: usize = 180;
+const FEEDBACK_SCREENSHOT_MAX_COUNT: usize = 3;
+const FEEDBACK_SCREENSHOT_MAX_BYTES: usize = 5 * 1024 * 1024;
+const FEEDBACK_SCREENSHOT_TOTAL_MAX_BYTES: usize = 10 * 1024 * 1024;
+const FEEDBACK_SCREENSHOT_BUCKET: &str = "feedback-screenshots";
 
 /// 自动收集的诊断信息(给反馈 MD 用)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +72,11 @@ pub struct DiagnosticInfo {
     /// 最多 200 行,新→旧(每行已 sanitize_paths,不含 /Users/.../<case-name>/ 路径)
     pub stderr_tail: Vec<String>,
 
+    /// 最近 24 小时的 Pi Runtime 结构化元数据。只含 Provider、模型、耗时、
+    /// 重试、错误分类和请求规模，不含 prompt、回答、推理或工具载荷。
+    #[serde(default)]
+    pub runtime_traces: Vec<crate::chat::diagnostics::RuntimeTraceEvent>,
+
     /// 2026-05-26 V0.1.11:前端累积的 console.error / window.onerror(由前端打开弹窗时传入)
     /// 不持久化,刷新页面就丢
     #[serde(default)]
@@ -95,12 +105,39 @@ pub struct DiagnosticInfo {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CloudFeedbackPayload {
+    pub id: String,
     pub client_id_short: String,
     pub app_version: String,
     pub os_version: String,
     pub description_preview: String,
     pub report_md: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub screenshots: Vec<CloudFeedbackScreenshot>,
     pub status: String,
+}
+
+/// 前端主动选择或粘贴的截图。字段按 Tauri IPC 的 camelCase 契约反序列化。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackScreenshotInput {
+    pub filename: String,
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+/// 写入 feedback_reports.screenshots(jsonb) 的 Storage 对象引用,不含图片正文。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CloudFeedbackScreenshot {
+    pub filename: String,
+    pub mime_type: String,
+    pub storage_path: String,
+    pub size_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedFeedbackScreenshot {
+    pub metadata: CloudFeedbackScreenshot,
+    pub bytes: Vec<u8>,
 }
 
 /// 功能模块用量统计(2026-05-27 V0.1.13+)。
@@ -598,6 +635,11 @@ pub async fn collect(
     let system_info = collect_system_info();
     let kb_memory = collect_kb_memory_diagnostic(&settings);
     let stderr_tail = crate::diagnostic_log::snapshot();
+    let runtime_traces =
+        crate::chat::diagnostics::read_recent_runtime_traces().unwrap_or_else(|error| {
+            crate::dlog!("[feedback] 读取 Pi Runtime 结构化诊断失败: {}", error);
+            Vec::new()
+        });
 
     // 2026-05-26 V0.1.12:最近 200 条抽取 metrics + 按 backend 聚合
     // (metrics_tail 现直接是 Vec<MetricRow>,原逐字段手抄随 B3/B8 收口删除)
@@ -634,6 +676,7 @@ pub async fn collect(
         system_info,
         kb_memory,
         stderr_tail,
+        runtime_traces,
         console_errors,
         metrics_tail,
         metrics_summary,
@@ -1130,20 +1173,30 @@ pub fn save_to_desktop(info: &DiagnosticInfo, user_description: &str) -> Result<
     Ok(path)
 }
 
-pub async fn upload_to_cloud(info: &DiagnosticInfo, user_description: &str) -> Result<(), String> {
+pub async fn upload_to_cloud(
+    info: &DiagnosticInfo,
+    user_description: &str,
+    screenshots: &[FeedbackScreenshotInput],
+) -> Result<(), String> {
     let (base, key) = match (FEEDBACK_SUPABASE_URL, FEEDBACK_SUPABASE_KEY) {
         (Some(base), Some(key)) if !base.trim().is_empty() && !key.trim().is_empty() => {
             (base.trim_end_matches('/'), key)
         }
         _ => return Err("反馈上传未配置:缺少 CASEBOARD_TELEMETRY_URL / KEY".into()),
     };
-    let payload = build_cloud_feedback_payload(info, user_description);
-    let url = format!("{base}/rest/v1/feedback_reports");
+    let report_id = uuid::Uuid::new_v4().to_string();
+    let (payload, prepared_screenshots) =
+        build_cloud_feedback_upload(info, user_description, screenshots, &report_id)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(FEEDBACK_UPLOAD_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("HTTP client 构建失败:{e}"))?;
 
+    for screenshot in &prepared_screenshots {
+        upload_feedback_screenshot(&client, base, key, screenshot).await?;
+    }
+
+    let url = format!("{base}/rest/v1/feedback_reports");
     let response = client
         .post(&url)
         .header("apikey", key)
@@ -1161,15 +1214,50 @@ pub async fn upload_to_cloud(info: &DiagnosticInfo, user_description: &str) -> R
     let body = response.text().await.unwrap_or_default();
     let snippet: String = body.chars().take(300).collect();
     Err(format!(
-        "上传反馈失败:Supabase {}:{snippet}",
+        "上传反馈记录失败:Supabase {}:{snippet}",
         status.as_u16()
     ))
 }
 
-pub(crate) fn build_cloud_feedback_payload(
+async fn upload_feedback_screenshot(
+    client: &reqwest::Client,
+    base: &str,
+    key: &str,
+    screenshot: &PreparedFeedbackScreenshot,
+) -> Result<(), String> {
+    let url = format!(
+        "{base}/storage/v1/object/{}/{}",
+        FEEDBACK_SCREENSHOT_BUCKET, screenshot.metadata.storage_path
+    );
+    let response = client
+        .post(url)
+        .header("apikey", key)
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", &screenshot.metadata.mime_type)
+        .header("x-upsert", "false")
+        .body(screenshot.bytes.clone())
+        .send()
+        .await
+        .map_err(|e| format!("上传截图失败:{e}"))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    let snippet: String = body.chars().take(300).collect();
+    Err(format!(
+        "上传截图失败:Supabase Storage {}:{snippet}",
+        status.as_u16()
+    ))
+}
+
+pub(crate) fn build_cloud_feedback_upload(
     info: &DiagnosticInfo,
     user_description: &str,
-) -> CloudFeedbackPayload {
+    screenshots: &[FeedbackScreenshotInput],
+    report_id: &str,
+) -> Result<(CloudFeedbackPayload, Vec<PreparedFeedbackScreenshot>), String> {
+    let prepared_screenshots = prepare_feedback_screenshots(report_id, screenshots)?;
     let report_md = truncate_chars(
         &render_md(info, user_description),
         FEEDBACK_REPORT_MAX_CHARS,
@@ -1181,14 +1269,88 @@ pub(crate) fn build_cloud_feedback_payload(
     } else {
         truncate_chars(&desc, FEEDBACK_DESCRIPTION_PREVIEW_CHARS, "…")
     };
-    CloudFeedbackPayload {
+    let payload = CloudFeedbackPayload {
+        id: report_id.to_string(),
         client_id_short: info.client_id_short.clone(),
         app_version: info.app_version.clone(),
         os_version: info.os_version.clone(),
         description_preview,
         report_md,
+        screenshots: prepared_screenshots
+            .iter()
+            .map(|screenshot| screenshot.metadata.clone())
+            .collect(),
         status: "open".to_string(),
+    };
+    Ok((payload, prepared_screenshots))
+}
+
+fn prepare_feedback_screenshots(
+    report_id: &str,
+    screenshots: &[FeedbackScreenshotInput],
+) -> Result<Vec<PreparedFeedbackScreenshot>, String> {
+    let report_id = uuid::Uuid::parse_str(report_id)
+        .map_err(|_| "反馈编号格式无效".to_string())?
+        .to_string();
+    if screenshots.len() > FEEDBACK_SCREENSHOT_MAX_COUNT {
+        return Err(format!("最多上传 {} 张截图", FEEDBACK_SCREENSHOT_MAX_COUNT));
     }
+
+    let mut total_bytes = 0usize;
+    let mut prepared = Vec::with_capacity(screenshots.len());
+    for (index, screenshot) in screenshots.iter().enumerate() {
+        let mime_type = screenshot.mime_type.trim().to_ascii_lowercase();
+        if !matches!(
+            mime_type.as_str(),
+            "image/png" | "image/jpeg" | "image/webp"
+        ) {
+            return Err(format!(
+                "第 {} 张截图格式不支持,仅支持 PNG、JPEG、WebP",
+                index + 1
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(screenshot.data_base64.trim())
+            .map_err(|_| format!("第 {} 张截图数据损坏", index + 1))?;
+        if bytes.is_empty() {
+            return Err(format!("第 {} 张截图为空", index + 1));
+        }
+        if bytes.len() > FEEDBACK_SCREENSHOT_MAX_BYTES {
+            return Err(format!("单张截图不能超过 5 MB(第 {} 张超限)", index + 1));
+        }
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > FEEDBACK_SCREENSHOT_TOTAL_MAX_BYTES {
+            return Err("截图总大小不能超过 10 MB".into());
+        }
+        let signature_matches = match mime_type.as_str() {
+            "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+            "image/webp" => {
+                bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
+            }
+            _ => false,
+        };
+        if !signature_matches {
+            return Err(format!("第 {} 张图片内容与格式不一致", index + 1));
+        }
+
+        let extension = match mime_type.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            _ => "webp",
+        };
+        let ordinal = index + 1;
+        prepared.push(PreparedFeedbackScreenshot {
+            metadata: CloudFeedbackScreenshot {
+                filename: format!("反馈截图 {ordinal}.{extension}"),
+                mime_type,
+                storage_path: format!("{report_id}/{ordinal}.{extension}"),
+                size_bytes: bytes.len(),
+            },
+            bytes,
+        });
+    }
+    Ok(prepared)
 }
 
 fn truncate_chars(value: &str, max_chars: usize, suffix: &str) -> String {
@@ -1249,8 +1411,6 @@ fn dirs_desktop() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Desktop"))
 }
 
-/// Test-only re-export of `render_md` so other modules can regression-test
-/// "敏感数据不应进反馈 MD"。生产代码继续走 `save_to_desktop`。
 fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -1374,7 +1534,7 @@ fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
             ));
             // 失败原因(sanitize 后),帮作者快速判断是哪类问题(限流 / token / 大小 / 网络...)
             if let Some(err) = &f.last_error {
-                let safe = sanitize_paths(err);
+                let safe = sanitize_runtime_log_entry(err).replace('`', "'");
                 md.push_str(&format!("  - 错误:`{}`\n", safe));
             }
         }
@@ -1521,10 +1681,13 @@ fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
             None => md.push_str("- 记忆文件数:(未统计)\n"),
         }
         if let Some(err) = &km.memory_error {
-            md.push_str(&format!("- 记忆检测错误:`{}`\n", err));
+            let safe = sanitize_runtime_log_entry(err).replace('`', "'");
+            md.push_str(&format!("- 记忆检测错误:`{}`\n", safe));
         }
         md.push('\n');
     }
+
+    render_pi_runtime_diagnosis(&mut md, &info.runtime_traces);
 
     // 2026-05-26 V0.1.11:App 自身 stderr ring buffer
     if !info.stderr_tail.is_empty() {
@@ -1533,7 +1696,9 @@ fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
             info.stderr_tail.len()
         ));
         for line in &info.stderr_tail {
-            md.push_str(line);
+            // stderr_tail 属于非结构化诊断输入。即使调用方漏做了写入侧清理，
+            // 反馈边界也只允许单行、有界摘要，不能携带模型原始输出或案件正文。
+            md.push_str(&sanitize_runtime_log_entry(line));
             md.push('\n');
         }
         md.push_str("```\n\n");
@@ -1620,12 +1785,9 @@ fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
         for e in &info.console_errors {
             let at = e.at.as_deref().unwrap_or("?");
             md.push_str(&format!("- **[{}]** {}\n", e.level, at));
-            // message 可能多行,缩进展示
-            for line in e.message.lines() {
-                md.push_str("  > ");
-                md.push_str(line);
-                md.push('\n');
-            }
+            md.push_str("  > ");
+            md.push_str(&sanitize_runtime_log_entry(&e.message));
+            md.push('\n');
         }
         md.push('\n');
     }
@@ -1648,6 +1810,217 @@ fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
 
     // 安全网:整份 MD 再过一次 sanitize_paths,兜底 stderr/console 里可能漏的路径
     sanitize_paths(&md)
+}
+
+fn render_pi_runtime_diagnosis(
+    md: &mut String,
+    traces: &[crate::chat::diagnostics::RuntimeTraceEvent],
+) {
+    use crate::chat::diagnostics::{
+        FailureOrigin, RuntimeRequestFinished, RuntimeRequestStarted, RuntimeTraceEvent,
+    };
+
+    if traces.is_empty() {
+        return;
+    }
+    let mut request_ids = Vec::new();
+    for event in traces {
+        if !request_ids
+            .iter()
+            .any(|request_id| *request_id == event.request_id())
+        {
+            request_ids.push(event.request_id());
+        }
+    }
+    if request_ids.is_empty() {
+        return;
+    }
+
+    md.push_str("## Pi Runtime 诊断\n\n");
+    md.push_str("| 时间 | Provider | 模型 | 错误来源 | 分类 / HTTP | 重试 | 耗时 | 终止原因 |\n");
+    md.push_str("|:---|:---|:---|:---|:---|---:|---:|:---|\n");
+    for request_id in &request_ids {
+        let started = traces.iter().find_map(|event| match event {
+            RuntimeTraceEvent::RequestStarted(started)
+                if started.common.request_id == **request_id =>
+            {
+                Some(started)
+            }
+            _ => None,
+        });
+        let finished = traces.iter().find_map(|event| match event {
+            RuntimeTraceEvent::RequestFinished(finished)
+                if finished.common.request_id == **request_id =>
+            {
+                Some(finished)
+            }
+            _ => None,
+        });
+        let timestamp = finished
+            .map(|event| event.common.ts.as_str())
+            .or_else(|| started.map(|event| event.common.ts.as_str()))
+            .unwrap_or("—");
+        let provider = finished
+            .and_then(|event| event.provider_id.as_deref())
+            .or_else(|| started.map(|event| event.provider_id.as_str()))
+            .unwrap_or("—");
+        let model = finished
+            .and_then(|event| event.model_id.as_deref())
+            .or_else(|| started.map(|event| event.model_id.as_str()))
+            .unwrap_or("—");
+        let origin = finished
+            .and_then(|event| event.failure_origin)
+            .map(failure_origin_display)
+            .unwrap_or("—");
+        let category = finished
+            .and_then(|event| event.error_category)
+            .map(|category| category.as_str())
+            .unwrap_or("—");
+        let category_http = match finished.and_then(|event| event.http_status) {
+            Some(status) => format!("{category} / HTTP {status}"),
+            None => category.to_string(),
+        };
+        let retry_count = finished.map_or(0, |event| event.retry_count);
+        let elapsed = finished
+            .map(|event| format!("{:.2} s", event.elapsed_ms as f64 / 1000.0))
+            .unwrap_or_else(|| "—".into());
+        let stop_reason = finished
+            .and_then(|event| event.stop_reason.as_deref())
+            .unwrap_or("未记录");
+        md.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} 次 | {} | {} |\n",
+            timestamp, provider, model, origin, category_http, retry_count, elapsed, stop_reason
+        ));
+    }
+    md.push('\n');
+
+    for request_id in request_ids {
+        let started: Option<&RuntimeRequestStarted> = traces.iter().find_map(|event| match event {
+            RuntimeTraceEvent::RequestStarted(started)
+                if started.common.request_id == request_id =>
+            {
+                Some(started)
+            }
+            _ => None,
+        });
+        let finished: Option<&RuntimeRequestFinished> =
+            traces.iter().find_map(|event| match event {
+                RuntimeTraceEvent::RequestFinished(finished)
+                    if finished.common.request_id == request_id =>
+                {
+                    Some(finished)
+                }
+                _ => None,
+            });
+        let provider = finished
+            .and_then(|event| event.provider_id.as_deref())
+            .or_else(|| started.map(|event| event.provider_id.as_str()))
+            .unwrap_or("—");
+        let model = finished
+            .and_then(|event| event.model_id.as_deref())
+            .or_else(|| started.map(|event| event.model_id.as_str()))
+            .unwrap_or("—");
+        md.push_str(&format!("### {} / {}\n\n", provider, model));
+        md.push_str(&format!("- 请求 ID:`{}`\n", request_id));
+        if let Some(started) = started {
+            md.push_str(&format!(
+                "- 凭据:{} · 来源:{}\n",
+                started.credential_type.as_deref().unwrap_or("未记录"),
+                started.credential_source.as_deref().unwrap_or("未记录")
+            ));
+            md.push_str(&format!(
+                "- Runtime:{} · Pi SDK:{} · 协议:v{} · 平台:{}/{}\n",
+                started.sidecar_version.as_deref().unwrap_or("未记录"),
+                started.pi_sdk_version.as_deref().unwrap_or("未记录"),
+                started.protocol_version,
+                started.platform,
+                started.arch
+            ));
+            md.push_str(&format!(
+                "- 请求规模:system {} 字 · 历史 {} 条/{} 字 · 用户 {} 字 · 工具 {} · Skill {} · max tokens {}\n",
+                started.system_prompt_chars,
+                started.history_messages,
+                started.history_chars,
+                started.user_message_chars,
+                started.tool_count,
+                started.skill_count,
+                started.max_tokens
+            ));
+        }
+        if let Some(finished) = finished {
+            md.push_str(&format!(
+                "- 运行统计:轮次 {} · 工具 {}（失败 {}）· 重试 {} · 正文 {} 字 · 推理 {} 字\n",
+                finished.turns,
+                finished.tool_calls,
+                finished.tool_failures,
+                finished.retry_count,
+                finished.text_chars,
+                finished.reasoning_chars
+            ));
+            if finished.prompt_tokens.is_some() || finished.completion_tokens.is_some() {
+                md.push_str(&format!(
+                    "- Token:输入 {} · 输出 {} · cache read {} · cache write {} · 总计 {}\n",
+                    display_optional_u64(finished.prompt_tokens),
+                    display_optional_u64(finished.completion_tokens),
+                    display_optional_u64(finished.cache_read_tokens),
+                    display_optional_u64(finished.cache_write_tokens),
+                    display_optional_u64(finished.total_tokens)
+                ));
+            }
+            if let Some(error) = &finished.error_message {
+                md.push_str(&format!(
+                    "- 最终错误:`{}`\n",
+                    redact_feedback_runtime_secret(error).replace('`', "'")
+                ));
+            }
+            if !finished.stderr_tail.is_empty() {
+                md.push_str("- 异常 stderr 尾部:\n\n```text\n");
+                for line in &finished.stderr_tail {
+                    md.push_str(&redact_feedback_runtime_secret(line));
+                    md.push('\n');
+                }
+                md.push_str("```\n");
+            }
+        }
+        md.push('\n');
+    }
+
+    fn failure_origin_display(origin: FailureOrigin) -> &'static str {
+        match origin {
+            FailureOrigin::Provider => "大模型供应商",
+            FailureOrigin::Network => "网络",
+            FailureOrigin::PiRuntime => "Pi Runtime",
+            FailureOrigin::Protocol => "协议",
+            FailureOrigin::HostTool => "CaseBoard 工具",
+            FailureOrigin::Cancelled => "用户取消",
+            FailureOrigin::Unknown => "无法确定",
+        }
+    }
+}
+
+fn display_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "—".into(), |value| value.to_string())
+}
+
+fn redact_feedback_runtime_secret(value: &str) -> String {
+    static BEARER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SK_TOKEN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static NAMED_SECRET: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let safe = BEARER
+        .get_or_init(|| regex::Regex::new(r"(?i)bearer\s+[^\s,;]+").unwrap())
+        .replace_all(value, "Bearer [REDACTED]");
+    let safe = SK_TOKEN
+        .get_or_init(|| regex::Regex::new(r"(?i)\bsk-[a-z0-9._-]+").unwrap())
+        .replace_all(&safe, "[REDACTED]");
+    NAMED_SECRET
+        .get_or_init(|| {
+            regex::Regex::new(r"(?i)(authorization|cookie|api[_ -]?key|token)\s*[:=]\s*[^\s,;]+")
+                .unwrap()
+        })
+        .replace_all(&safe, "$1: [REDACTED]")
+        .chars()
+        .take(2_000)
+        .collect()
 }
 
 /// 反馈 MD 里 key 状态的统一文案。三态:
@@ -1762,4 +2135,26 @@ pub(crate) fn sanitize_paths(s: &str) -> String {
         }
     }
     out
+}
+/// 把非结构化运行时日志压成可进入本机日志和在线反馈的单行摘要。
+///
+/// LLM JSON 解析错误可能把 `---原始---` 后的完整模型输出拼进错误文本；该输出通常
+/// 含案件正文和个人信息。这里只保留第一行错误类型/位置，并对超长单行设置硬上限。
+pub(crate) fn sanitize_runtime_log_entry(value: &str) -> String {
+    const MAX_SUMMARY_CHARS: usize = 1_000;
+
+    let first_line_end = value.find(['\r', '\n']).unwrap_or(value.len());
+    let first_line = &value[..first_line_end];
+    let raw_marker_end = first_line.find("---原始---").unwrap_or(first_line.len());
+    let summary = first_line[..raw_marker_end].trim_end().replace('\t', " ");
+    let summary_chars = summary.chars().count();
+    let mut safe = sanitize_paths(&summary.chars().take(MAX_SUMMARY_CHARS).collect::<String>());
+
+    let removed_details = first_line_end < value.len() || raw_marker_end < first_line.len();
+    if removed_details {
+        safe.push_str(" [多行详情已移除]");
+    } else if summary_chars > MAX_SUMMARY_CHARS {
+        safe.push_str(" [超长详情已截断]");
+    }
+    safe
 }

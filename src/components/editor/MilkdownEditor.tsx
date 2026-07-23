@@ -59,13 +59,24 @@ interface Props {
   value: string;
   /** 编辑产生新 MD 时回调(markdownUpdated;父组件据此存最新 MD + 算 dirty) */
   onChange: (markdown: string) => void;
+  /** 可选选区回调，工作区可据此把选中段落交给 AI；案件旧调用不受影响。 */
+  onSelectionChange?: (selection: EditorSelection | null) => void;
+}
+
+export interface EditorSelection {
+  from: number;
+  to: number;
+  text: string;
 }
 
 /** 真正挂 Milkdown 实例的内层(必须在 MilkdownProvider 内) */
-function Inner({ value, onChange }: Props) {
+function Inner({ value, onChange, onSelectionChange }: Props) {
   // 用 ref 持有 onChange,避免它变化导致 useEditor 重建编辑器(会丢光标/历史)
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  const selectionRef = useRef(onSelectionChange);
+  selectionRef.current = onSelectionChange;
+  const [instanceLoading, getInstance] = useInstance();
 
   useEditor((root) =>
     Editor.make()
@@ -83,7 +94,21 @@ function Inner({ value, onChange }: Props) {
       .use(listener),
   );
 
-  return <Milkdown />;
+  const reportSelection = () => {
+    if (instanceLoading || !selectionRef.current) return;
+    getInstance()?.action((ctx) => {
+      const { state } = ctx.get(editorViewCtx);
+      const { from, to } = state.selection;
+      const text = state.doc.textBetween(from, to, "\n");
+      selectionRef.current?.(from === to ? null : { from, to, text });
+    });
+  };
+
+  return (
+    <div onMouseUp={reportSelection} onKeyUp={reportSelection}>
+      <Milkdown />
+    </div>
+  );
 }
 
 /** 工具条按钮 */
@@ -189,6 +214,7 @@ function Toolbar() {
 export function MilkdownEditor({
   value,
   onChange,
+  onSelectionChange,
   className,
 }: Props & { className?: string }) {
   return (
@@ -196,7 +222,11 @@ export function MilkdownEditor({
       <div className={cn("milkdown-editor", className)}>
         <Toolbar />
         <div className="min-h-0 flex-1 overflow-auto">
-          <Inner value={value} onChange={onChange} />
+          <Inner
+            value={value}
+            onChange={onChange}
+            onSelectionChange={onSelectionChange}
+          />
         </div>
       </div>
     </MilkdownProvider>

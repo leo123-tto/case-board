@@ -8,6 +8,7 @@ import poseNeutral from "@/assets/caseboard-companion/caseboard-companion-pose-n
 import poseWriting from "@/assets/caseboard-companion/caseboard-companion-pose-writing-2026-06-28.png";
 import {
   generateHomeGreeting,
+  getSettings,
   getNativeLocation,
   getWeatherInfo,
   openLocationPrivacySettings,
@@ -21,6 +22,8 @@ import {
   isDisplayableCachedWeather,
   isGreetingTextCompatible,
   isStaleIso,
+  normalizeWeatherCity,
+  resolveGreetingWeatherSummary,
   shouldShowLocationSettingsAction,
   shouldRefreshWeather,
   timeOfDay,
@@ -28,6 +31,7 @@ import {
   weatherDisplaySummary,
   weatherStatusMessage,
   weatherSummaryForGreeting,
+  WEATHER_CITY_CHANGED_EVENT,
 } from "./homeCompanionLogic";
 
 const GREETING_KEY_PREFIX = "caseboard:home-companion:greeting:v2:";
@@ -45,7 +49,7 @@ interface CachedWeather {
   summary: string;
   detail: string;
   generated_at: string;
-  source?: "系统定位" | "网络定位";
+  source?: "系统定位" | "手动城市" | "网络定位";
   location_label?: string | null;
 }
 
@@ -142,13 +146,11 @@ export function HomeCompanionStrip({
   );
 
   const refreshGreeting = useCallback(
-    async ({
-      forceRefresh = false,
-      weatherSummaryOverride,
-    }: {
+    async (options: {
       forceRefresh?: boolean;
       weatherSummaryOverride?: string | null;
     } = {}) => {
+      const { forceRefresh = false } = options;
       const requestDate = todayLocalIso();
       const requestPeriod = timeOfDay();
       const requestMode = resolveCompanionMode({
@@ -157,7 +159,7 @@ export function HomeCompanionStrip({
         reminderSummaries,
       });
       const requestAssistantMode = companionModeLabel(requestMode);
-      const effectiveWeatherSummary = weatherSummaryOverride ?? weatherSummary;
+      const effectiveWeatherSummary = resolveGreetingWeatherSummary(weatherSummary, options);
       const requestCacheKey = buildGreetingCacheKey({
         localDate: requestDate,
         timeOfDay: requestPeriod,
@@ -212,15 +214,29 @@ export function HomeCompanionStrip({
   }, [companionMode, currentPeriod, displayName, greetingCacheKey, greetingRefreshing, refreshGreeting]);
 
   const refreshWeather = useCallback(
-    async (forceGreetingRefresh = false) => {
-      setWeather((prev) => ({ status: "locating", value: prev.value, error: null }));
+    async (forceGreetingRefresh = false, clearPrevious = false) => {
+      setWeather((prev) => ({
+        status: "locating",
+        value: clearPrevious ? null : prev.value,
+        error: null,
+      }));
       try {
         let request: WeatherRequest;
+        let manualCity: string | null = null;
         try {
-          const location = await getSystemLocation();
-          request = { latitude: location.latitude, longitude: location.longitude };
-        } catch (error) {
-          request = { warning: weatherErrorMessage(error) };
+          manualCity = normalizeWeatherCity((await getSettings()).weather_city);
+        } catch {
+          // 设置读取失败时保留原有定位路径，首页天气不能阻断主流程。
+        }
+        if (manualCity) {
+          request = { cityName: manualCity };
+        } else {
+          try {
+            const location = await getSystemLocation();
+            request = { latitude: location.latitude, longitude: location.longitude };
+          } catch (error) {
+            request = { warning: weatherErrorMessage(error) };
+          }
         }
         setWeather((prev) => ({ status: "fetching", value: prev.value, error: null }));
         const next = weatherInfoToCache(await getWeatherInfo(request));
@@ -233,13 +249,20 @@ export function HomeCompanionStrip({
       } catch (e) {
         const message = weatherErrorMessage(e);
         setWeather((prev) => ({ status: "idle", value: prev.value, error: message }));
-        if (forceGreetingRefresh) void refreshGreeting({ forceRefresh: true });
+        if (forceGreetingRefresh) {
+          void refreshGreeting(
+            clearPrevious
+              ? { forceRefresh: true, weatherSummaryOverride: null }
+              : { forceRefresh: true },
+          );
+        }
       }
     },
     [refreshGreeting],
   );
 
   useEffect(() => {
+    if (weather.status !== "idle" || weather.error) return;
     const cached = readCachedWeather(localDate);
     if (cached && cached.generated_at !== weather.value?.generated_at) {
       setWeather({ status: "idle", value: cached, error: null });
@@ -249,7 +272,16 @@ export function HomeCompanionStrip({
       void refreshWeather(false);
     }, 250);
     return () => window.clearTimeout(id);
-  }, [localDate, refreshWeather, weather.value?.generated_at]);
+  }, [localDate, refreshWeather, weather.error, weather.status, weather.value?.generated_at]);
+
+  useEffect(() => {
+    function handleWeatherCityChanged() {
+      removeCachedWeather(localDate);
+      void refreshWeather(true, true);
+    }
+    window.addEventListener(WEATHER_CITY_CHANGED_EVENT, handleWeatherCityChanged);
+    return () => window.removeEventListener(WEATHER_CITY_CHANGED_EVENT, handleWeatherCityChanged);
+  }, [localDate, refreshWeather]);
 
   const handleManualRefresh = useCallback(() => {
     void refreshWeather(true);
@@ -474,6 +506,14 @@ function readCachedWeather(today: string): CachedWeather | null {
 
 function writeCachedWeather(today: string, value: CachedWeather): void {
   writeJson(WEATHER_KEY_PREFIX + today, value);
+}
+
+function removeCachedWeather(today: string): void {
+  try {
+    localStorage.removeItem(WEATHER_KEY_PREFIX + today);
+  } catch {
+    /* UI cache only */
+  }
 }
 
 function readJson<T>(key: string): T | null {

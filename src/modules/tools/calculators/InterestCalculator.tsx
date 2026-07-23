@@ -5,7 +5,7 @@
  *   - 利息计算(interest):多本金 + 各自时间段 + 自定义利率 / LPR;按 LPR 变化点分段
  *   - 执行款(execution):多案件 + 多还款 + 五阶段清偿 + 迟延履行利息
  *
- * 计算逻辑见 ../lib/interestCalc.ts(由旧版网页计算器迁移而来)。
+ * 计算逻辑见 ../lib/interestCalc.ts（由早期网页原型迁移）。
  *
  * 法律依据:利息 / 执行款 两套独立弹窗。
  */
@@ -25,6 +25,7 @@ import {
   INTEREST_BASIS,
 } from "../lib/legalBasisData";
 import {
+  type AnnualDayBasis,
   calcFiveStage,
   calculateInterestByPeriod,
   calculateInterestSegments,
@@ -56,6 +57,8 @@ export function InterestCalculator({
   const [basisOpen, setBasisOpen] = useState<null | "interest" | "execution">(
     null,
   );
+  const [annualDayBasis, setAnnualDayBasis] =
+    useState<AnnualDayBasis>(365);
 
   return (
     <div className="space-y-5">
@@ -80,15 +83,33 @@ export function InterestCalculator({
             执行款计算
           </TabBtn>
         </div>
-        <LegalBasisButton onClick={() => setBasisOpen(mode)}>
-          {mode === "interest" ? "查看利息计算法律依据" : "查看执行款计算法律依据"}
-        </LegalBasisButton>
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span>年计息天数</span>
+            <select
+              aria-label="年计息天数"
+              value={annualDayBasis}
+              onChange={(e) =>
+                setAnnualDayBasis(Number(e.target.value) as AnnualDayBasis)
+              }
+              className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground outline-none focus:border-foreground/50"
+            >
+              <option value={365}>365 天</option>
+              <option value={360}>360 天</option>
+            </select>
+          </label>
+          <LegalBasisButton onClick={() => setBasisOpen(mode)}>
+            {mode === "interest"
+              ? "查看利息计算法律依据"
+              : "查看执行款计算法律依据"}
+          </LegalBasisButton>
+        </div>
       </div>
 
       {mode === "interest" ? (
-        <InterestPanel prefill={prefill} />
+        <InterestPanel prefill={prefill} annualDayBasis={annualDayBasis} />
       ) : (
-        <ExecutionPanel prefill={prefill} />
+        <ExecutionPanel prefill={prefill} annualDayBasis={annualDayBasis} />
       )}
 
       <LegalBasisModal
@@ -123,7 +144,13 @@ export interface InterestPrefill {
   repayments?: Array<{ date: string; amount: number }>;
 }
 
-function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
+function InterestPanel({
+  prefill,
+  annualDayBasis,
+}: {
+  prefill?: InterestPrefill | null;
+  annualDayBasis: AnnualDayBasis;
+}) {
   const [principals, setPrincipals] = useState<InterestPrincipal[]>(() => {
     if (prefill && (prefill.principal || prefill.startDate)) {
       const seed = makeBlankPrincipal();
@@ -161,6 +188,7 @@ function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
         customRate,
         p.lprTerm,
         lprMultiplier,
+        annualDayBasis,
       );
       const days = daysBetween(p.startDate, p.endDate);
       const segments = calculateInterestSegments(
@@ -171,6 +199,7 @@ function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
         customRate,
         p.lprTerm,
         lprMultiplier,
+        annualDayBasis,
       );
       return { p, principal, interest, days, lprMultiplier, segments };
     })
@@ -254,13 +283,13 @@ function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
                     </p>
                     {x.p.rateType === "custom" ? (
                       <p className="pl-3 font-mono text-muted-foreground">
-                        {x.principal} × {x.p.rate}% ÷ 365 × {x.days} = {formatMoney(x.interest)}
+                        {x.principal} × {x.p.rate}% ÷ {annualDayBasis} × {x.days} = {formatMoney(x.interest)}
                       </p>
                     ) : (
                       <div className="space-y-0.5 pl-3 font-mono text-muted-foreground">
                         {x.segments.map((s, si) => (
                           <p key={si}>
-                            {s.startDate} ~ {s.endDate}: {formatInterestSegmentFormula(x.principal, s)} = {formatMoney(s.interest)}
+                            {s.startDate} ~ {s.endDate}: {formatInterestSegmentFormula(x.principal, s, annualDayBasis)} = {formatMoney(s.interest)}
                           </p>
                         ))}
                         <p className="font-medium text-foreground">
@@ -303,21 +332,22 @@ function formatRate(value: number): string {
 function formatInterestSegmentFormula(
   principal: number,
   segment: InterestSegment,
+  annualDayBasis: AnnualDayBasis,
 ): string {
   if (segment.rateType === "custom") {
-    return `${principal} × ${formatRate(segment.rate)}% ÷ 365 × ${segment.days} 天`;
+    return `${principal} × ${formatRate(segment.rate)}% ÷ ${annualDayBasis} × ${segment.days} 天`;
   }
   if (
     segment.rateType === "hybrid" &&
     segment.endDate <= PRIVATE_LENDING_CAP_SWITCH_DATE
   ) {
-    return `${principal} × 约定年利率 ${formatRate(segment.rate)}% ÷ 365 × ${segment.days} 天`;
+    return `${principal} × 约定年利率 ${formatRate(segment.rate)}% ÷ ${annualDayBasis} × ${segment.days} 天`;
   }
   const rateText =
     segment.multiplier === 1
       ? `LPR ${formatRate(segment.baseRate)}%`
       : `LPR ${formatRate(segment.baseRate)}% × ${formatMultiplier(segment.multiplier)} = ${formatRate(segment.rate)}%`;
-  return `${principal} × ${rateText} ÷ 365 × ${segment.days} 天`;
+  return `${principal} × ${rateText} ÷ ${annualDayBasis} × ${segment.days} 天`;
 }
 
 function defaultRateTypePatch(
@@ -576,7 +606,13 @@ function PrincipalRow({
 }
 
 /* ============================ 执行款计算 ============================ */
-function ExecutionPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
+function ExecutionPanel({
+  prefill,
+  annualDayBasis,
+}: {
+  prefill?: InterestPrefill | null;
+  annualDayBasis: AnnualDayBasis;
+}) {
   // 2026-06-11:执行模块跳过来时预填首案(本金/起算日/名称)+ 还款记录,能提取到的都填
   const [cases, setCases] = useState<ExecCaseFormData[]>(() => {
     const blank = makeBlankCase();
@@ -668,6 +704,7 @@ function ExecutionPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) 
         },
         sortedReps,
         includeDelayed,
+        annualDayBasis,
       );
       return { mode: "multi" as const, merged };
     }
@@ -675,7 +712,12 @@ function ExecutionPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) 
       mode: "separate" as const,
       perCase: rawCases.map((c) => ({
         info: c,
-        result: calcFiveStage(c, sortedReps, includeDelayed),
+        result: calcFiveStage(
+          c,
+          sortedReps,
+          includeDelayed,
+          annualDayBasis,
+        ),
       })),
     };
   };
@@ -812,10 +854,19 @@ function ExecutionPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) 
           {showDetail && (
             <div className="mt-2 space-y-3 rounded-md border border-dashed border-border bg-muted/20 px-3 py-3 text-label">
               {results.mode === "multi" ? (
-                <ExecDetailBlock title="多案合并" result={results.merged} />
+                <ExecDetailBlock
+                  title="多案合并"
+                  result={results.merged}
+                  annualDayBasis={annualDayBasis}
+                />
               ) : (
                 results.perCase.map((x, i) => (
-                  <ExecDetailBlock key={i} title={x.info.name} result={x.result} />
+                  <ExecDetailBlock
+                    key={i}
+                    title={x.info.name}
+                    result={x.result}
+                    annualDayBasis={annualDayBasis}
+                  />
                 ))
               )}
             </div>
@@ -1114,9 +1165,11 @@ function BreakdownDl({ result }: { result: ReturnType<typeof calcFiveStage> }) {
 function ExecDetailBlock({
   title,
   result,
+  annualDayBasis,
 }: {
   title: string;
   result: ReturnType<typeof calcFiveStage>;
+  annualDayBasis: AnnualDayBasis;
 }) {
   return (
     <div>
@@ -1132,7 +1185,7 @@ function ExecDetailBlock({
                 <div className="pl-3 font-mono text-muted-foreground/80">
                   {s.interestSegments.map((seg, si) => (
                     <p key={si}>
-                      {seg.startDate} ~ {seg.endDate}: {formatInterestSegmentFormula(seg.principal, seg)} = {formatMoney(seg.interest)}
+                      {seg.startDate} ~ {seg.endDate}: {formatInterestSegmentFormula(seg.principal, seg, annualDayBasis)} = {formatMoney(seg.interest)}
                     </p>
                   ))}
                 </div>
@@ -1153,7 +1206,7 @@ function ExecDetailBlock({
           <div className="pl-3 font-mono text-muted-foreground/80">
             {result.finalInterestSegments.map((seg, i) => (
               <p key={i}>
-                {seg.startDate} ~ {seg.endDate}: {formatInterestSegmentFormula(seg.principal, seg)} = {formatMoney(seg.interest)}
+                {seg.startDate} ~ {seg.endDate}: {formatInterestSegmentFormula(seg.principal, seg, annualDayBasis)} = {formatMoney(seg.interest)}
               </p>
             ))}
           </div>

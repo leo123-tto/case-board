@@ -49,30 +49,45 @@ enum Role {
     Title,
     H1,
     H2,
+    H3,
     Body,
 }
 
 impl Role {
-    fn east_asia(self) -> &'static str {
+    fn east_asia(self, profile: Profile) -> &'static str {
+        if profile == Profile::Editor {
+            return "Songti SC";
+        }
         match self {
             Role::Title => "方正小标宋简体",
-            Role::H1 | Role::H2 => "SimHei",
+            Role::H1 | Role::H2 | Role::H3 => "SimHei",
             Role::Body => "仿宋_GB2312",
         }
     }
     /// 字号(半点)
-    fn sz(self) -> &'static str {
+    fn sz(self, profile: Profile) -> &'static str {
+        if profile == Profile::Editor {
+            return match self {
+                Role::Title | Role::H1 => "34",
+                Role::H2 => "28",
+                Role::H3 => "26",
+                Role::Body => "24",
+            };
+        }
         match self {
             Role::Title => "32",
             Role::H1 => "30",
-            Role::H2 | Role::Body => "28",
+            Role::H2 | Role::H3 | Role::Body => "28",
         }
     }
-    fn centered(self) -> bool {
-        matches!(self, Role::Title)
+    fn centered(self, profile: Profile) -> bool {
+        matches!(self, Role::Title) || (profile == Profile::Editor && matches!(self, Role::H1))
     }
-    fn first_line_indent(self) -> bool {
-        !matches!(self, Role::Title)
+    fn first_line_indent(self, profile: Profile) -> bool {
+        profile != Profile::Editor && !matches!(self, Role::Title)
+    }
+    fn default_bold(self, profile: Profile) -> bool {
+        profile == Profile::Editor && !matches!(self, Role::Body)
     }
 }
 
@@ -87,11 +102,16 @@ pub enum Profile {
     Base,
     /// 法律文书:base + 法律叠加
     Filing,
+    /// Milkdown 可视编辑器文稿：标题层级、宋体正文、1.9 倍行距和预格式块
+    /// 尽可能对齐 `src/components/editor/editor.css`。
+    Editor,
 }
 
 struct Run {
     text: String,
     bold: bool,
+    italic: bool,
+    code: bool,
 }
 
 enum Block {
@@ -103,6 +123,10 @@ enum Block {
     },
     Table {
         rows: Vec<TableRow>,
+    },
+    /// 围栏代码块 / 预格式块：保留原文换行和行首空格。
+    Preformatted {
+        text: String,
     },
     /// 分隔线(`---`),只在 base 档渲染
     Rule,
@@ -186,6 +210,8 @@ struct Walker {
     cur: Option<(Role, Vec<Run>, u8)>,
     ordered: Vec<Option<u64>>,
     bold_depth: u32,
+    italic_depth: u32,
+    code_block_text: Option<String>,
     // 表格累积
     table_rows: Option<Vec<TableRow>>,
     cur_row: Option<(bool, Vec<Vec<Run>>)>,
@@ -213,10 +239,13 @@ impl Walker {
             return;
         }
         let bold = self.bold_depth > 0;
+        let italic = self.italic_depth > 0;
         if let Some(cell) = self.cur_cell.as_mut() {
             cell.push(Run {
                 text: t.to_string(),
                 bold,
+                italic,
+                code: false,
             });
             return;
         }
@@ -226,6 +255,31 @@ impl Walker {
         self.cur.as_mut().unwrap().1.push(Run {
             text: t.to_string(),
             bold,
+            italic,
+            code: false,
+        });
+    }
+
+    fn push_code(&mut self, t: &str) {
+        let bold = self.bold_depth > 0;
+        let italic = self.italic_depth > 0;
+        if let Some(cell) = self.cur_cell.as_mut() {
+            cell.push(Run {
+                text: t.to_string(),
+                bold,
+                italic,
+                code: true,
+            });
+            return;
+        }
+        if self.cur.is_none() {
+            self.cur = Some((Role::Body, Vec::new(), 0));
+        }
+        self.cur.as_mut().unwrap().1.push(Run {
+            text: t.to_string(),
+            bold,
+            italic,
+            code: true,
         });
     }
 
@@ -235,8 +289,14 @@ impl Walker {
                 Event::Start(tag) => self.start(tag),
                 Event::End(tag) => self.end(tag),
                 // 正文文本做中文标点规范化(导出 Word 静默规范);Code(行内代码)原样不碰。
-                Event::Text(t) => self.push_text(&normalize_cjk_punct(&t)),
-                Event::Code(t) => self.push_text(&t),
+                Event::Text(t) => {
+                    if let Some(code) = self.code_block_text.as_mut() {
+                        code.push_str(&t);
+                    } else {
+                        self.push_text(&normalize_cjk_punct(&t));
+                    }
+                }
+                Event::Code(t) => self.push_code(&t),
                 // 内联/块级 HTML 当字面量文本处理(转义后输出),既不丢内容也不注入 HTML
                 Event::Html(t) | Event::InlineHtml(t) => self.push_text(&t),
                 // 软换行:中文文书同段内不插空格;硬换行同样并段(MVP)
@@ -244,7 +304,7 @@ impl Walker {
                 // 分隔线 `---`:base 忠实渲染成下边框段,filing 沿用旧行为(丢弃)
                 Event::Rule => {
                     self.flush_cur();
-                    if self.profile == Profile::Base {
+                    if matches!(self.profile, Profile::Base | Profile::Editor) {
                         self.blocks.push(Block::Rule);
                     }
                 }
@@ -258,8 +318,11 @@ impl Walker {
         match tag {
             Tag::Heading { level, .. } => {
                 self.flush_cur();
-                let role = match level {
-                    HeadingLevel::H1 | HeadingLevel::H2 => Role::H1,
+                let role = match (self.profile, level) {
+                    (Profile::Editor, HeadingLevel::H1) => Role::H1,
+                    (Profile::Editor, HeadingLevel::H2) => Role::H2,
+                    (Profile::Editor, _) => Role::H3,
+                    (_, HeadingLevel::H1 | HeadingLevel::H2) => Role::H1,
                     _ => Role::H2,
                 };
                 self.cur = Some((role, Vec::new(), 0));
@@ -281,17 +344,21 @@ impl Walker {
                         *n += 1;
                         s
                     }
-                    Some(None) if self.profile == Profile::Base => "• ".to_string(),
+                    Some(None) if matches!(self.profile, Profile::Base | Profile::Editor) => {
+                        "• ".to_string()
+                    }
                     _ => String::new(),
                 };
                 if !prefix.is_empty() {
                     runs.push(Run {
                         text: prefix,
                         bold: false,
+                        italic: false,
+                        code: false,
                     });
                 }
                 // base 给列表项左悬挂缩进(按嵌套层级);filing 保持普通段落(首行缩进)
-                let list_depth = if self.profile == Profile::Base {
+                let list_depth = if matches!(self.profile, Profile::Base | Profile::Editor) {
                     depth
                 } else {
                     0
@@ -299,6 +366,11 @@ impl Walker {
                 self.cur = Some((Role::Body, runs, list_depth));
             }
             Tag::Strong => self.bold_depth += 1,
+            Tag::Emphasis => self.italic_depth += 1,
+            Tag::CodeBlock(_) => {
+                self.flush_cur();
+                self.code_block_text = Some(String::new());
+            }
             Tag::Table(_) => {
                 self.flush_cur();
                 self.table_rows = Some(Vec::new());
@@ -319,6 +391,22 @@ impl Walker {
                 self.ordered.pop();
             }
             TagEnd::Strong => self.bold_depth = self.bold_depth.saturating_sub(1),
+            TagEnd::Emphasis => self.italic_depth = self.italic_depth.saturating_sub(1),
+            TagEnd::CodeBlock => {
+                if let Some(mut text) = self.code_block_text.take() {
+                    // pulldown-cmark 会把围栏闭合前的换行收进 Text；这个结尾换行
+                    // 是 Markdown 语法边界，不是用户想在 Word 中多出的空行。
+                    if text.ends_with('\n') {
+                        text.pop();
+                        if text.ends_with('\r') {
+                            text.pop();
+                        }
+                    }
+                    if !text.is_empty() {
+                        self.blocks.push(Block::Preformatted { text });
+                    }
+                }
+            }
             TagEnd::TableCell => {
                 if let (Some(cell), Some(row)) = (self.cur_cell.take(), self.cur_row.as_mut()) {
                     row.1.push(cell);
@@ -357,39 +445,77 @@ fn parse_blocks(body_md: &str, profile: Profile) -> Vec<Block> {
 
 // ───────────────────────── Blocks → document.xml ─────────────────────────
 
-fn render_run(run: &Run, role: Role) -> String {
+fn render_run(run: &Run, role: Role, profile: Profile) -> String {
     if run.text.is_empty() {
         return String::new();
     }
-    let b = if run.bold { "<w:b/><w:bCs/>" } else { "" };
+    let b = if run.bold || role.default_bold(profile) {
+        "<w:b/><w:bCs/>"
+    } else {
+        ""
+    };
+    let i = if run.italic { "<w:i/><w:iCs/>" } else { "" };
+    let code = if run.code && profile == Profile::Editor {
+        "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F0F0F0\"/>"
+    } else {
+        ""
+    };
+    let ascii = if run.code && profile == Profile::Editor {
+        "Menlo"
+    } else {
+        "Times New Roman"
+    };
     format!(
-        "<w:r><w:rPr><w:rFonts w:ascii=\"Times New Roman\" w:eastAsia=\"{ea}\"/>{b}\
+        "<w:r><w:rPr><w:rFonts w:ascii=\"{ascii}\" w:eastAsia=\"{ea}\"/>{b}{i}{code}\
          <w:sz w:val=\"{sz}\"/><w:szCs w:val=\"{sz}\"/></w:rPr>\
          <w:t xml:space=\"preserve\">{t}</w:t></w:r>",
-        ea = role.east_asia(),
+        ascii = ascii,
+        ea = role.east_asia(profile),
         b = b,
-        sz = role.sz(),
+        i = i,
+        code = code,
+        sz = role.sz(profile),
         t = xml_escape(&run.text),
     )
 }
 
-fn render_para(role: Role, runs: &[Run], list_depth: u8) -> String {
-    let mut s = String::from("<w:p><w:pPr><w:spacing w:line=\"360\" w:lineRule=\"auto\"/>");
+fn render_para(role: Role, runs: &[Run], list_depth: u8, profile: Profile) -> String {
+    let spacing = if profile == Profile::Editor {
+        match role {
+            Role::Title | Role::H1 => {
+                "<w:spacing w:before=\"320\" w:after=\"240\" w:line=\"360\" w:lineRule=\"auto\"/><w:keepNext/>"
+            }
+            Role::H2 => {
+                "<w:spacing w:before=\"280\" w:after=\"160\" w:line=\"360\" w:lineRule=\"auto\"/><w:keepNext/>"
+            }
+            Role::H3 => {
+                "<w:spacing w:before=\"220\" w:after=\"120\" w:line=\"360\" w:lineRule=\"auto\"/><w:keepNext/>"
+            }
+            Role::Body => {
+                "<w:spacing w:before=\"0\" w:after=\"144\" w:line=\"456\" w:lineRule=\"auto\"/>"
+            }
+        }
+    } else {
+        "<w:spacing w:line=\"360\" w:lineRule=\"auto\"/>"
+    };
+    let mut s = format!("<w:p><w:pPr>{spacing}");
     if list_depth > 0 {
         // 列表项:按嵌套层级左缩进 + 悬挂缩进(换行后对齐到圆点/编号之后)
         let left = 420 * list_depth as i32 + 280;
         s.push_str(&format!("<w:ind w:left=\"{}\" w:hanging=\"280\"/>", left));
-    } else if role.first_line_indent() {
+    } else if role.first_line_indent(profile) {
         s.push_str("<w:ind w:firstLine=\"560\"/>");
     }
-    s.push_str(if role.centered() {
+    s.push_str(if role.centered(profile) {
         "<w:jc w:val=\"center\"/>"
+    } else if profile == Profile::Editor && matches!(role, Role::H2 | Role::H3) {
+        "<w:jc w:val=\"left\"/>"
     } else {
         "<w:jc w:val=\"both\"/>"
     });
     s.push_str("</w:pPr>");
     for r in runs {
-        s.push_str(&render_run(r, role));
+        s.push_str(&render_run(r, role, profile));
     }
     s.push_str("</w:p>");
     s
@@ -401,24 +527,30 @@ fn render_rule() -> &'static str {
 }
 
 /// 表格单元格里的段落:正文字体,不缩进(表格内),表头加粗。
-fn render_cell(cell: &[Run], header: bool) -> String {
-    let mut s = String::from(
-        "<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr>\
-         <w:p><w:pPr><w:spacing w:line=\"360\" w:lineRule=\"auto\"/><w:jc w:val=\"both\"/></w:pPr>",
-    );
+fn render_cell(cell: &[Run], header: bool, profile: Profile) -> String {
+    let fill = if header && profile == Profile::Editor {
+        "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F4F4F4\"/>"
+    } else {
+        ""
+    };
+    let mut s = String::from("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/>");
+    s.push_str(fill);
+    s.push_str("</w:tcPr><w:p><w:pPr><w:spacing w:line=\"360\" w:lineRule=\"auto\"/><w:jc w:val=\"left\"/></w:pPr>");
     // 空单元格也合法:留一个 run-less 段(上面的 <w:p> 已含),Word 才认
     for r in cell {
         let run = Run {
             text: r.text.clone(),
             bold: r.bold || header,
+            italic: r.italic,
+            code: r.code,
         };
-        s.push_str(&render_run(&run, Role::Body));
+        s.push_str(&render_run(&run, Role::Body, profile));
     }
     s.push_str("</w:p></w:tc>");
     s
 }
 
-fn render_table(rows: &[TableRow]) -> String {
+fn render_table(rows: &[TableRow], profile: Profile) -> String {
     let cols = rows.iter().map(|r| r.cells.len()).max().unwrap_or(1).max(1);
     // 文字区宽 = 11906 - 左右各 1440 = 9026 twip,均分
     let colw = 9026 / cols as i32;
@@ -443,11 +575,37 @@ fn render_table(rows: &[TableRow]) -> String {
     for row in rows {
         s.push_str("<w:tr>");
         for cell in &row.cells {
-            s.push_str(&render_cell(cell, row.header));
+            s.push_str(&render_cell(cell, row.header, profile));
         }
         s.push_str("</w:tr>");
     }
     s.push_str("</w:tbl>");
+    s
+}
+
+/// 编辑器中的预格式块→ Word 浅灰底文本块。用 `<w:br/>` 明确表示换行，
+/// 避免 OOXML 把 `<w:t>` 里的原始换行归一化为空格，导致流程图横向串行。
+fn render_preformatted(text: &str) -> String {
+    let mut s = String::from(
+        "<w:p><w:pPr><w:spacing w:before=\"120\" w:after=\"120\" w:line=\"360\" w:lineRule=\"auto\"/>\
+         <w:ind w:left=\"280\" w:right=\"280\"/><w:jc w:val=\"left\"/><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F3F4F6\"/>\
+         <w:keepLines/></w:pPr>",
+    );
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            s.push_str("<w:r><w:br/></w:r>");
+        }
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if !line.is_empty() {
+            s.push_str(&format!(
+                "<w:r><w:rPr><w:rFonts w:ascii=\"Menlo\" w:eastAsia=\"Songti SC\"/>\
+                 <w:sz w:val=\"24\"/><w:szCs w:val=\"24\"/></w:rPr>\
+                 <w:t xml:space=\"preserve\">{}</w:t></w:r>",
+                xml_escape(line)
+            ));
+        }
+    }
+    s.push_str("</w:p>");
     s
 }
 
@@ -474,8 +632,11 @@ pub(crate) fn render_document_xml(title: &str, body_md: &str, profile: Profile) 
             &[Run {
                 text: title_trim.to_string(),
                 bold: false,
+                italic: false,
+                code: false,
             }],
             0,
+            profile,
         ));
     }
 
@@ -486,8 +647,9 @@ pub(crate) fn render_document_xml(title: &str, body_md: &str, profile: Profile) 
                 role,
                 runs,
                 list_depth,
-            } => body.push_str(&render_para(*role, runs, *list_depth)),
-            Block::Table { rows } => body.push_str(&render_table(rows)),
+            } => body.push_str(&render_para(*role, runs, *list_depth, profile)),
+            Block::Table { rows } => body.push_str(&render_table(rows, profile)),
+            Block::Preformatted { text } => body.push_str(&render_preformatted(text)),
             Block::Rule => body.push_str(render_rule()),
         }
     }
@@ -517,6 +679,12 @@ pub fn build_filing_docx_bytes(title: &str, body_md: &str) -> Result<Vec<u8>, St
 /// 案件分析报告、风险/深挖报告、通用 MD 导出走这条(替代旧的 textutil HTML 路径)。
 pub fn build_report_docx_bytes(title: &str, body_md: &str) -> Result<Vec<u8>, String> {
     build_docx_bytes(title, body_md, Profile::Base)
+}
+
+/// Milkdown 可视编辑器导出档：保留编辑器的标题层级、正文字号/行距、
+/// 列表、表格、加粗/斜体和预格式块，与报告档和法律文书档相互隔离。
+pub fn build_editor_docx_bytes(title: &str, body_md: &str) -> Result<Vec<u8>, String> {
+    build_docx_bytes(title, body_md, Profile::Editor)
 }
 
 /// 把 (标题, 正文 MD, 档位) 打包成完整 .docx 字节流。纯函数,便于测试。

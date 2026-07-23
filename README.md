@@ -145,7 +145,7 @@ xattr -cr /Applications/案件看板.app
 
 ### 环境要求
 
-- Node 20+ · pnpm 9+
+- Node 20+ · pnpm 10+ · Bun 1.3.10（构建内置 Pi Runtime）
 - Rust 1.80+(`rustup install stable`)
 - macOS Xcode Command Line Tools(`xcode-select --install`)
 
@@ -165,7 +165,7 @@ bash scripts/release.sh aarch64   # Apple Silicon
 bash scripts/release.sh x86_64    # Intel 交叉编译
 ```
 
-产出 `target/release/bundle/dmg/案件看板_<version>_aarch64.dmg`,首次约 2-3 分钟。
+分别产出 Apple Silicon 的 `aarch64` 与 Intel 的 `x64` DMG，同时生成带签名的 App updater 包。
 
 ### 测试 / 质量基线
 
@@ -200,19 +200,20 @@ caseboard/
 │   │   ├── lifecycle/            # 本机 llama-server 自启
 │   │   ├── settings.rs           # 本机配置读写
 │   │   └── lib.rs                # Tauri commands
-│   └── migrations/               # SQLite migrations(0001 ~ 0022)
+│   └── migrations/               # SQLite migrations（只增不改）
 ├── scripts/release.sh            # 一键打 dmg
 └── public/                       # 静态资源(图标 / svg)
 ```
 
 ## 状态
 
-- ✅ 当前公开版 v0.4.7,提供 macOS Apple Silicon、macOS Intel 与 Windows x64 安装包(下载见 [lawtools.top](https://lawtools.top))
+- ✅ 当前公开版 v0.4.15，提供 macOS Apple Silicon、macOS Intel 与 Windows x64 安装包（下载见 [lawtools.top](https://lawtools.top)）
+- 🔧 0.4.x 是持续维护的最终公开大版：三端同版发布安全修复、Bug 修复与适合共享的优化，欢迎在此基线上提 PR 或继续定制
 - 🐢 个人项目节奏:issue / PR 会看,但不承诺响应时限;Linux 适配欢迎 PR
 
 ## 反馈 & 贡献
 
-- 用户反馈:App 右下角 💬 反馈按钮 → 自动生成本地 MD → 用户自行发送给项目维护者
+- 用户反馈:App 右下角 💬 反馈按钮 → 预览脱敏诊断 → 可匿名上传，也可只保存本地 MD
 - 安全问题:见 [SECURITY.md](./SECURITY.md)
 - 行为准则:见 [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)
 - 贡献指南:见 [CONTRIBUTING.md](./CONTRIBUTING.md)

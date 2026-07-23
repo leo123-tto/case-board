@@ -8,18 +8,29 @@
  * 本模块完全独立 —— 不依赖诉讼模块的任何 state、组件、IPC。
  */
 
-import { useState } from "react";
-import { ArrowLeft, FileSignature, ShieldCheck } from "lucide-react";
+import { useRef, useState } from "react";
+import {
+  ArrowLeft,
+  BriefcaseBusiness,
+  FileSignature,
+  ShieldCheck,
+} from "lucide-react";
 
 import { BetaBadge } from "@/components/BetaBadge";
 import { LegalToolCard } from "@/modules/tools/components/LegalToolCard";
 import { ContractReviewTool } from "./ContractReviewTool";
 import { ContractDraftTool } from "./ContractDraftTool";
+import { AiWorkspaceTool } from "./ai-workspace/AiWorkspaceTool";
 
-type TransactionToolId = "contract_review" | "contract_draft";
+type TransactionToolId = "contract_review" | "contract_draft" | "ai_workspace";
 
-export function TransactionModule() {
-  const [activeTool, setActiveTool] = useState<TransactionToolId | null>(null);
+export function TransactionModule({
+  initialTool = null,
+}: {
+  initialTool?: TransactionToolId | null;
+}) {
+  const [activeTool, setActiveTool] = useState<TransactionToolId | null>(initialTool);
+  const aiWorkspaceBeforeLeaveRef = useRef<() => Promise<boolean>>(() => Promise.resolve(true));
 
   // 详情视图:合同审查
   if (activeTool === "contract_review") {
@@ -81,6 +92,21 @@ export function TransactionModule() {
     );
   }
 
+  if (activeTool === "ai_workspace") {
+    return (
+      <main className="app-shell flex h-full w-full flex-col">
+        <AiWorkspaceTool
+          onBackToTransaction={() => void (async () => {
+            if (await aiWorkspaceBeforeLeaveRef.current()) setActiveTool(null);
+          })()}
+          registerBeforeLeave={(handler) => {
+            aiWorkspaceBeforeLeaveRef.current = handler;
+          }}
+        />
+      </main>
+    );
+  }
+
   // 卡片网格(默认)
   return (
     <main className="app-shell flex h-full w-full flex-col">
@@ -91,11 +117,11 @@ export function TransactionModule() {
               非诉
             </h1>
             <p className="mt-1 text-xs text-muted-foreground">
-              合同审查与起草。
+              合同专项工具与独立 AI 事务工作区。
             </p>
           </header>
 
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
             <LegalToolCard
               icon={ShieldCheck}
               title="合同审查"
@@ -108,6 +134,12 @@ export function TransactionModule() {
               desc="补全交易要素，生成可导出的合同草案。"
               badge="Beta"
               onClick={() => setActiveTool("contract_draft")}
+            />
+            <LegalToolCard
+              icon={BriefcaseBusiness}
+              title="AI 事务工作区"
+              desc="围绕一件事务持续整理材料、对话和起草文稿。"
+              onClick={() => setActiveTool("ai_workspace")}
             />
           </div>
         </div>

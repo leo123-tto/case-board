@@ -30,6 +30,9 @@ pub const DEFAULT_CHAT_LOOP_MAX_ITERS_DEEP_ANALYSIS: u32 = 64;
 pub const DEFAULT_REASONING_TOKENS_DEFAULT: u64 = 64_000;
 pub const DEFAULT_REASONING_TOKENS_COMPLEX: u64 = 192_000;
 pub const DEFAULT_REASONING_TOKENS_DEEP_ANALYSIS: u64 = 256_000;
+pub const WORKSPACE_RESEARCH_MAX_DURATION_SECS: u64 = 3_600;
+pub const WORKSPACE_RESEARCH_IDLE_TIMEOUT_SECS: u64 = 90;
+pub const WORKSPACE_RESEARCH_RESPONSE_READ_TIMEOUT_SECS: u64 = 600;
 const MIN_CHAT_LOOP_TIMEOUT_SECS: u64 = 60;
 const MIN_CHAT_LOOP_IDLE_TIMEOUT_SECS: u64 = 30;
 
@@ -42,7 +45,7 @@ pub enum LoopGuardViolation {
     DuplicateToolCall { tool: String },
     #[error("本会话总耗时超 {limit_secs}s,可能后端慢或卡死,提前 abort")]
     DurationCapExceeded { limit_secs: u64 },
-    #[error("连续 {idle_secs}s 没有新进展(token / reasoning / 工具结果),疑似卡住,提前 abort")]
+    #[error("连续 {idle_secs}s 没有可交付进展(正文 / 工具调用 / 工具结果),疑似卡住,提前 abort")]
     IdleCapExceeded { idle_secs: u64 },
     #[error("reasoning token 累计超 {limit},thinking 模型可能跑飞")]
     ReasoningTokenCapExceeded { limit: u64 },
@@ -109,6 +112,29 @@ impl LoopGuardConfig {
             max_reasoning_tokens,
         }
     }
+
+    /// 独立事务工作区允许连续做多轮材料分析和联网检索。
+    /// 保留一小时总安全阀与 5 分钟无进展阀，避免仍在持续输出的任务被 300 秒误杀，
+    /// 同时防止真正断流或失控任务无限占用资源。
+    pub fn for_workspace_research(s: &crate::settings::Settings) -> Self {
+        let configured_iters = s
+            .chat_loop_max_iters
+            .unwrap_or(DEFAULT_CHAT_LOOP_MAX_ITERS_DEFAULT);
+        let max_iters = if configured_iters == DEFAULT_CHAT_LOOP_MAX_ITERS_DEFAULT {
+            DEFAULT_CHAT_LOOP_MAX_ITERS_DEEP_ANALYSIS
+        } else {
+            configured_iters
+        };
+        Self {
+            max_iters,
+            max_duration: Duration::from_secs(WORKSPACE_RESEARCH_MAX_DURATION_SECS),
+            idle_timeout: Duration::from_secs(WORKSPACE_RESEARCH_IDLE_TIMEOUT_SECS),
+            response_read_timeout: Duration::from_secs(
+                WORKSPACE_RESEARCH_RESPONSE_READ_TIMEOUT_SECS,
+            ),
+            max_reasoning_tokens: DEFAULT_REASONING_TOKENS_DEEP_ANALYSIS,
+        }
+    }
 }
 
 pub struct LoopGuard {
@@ -158,7 +184,21 @@ impl LoopGuard {
         self.response_read_timeout.as_secs()
     }
 
-    /// 收到新的 token / reasoning / 工具结果时更新最近进展时间。
+    /// 新的 HTTP 200 流即将开始读取。安全重试可以获得一段新的“等待首个有效事件”窗口，
+    /// 但不会重置整个会话的总时长、轮数、工具去重或 reasoning token 计数。
+    pub fn begin_stream_attempt(&mut self) {
+        self.last_progress_at = Instant::now();
+    }
+
+    /// 距离有效进展 idle deadline 的剩余时间。SSE keep-alive 不调用 `note_progress`，
+    /// 因此即使连接持续收到注释帧，这个剩余时间仍会正常归零。
+    pub fn idle_remaining(&self) -> Duration {
+        self.idle_timeout
+            .saturating_sub(self.last_progress_at.elapsed())
+    }
+
+    /// 收到正文、工具调用或工具结果时更新最近进展时间。
+    /// 内部 reasoning 只用于界面显示“仍在分析”，不能单独无限续命。
     pub fn note_progress(&mut self) {
         self.last_progress_at = Instant::now();
     }
@@ -204,7 +244,7 @@ impl LoopGuard {
 
     /// 连续太久没有任何新进展(token / reasoning / 工具结果)就判定为卡住。
     pub fn check_idle_cap(&self) -> Result<(), LoopGuardViolation> {
-        if self.last_progress_at.elapsed() > self.idle_timeout {
+        if self.last_progress_at.elapsed() >= self.idle_timeout {
             return Err(LoopGuardViolation::IdleCapExceeded {
                 idle_secs: self.idle_timeout.as_secs(),
             });

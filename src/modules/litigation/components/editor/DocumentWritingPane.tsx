@@ -5,7 +5,7 @@
  *   1. 按 doc.source_path 读 .md → 剥 filing 注释头 → 得正文 body + title。
  *   2. 顶部:返回看板 / 可编辑标题 / 未保存指示 / 保存 / 导出。
  *   3. 显式保存(Cmd+S / 保存按钮);**关闭即存**(返回看板时 dirty 先存再退,advisor 定)。
- *   4. 导出复用 export_filing_docx(法律格式)/ export_md_html;**导出前先存**(导出读磁盘)。
+ *   4. 导出复用两个编辑工作区共享的 Word / HTML 菜单；**导出前先存**。
  *
  * 安全:MVP 不上 autosave(序列化若规范化 MD 会静默改文书,autosave 会覆盖唯一副本)。
  * 详见 docs/V0.3-Milkdown编辑器-实施落地.md §1.5。
@@ -18,23 +18,17 @@ import {
   useRef,
   useState,
 } from "react";
-import { save } from "@tauri-apps/plugin-dialog";
-import { ArrowLeft, FileDown, FileText, Loader2, Save } from "lucide-react";
+import { ArrowLeft, Loader2, Save } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import {
-  exportFilingDocx,
-  exportMdHtml,
-  readTextFile,
-  revealInFinder,
-  saveEditorDoc,
-} from "@/lib/api";
+import { readTextFile, saveEditorDoc } from "@/lib/api";
 import { stripFilingHeader, titleFromFilename } from "@/lib/filing";
 import { countChanges, diffParts, type DiffPart } from "@/lib/textDiff";
 import type { Document } from "@/lib/types";
+import { DiffReview } from "@/components/editor/DiffReview";
+import { EditorExportMenu } from "@/components/editor/EditorExportMenu";
+import { MilkdownEditor } from "@/components/editor/MilkdownEditor";
 
-import { DiffReview } from "./DiffReview";
-import { MilkdownEditor } from "./MilkdownEditor";
 
 interface Props {
   doc: Document;
@@ -68,15 +62,10 @@ export const DocumentWritingPane = forwardRef<DocumentWritingPaneHandle, Props>(
   const savedRef = useRef<{ md: string; title: string }>({ md: "", title: "" });
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [exporting, setExporting] = useState<"filing" | "html" | null>(null);
   /** ADR-0003 Phase 2 · 非 null 时进 diff 审阅视图(AI 改动待用户接受/拒绝) */
   const [review, setReview] = useState<DiffPart[] | null>(null);
   /** 编辑器重挂代次:换它强制 MilkdownEditor remount 显示最新 body(审阅应用后用) */
   const [editorEpoch, setEditorEpoch] = useState(0);
-
-  // V0.3 · 只有 save_artifact 正式文书(source='chat_artifact')出「Word(法律格式)」导出;
-  // 分析类 AI 产物(source='chat')只出普通 HTML/Word(法律排版套不上)。
-  const isFiling = doc.source === "chat_artifact";
 
   // ── 载入文书 ────────────────────────────────────────────────
   useEffect(() => {
@@ -213,44 +202,9 @@ export const DocumentWritingPane = forwardRef<DocumentWritingPaneHandle, Props>(
   }, [dirty, doSave]);
 
   // ── 导出(先存再导,因为导出从磁盘读) ──────────────────────
-  const runExport = useCallback(
-    async (kind: "filing" | "html") => {
-      if (dirty) {
-        const ok = await doSave();
-        if (!ok) return;
-      }
-      const t = title.trim() || titleFromFilename(doc.filename);
-      const defaultName = `${t}.${kind === "html" ? "html" : "docx"}`;
-      const filters =
-        kind === "html"
-          ? [{ name: "HTML", extensions: ["html"] }]
-          : [{ name: "Word", extensions: ["docx"] }];
-      let savePath: string | null;
-      try {
-        savePath = await save({ defaultPath: defaultName, filters });
-      } catch (e) {
-        setError(`打开保存对话框失败:${e}`);
-        return;
-      }
-      if (!savePath) return;
-      setExporting(kind);
-      try {
-        const written =
-          kind === "filing"
-            ? await exportFilingDocx(doc.id, savePath)
-            : await exportMdHtml(doc.source_path, t, savePath);
-        try {
-          await revealInFinder(written);
-        } catch {
-          /* 不阻塞 */
-        }
-      } catch (e) {
-        setError(`导出失败:${e}`);
-      } finally {
-        setExporting(null);
-      }
-    },
-    [dirty, doSave, title, doc.id, doc.source_path, doc.filename],
+  const prepareExport = useCallback(
+    async (): Promise<boolean> => (dirty ? await doSave() : true),
+    [dirty, doSave],
   );
 
   // ADR-0003 Phase 2 · 审阅模式:占满中栏,接受/拒绝 AI 改动(替代直接生效)
@@ -313,36 +267,13 @@ export const DocumentWritingPane = forwardRef<DocumentWritingPaneHandle, Props>(
             )}
             保存
           </Button>
-          {isFiling ? (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void runExport("filing")}
-              disabled={exporting !== null || saving}
-              title="导出为 Word(法律格式):方正小标宋标题/黑体小标题/仿宋正文/两端对齐/首行缩进2字"
-            >
-              {exporting === "filing" ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <FileText className="size-3.5" />
-              )}
-              Word(法律格式)
-            </Button>
-          ) : null}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void runExport("html")}
-            disabled={exporting !== null || saving}
-            title="导出为 HTML(陶土红×羊皮纸风格,单文件可分享)"
-          >
-            {exporting === "html" ? (
-              <Loader2 className="size-3.5 animate-spin" />
-            ) : (
-              <FileDown className="size-3.5" />
-            )}
-            HTML
-          </Button>
+          <EditorExportMenu
+            title={title.trim() || titleFromFilename(doc.filename)}
+            mdPath={doc.source_path}
+            beforeExport={prepareExport}
+            onError={(message) => setError(message || null)}
+            disabled={saving || loading}
+          />
         </div>
       </header>
 

@@ -34,16 +34,22 @@ pub mod cases;
 pub mod companies;
 pub mod docs;
 pub mod kb;
+pub mod kb_guide;
+pub mod kb_maintenance;
 pub mod law_fulltext;
 pub mod laws;
+pub mod network_research;
 pub mod reextract;
 pub mod save_kb;
 pub mod semantic;
 pub mod semantic_kb;
+pub mod skills;
 pub mod snapshot;
 pub mod verify;
 pub mod visualization;
 pub mod web;
+pub mod workspace_files;
+mod yuandian_schema;
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -168,10 +174,19 @@ pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResearchCapabilities {
+    pub exa: bool,
+    pub firecrawl: bool,
+}
+
 impl ToolRegistry {
-    /// V0.2 全量注册。次序无关紧要,DeepSeek tools 数组无序。
-    pub fn default_v0_2() -> Self {
-        let tools: Vec<Box<dyn Tool>> = vec![
+    pub fn empty() -> Self {
+        Self { tools: Vec::new() }
+    }
+
+    fn builtin_tools() -> Vec<Box<dyn Tool>> {
+        vec![
             // 法规法条 5
             Box::new(laws::SearchLaws),
             Box::new(laws::GetLawArticle),
@@ -192,36 +207,135 @@ impl ToolRegistry {
             Box::new(companies::EnterpriseAnnualReport),
             // 幻觉校验 1
             Box::new(verify::VerifyLegalCitations),
-            // 案件文档 4(V0.3.3 加 semantic_search_case_docs · 语义检索本案全文)
+            // 案件文档 4
             Box::new(docs::ListCaseDocs),
             Box::new(docs::ReadCaseDoc),
             Box::new(docs::FindInDocument),
             Box::new(semantic::SemanticSearchCaseDocs),
-            // 本地 KB 2
+            // 本地知识库 3
             Box::new(kb::SearchLocalKb),
             Box::new(semantic_kb::SemanticSearchLocalKb),
             Box::new(kb::ReadKbFile),
-            // 写作工具 2(V0.3 M1 + ADR-0003):文书生产 + 局部编辑(均 mutating)
+            Box::new(kb_guide::GetLocalKbGuide),
+            Box::new(kb_maintenance::SaveLocalKbMaterial),
+            // 全局法律 Skill 1（只读、按注册名解析，不接受文件路径）
+            Box::new(skills::ReadLegalSkill),
+            // 写作工具 2
             Box::new(artifact::SaveArtifact),
             Box::new(artifact::EditArtifact),
-            // 交互工具 1(V0.3):选项式追问(agent_loop 拦截,不进 parallel 派发)
+            // 交互工具 1
             Box::new(ask_user::AskUser),
-            // 案情可视化 4:读取现状 + 首次创建 + 用户授权后直改 + 非主动建议提案
+            // 案情可视化 4
             Box::new(visualization::GetCaseVisualization),
             Box::new(visualization::SaveCaseVisualization),
             Box::new(visualization::ApplyCaseVisualUpdate),
             Box::new(visualization::ProposeCaseVisualUpdate),
-            // 文档维护 1(V0.3):触发后台重抽某文档(mutating,会重跑 OCR/LLM 烧积分)
+            // 文档维护 1
             Box::new(reextract::ReextractDocument),
-            // 入库工具 1(P2):把企业调查报告写进本地 KB raw/companies/(mutating)
+            // 通用知识库写回 1
             Box::new(save_kb::SaveCompanyReport),
-            // 用户确认后由 AI 助手纠正案件画像；写 user_overrides，重抽不覆盖。
+            // 案件画像更新 1
             Box::new(snapshot::UpdateCaseSnapshotField),
-            // 通用联网工具 2:公开网页搜索 / 读取。只读,作为本地 KB + 元典之外的兜底。
+            // 通用联网 2
             Box::new(web::WebSearch),
             Box::new(web::WebFetch),
-        ];
+            // 派生工作区文件 7（路径不对模型开放；原始文件永远只读）
+            Box::new(workspace_files::ListWorkspaceFiles),
+            Box::new(workspace_files::ReadWorkspaceFile),
+            Box::new(workspace_files::CreateWorkspaceFile),
+            Box::new(workspace_files::WriteWorkspaceFile),
+            Box::new(workspace_files::RenameWorkspaceFile),
+            Box::new(workspace_files::CopyWorkspaceFile),
+            Box::new(workspace_files::ArchiveWorkspaceFile),
+        ]
+    }
+
+    /// V0.2 全量注册。次序无关紧要,DeepSeek tools 数组无序。
+    pub fn default_v0_2() -> Self {
+        Self {
+            tools: Self::builtin_tools(),
+        }
+    }
+
+    pub fn with_research_capabilities(capabilities: ResearchCapabilities) -> Self {
+        let mut tools = Self::builtin_tools();
+        if capabilities.exa || capabilities.firecrawl {
+            tools.retain(|tool| tool.name() != "web_search");
+        }
+        if capabilities.exa {
+            tools.extend([
+                Box::new(network_research::ExaSearch) as Box<dyn Tool>,
+                Box::new(network_research::ExaContents),
+                Box::new(network_research::ExaFindSimilar),
+            ]);
+        }
+        if capabilities.firecrawl {
+            tools.extend([
+                Box::new(network_research::FirecrawlSearch) as Box<dyn Tool>,
+                Box::new(network_research::FirecrawlScrape),
+            ]);
+        }
         Self { tools }
+    }
+
+    pub fn for_current_credentials() -> Self {
+        let (exa, firecrawl) =
+            crate::network_research::configured_providers().unwrap_or((false, false));
+        Self::with_research_capabilities(ResearchCapabilities { exa, firecrawl })
+    }
+
+    /// 独立事务工作区复用同一份内置工具目录，再按 Adapter 权限排除案件专属工具。
+    /// 材料正文由工作区 retrieval 显式注入；法规、案例、企业、KB、联网与允许的 KB 写回
+    /// 均与案件助手使用同一实现，避免两份手工列表逐渐漂移。
+    pub fn matter_workspace() -> Self {
+        const CASE_ONLY_TOOLS: &[&str] = &[
+            "list_case_docs",
+            "read_case_doc",
+            "find_in_document",
+            "semantic_search_case_docs",
+            "save_artifact",
+            "edit_artifact",
+            "get_case_visualization",
+            "save_case_visualization",
+            "apply_case_visual_update",
+            "propose_case_visual_update",
+            "reextract_document",
+            "update_case_snapshot_field",
+        ];
+        let tools = Self::builtin_tools()
+            .into_iter()
+            .filter(|tool| !CASE_ONLY_TOOLS.contains(&tool.name()))
+            .collect();
+        Self { tools }
+    }
+
+    pub fn matter_workspace_for_current_credentials() -> Self {
+        const CASE_ONLY_TOOLS: &[&str] = &[
+            "list_case_docs",
+            "read_case_doc",
+            "find_in_document",
+            "semantic_search_case_docs",
+            "save_artifact",
+            "edit_artifact",
+            "get_case_visualization",
+            "save_case_visualization",
+            "apply_case_visual_update",
+            "propose_case_visual_update",
+            "reextract_document",
+            "update_case_snapshot_field",
+        ];
+        let tools = Self::for_current_credentials()
+            .tools
+            .into_iter()
+            .filter(|tool| !CASE_ONLY_TOOLS.contains(&tool.name()))
+            .collect();
+        Self { tools }
+    }
+
+    /// 当前实际注册、会随 function schemas 一起发给模型的工具名。
+    /// Prompt 只能引用本清单，避免手写能力说明与 Runtime 真相漂移。
+    pub fn registered_tool_names(&self) -> Vec<&str> {
+        self.tools.iter().map(|tool| tool.name()).collect()
     }
 
     pub fn find(&self, name: &str) -> Option<&dyn Tool> {
@@ -303,175 +417,13 @@ pub(crate) fn yuandian_key<'a>(ctx: &'a ToolContext<'_>) -> Result<&'a str, Tool
     Ok(k)
 }
 
-// =============================================================================
-// 喂 LLM 的搜索结果瘦身(ADR-0003 余波 · 2026-06-01 真机暴露:法规搜索 sidecar 250-290KB,
-// 整部塞进主上下文、且工具消息打不中前缀缓存=全价。原则:整部/大段只缓存本地,**进主上下文
-// 的只能是定位 + 短摘要**;要某条全文 LLM 用 get_law_article(fgid+ftnum) 取单条。
-// 缓存(sidecar / .md 索引)仍存完整,瘦身只作用于**返回给 LLM 的内容**。)
-// =============================================================================
-
-/// 需要对「喂 LLM 内容」瘦身的搜索类 query_type(法规法条 / 法规 / 法规向量检索)。
-const SLIM_SEARCH_TYPES: &[&str] = &["rh_ft_search", "rh_fg_search", "law_vector_search"];
-/// 每条结果保留的正文上限(字符)——够 LLM 判断这是不是要的条,全文走 get_law_article。
-const SLIM_CONTENT_CHARS: usize = 140;
-/// 喂 LLM 时砍掉的噪音/重复字段(llm_content 与 content 重复;其余是 url/日期/分类/score)。
-/// ⚠️ **保留 `id`(法条直接 id,get_law_article 首选入参)和 `tid`(阿拉伯条号,可当 ftnum)**
-/// —— 它们小但是模型可靠取单条的定位锚;砍了模型只能传中文 ft_num,extract_article 会失配降级。
-const SLIM_DROP_FIELDS: &[&str] = &[
-    "llm_content",
-    "url",
-    "_score",
-    "fbbm",
-    "fbrq",
-    "ssrq",
-    "fwzh",
-    "xljb_1",
-    "xljb_2",
-    "ftmc",
-    "title",
-];
-
-/// 把搜索类元典响应瘦身成「喂 LLM 的紧凑版」:每条只留定位字段(fgmc/ft_num/fgid/sxx)+
-/// 截断的 content,砍掉重复 llm_content 与一堆噪音。非搜索类返回 `None`(调用方走原样)。
-fn slim_search_for_llm(query_type: &str, resp: &Value) -> Option<Value> {
-    if !SLIM_SEARCH_TYPES.contains(&query_type) {
-        return None;
-    }
-    let arr = resp.get("data")?.as_array()?;
-    let slimmed: Vec<Value> = arr
-        .iter()
-        .map(|it| match it.as_object() {
-            None => it.clone(),
-            Some(obj) => {
-                let mut m = serde_json::Map::new();
-                for (k, v) in obj {
-                    if SLIM_DROP_FIELDS.contains(&k.as_str()) {
-                        continue;
-                    }
-                    match v.as_str() {
-                        Some(s) if s.chars().count() > SLIM_CONTENT_CHARS => {
-                            let kept: String = s.chars().take(SLIM_CONTENT_CHARS).collect();
-                            m.insert(
-                                k.clone(),
-                                Value::String(format!(
-                                    "{kept}…〔全文用 get_law_article(fgid+ftnum) 取〕"
-                                )),
-                            );
-                        }
-                        _ => {
-                            m.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-                Value::Object(m)
-            }
-        })
-        .collect();
-    let mut out = serde_json::Map::new();
-    out.insert("data".into(), Value::Array(slimmed));
-    out.insert(
-        "_note".into(),
-        Value::String(
-            "结果已精简(去重复正文/噪音,正文截断)。要某条全文用 get_law_article(fgid+ftnum) 取单条,\
-             不要据此截断片段直接引用原文。"
-                .into(),
-        ),
-    );
-    Some(Value::Object(out))
-}
-
-// =============================================================================
-// 案例检索瘦身(2026-06-02 · 真机:case_vector_search 单次 138KB / 45 案 × 656 字正文塞进主上下文;
-// get_case_detail 的 content 还带个 llm_content 重复正文)。案例响应结构跟法条不同:
-//   - case_vector_search 的案在 `extra.wenshu`;ptal/qwal 在 `data.lst`;
-//     当前 case_details 在 `data` 数组(兼容旧缓存 `data.lst`)。
-// 列表/向量检索:每案只留定位+短摘要(LLM 据此挑案,要全文 get_case_detail 取);
-// get_case_detail:留 content(本就为取全文而调),只砍重复 llm_content + 噪音。
-// 缓存(sidecar / .md)仍存完整,瘦身只作用于**返回给 LLM 的内容**。
-// =============================================================================
-
-/// 列表/向量检索类(每案正文截断)。`rh_case_details` 不在此列 —— 它要留全文。
-const CASE_LIST_TYPES: &[&str] = &["rh_ptal_search", "rh_qwal_search", "case_vector_search"];
-/// 每案只保留这些字段(定位 + 摘要锚);其余(llm_content 重复 / url / 区划 / score / 库 等)全砍。
-const CASE_KEEP_FIELDS: &[&str] = &[
-    "ah",      // 案号(取全文 get_case_detail 的 case_no)
-    "jbdw",    // 经办单位/法院
-    "ay",      // 案由
-    "anyou",   // 案由(向量库字段名)
-    "cprq",    // 裁判日期
-    "cj",      // 审级
-    "spcx",    // 审判程序
-    "title",   // 标题
-    "id",      // 定位 id
-    "scid",    // 向量库定位 id
-    "content", // 正文(列表型截断,详情型留全)
-];
-/// 列表型每案正文上限(字符)——够 LLM 判断是不是要的案,全文走 get_case_detail。
-const CASE_CONTENT_CHARS: usize = 160;
-
-/// 定位案例数组(不同 query_type 路径不同)。返回 `(案例数组, 是否列表型需截断)`。
-fn locate_cases<'a>(query_type: &str, resp: &'a Value) -> Option<(&'a Vec<Value>, bool)> {
-    let arr = match query_type {
-        "case_vector_search" => resp.get("extra")?.get("wenshu")?.as_array()?,
-        "rh_ptal_search" | "rh_qwal_search" => resp.get("data")?.get("lst")?.as_array()?,
-        "rh_case_details" => resp
-            .get("data")?
-            .as_array()
-            .or_else(|| resp.get("data")?.get("lst")?.as_array())?,
-        _ => return None,
-    };
-    Some((arr, CASE_LIST_TYPES.contains(&query_type)))
-}
-
-/// 把案例类元典响应瘦身成「喂 LLM 的紧凑版」。非案例类返回 `None`(调用方走原样)。
-fn slim_cases_for_llm(query_type: &str, resp: &Value) -> Option<Value> {
-    let (cases, truncate) = locate_cases(query_type, resp)?;
-    let slimmed: Vec<Value> = cases
-        .iter()
-        .map(|c| {
-            let Some(obj) = c.as_object() else {
-                return c.clone();
-            };
-            let mut m = serde_json::Map::new();
-            for &k in CASE_KEEP_FIELDS {
-                let Some(v) = obj.get(k) else { continue };
-                if truncate && k == "content" {
-                    if let Some(s) = v.as_str() {
-                        if s.chars().count() > CASE_CONTENT_CHARS {
-                            let kept: String = s.chars().take(CASE_CONTENT_CHARS).collect();
-                            m.insert(
-                                k.to_string(),
-                                Value::String(format!(
-                                    "{kept}…〔全文用 get_case_detail(type+case_no) 取〕"
-                                )),
-                            );
-                            continue;
-                        }
-                    }
-                }
-                m.insert(k.to_string(), v.clone());
-            }
-            Value::Object(m)
-        })
-        .collect();
-    let note = if truncate {
-        "案例结果已精简(每条只留 案号/法院/案由/日期/正文摘要,正文截断)。要某案全文用 \
-         get_case_detail(type+case_no) 取,不要据此截断片段直接引用裁判理由。"
-    } else {
-        "已去重复正文(llm_content)与噪音字段;content 为判决正文。"
-    };
-    let mut out = serde_json::Map::new();
-    out.insert("cases".into(), Value::Array(slimmed));
-    out.insert("_note".into(), Value::String(note.into()));
-    Some(Value::Object(out))
-}
-
-/// 决定一次工具结果**喂给 LLM** 的字符串:法条搜索类 / 案例类瘦身,其余原样 pretty JSON。
-/// 缓存里仍存完整 resp(本函数不影响落盘)。
-fn content_for_llm(query_type: &str, resp: &Value) -> String {
-    let v = slim_search_for_llm(query_type, resp).or_else(|| slim_cases_for_llm(query_type, resp));
-    let to_print = v.as_ref().unwrap_or(resp);
-    serde_json::to_string_pretty(to_print).unwrap_or_else(|_| "{}".into())
+/// 元典付费检索成功后,把接口返回的完整 JSON 原样交给模型。
+///
+/// 过去法规/案例列表会截断正文并删除元数据,导致一次已经付费的检索信息利用不足、
+/// 模型还可能为了被截断的正文再调详情。现在只做稳定的 pretty JSON 序列化；缓存、
+/// 法规全文写回和 local-first 路由均不受影响。
+fn content_for_llm(_query_type: &str, resp: &Value) -> String {
+    serde_json::to_string_pretty(resp).unwrap_or_else(|_| "{}".into())
 }
 
 // =============================================================================
@@ -490,6 +442,25 @@ struct DetailDoc {
     obj_id: String,
     display_name: String,
     body_md: String,
+}
+
+fn legal_detail_body(resp: &Value, content: &str) -> String {
+    if resp
+        .pointer("/_caseboard_validity_context/mode")
+        .and_then(Value::as_str)
+        != Some("historical_research_only")
+    {
+        return content.to_string();
+    }
+    let status = resp
+        .pointer("/data/sxx")
+        .or_else(|| resp.pointer("/data/validity"))
+        .or_else(|| resp.pointer("/_caseboard_validity_context/inactive_sources/0/validity"))
+        .and_then(Value::as_str)
+        .unwrap_or("失效或非现行历史版本");
+    format!(
+        "> validity_scope: historical_research_only\n> 时效性：{status}\n> 警告：仅供历史适用法研究；不得作为现行有效依据，引用前必须核实施行区间和后续修订。\n\n{content}"
+    )
 }
 
 /// 把详情类响应渲染成可读全文 MD 的素材。**按响应形状分支**(关键:三类形状不同):
@@ -513,7 +484,7 @@ fn render_detail_md(query_type: &str, resp: &Value) -> Option<DetailDoc> {
                 type_label: "法规",
                 obj_id: id.to_string(),
                 display_name: name.to_string(),
-                body_md: content.to_string(),
+                body_md: legal_detail_body(resp, content),
             })
         }
         "rh_ft_detail" => {
@@ -535,7 +506,7 @@ fn render_detail_md(query_type: &str, resp: &Value) -> Option<DetailDoc> {
                 type_label: "法条",
                 obj_id: id.to_string(),
                 display_name: name,
-                body_md: content.to_string(),
+                body_md: legal_detail_body(resp, content),
             })
         }
         "rh_case_details" => {
@@ -572,6 +543,17 @@ pub(crate) fn persist_detail(
     resp: &Value,
     body: &str,
 ) {
+    let historical = crate::local_kb::validity::historical_research_requested(query_type, params);
+    let validity_gate =
+        crate::local_kb::validity::legal_response_for_request(query_type, params, resp.clone());
+    if !historical && !validity_gate.inactive_sources.is_empty() {
+        crate::dlog!(
+            "失效法规详情已被时效门禁拦截，未写缓存或主库: {}",
+            query_type
+        );
+        return;
+    }
+    let resp = &validity_gate.value;
     if let Some(doc) = render_detail_md(query_type, resp) {
         if let Err(e) = kb.save_detail(
             query_type,
@@ -583,15 +565,13 @@ pub(crate) fn persist_detail(
         ) {
             crate::dlog!("local_kb save_detail failed: {}", e);
         }
-        // 新 legal-kb 闭环：法规全文不能只停在 API cache。整部法规详情成功后，
-        // 同步生成 raw/notes 全文 + wiki/sources 来源页 + 最小 index/log，之后
-        // `search_local_kb` 可在主库直接命中，不必再次调用元典。
+        // legal-kb 闭环：法规全文不能只停在 API cache。整部法规详情成功后写入
+        // raw/notes L1，供目录/BM25/向量复用；未经复核不自动伪造 wiki source。
         if query_type == "rh_fg_detail" {
             match crate::local_kb::ingest::ingest_regulation_detail(kb, resp) {
                 Ok(Some(result)) => crate::dlog!(
-                    "元典法规已收口主库: raw={} source={} articles={}",
+                    "元典法规已写回主库 L1: raw={} articles={} wiki=pending_review",
                     result.raw_path.display(),
-                    result.source_path.display(),
                     result.article_count
                 ),
                 Ok(None) => crate::dlog!("元典法规缺名称/正文，未提升到主库"),
@@ -667,6 +647,9 @@ pub(crate) fn try_kb_hit(
     query_type: &str,
     cache_params: &Value,
 ) -> Option<ToolResult> {
+    if crate::chat::policy::requires_direct_yuandian(ctx.message_id) {
+        return None;
+    }
     let kb = ctx.local_kb?;
     let (_hit, _fresh) = kb.check_cache(query_type, cache_params)?;
     // 只认 sidecar 完整响应(含 content 全文,字节与未命中路径一致)。缺 sidecar
@@ -674,12 +657,15 @@ pub(crate) fn try_kb_hit(
     // 误以为没查全,用相同参数重复调用(实测 get_law_article 被 LoopGuard 拦下丢答案)。
     // 宁可当 miss 让上层重新调 API:多花一次积分,但拿完整响应 + 重建 sidecar,打断重复调循环。
     let raw = kb.load_raw_response(query_type, cache_params)?;
-    // 缓存里存的是完整响应;喂 LLM 前对搜索类瘦身(与未命中路径 save_and_wrap 同一函数 →
-    // 命中/未命中喂给 LLM 的字节一致,前缀缓存照样命中)。解析失败则原样返回(兜底)。
+    // 缓存里存的是完整响应；命中/未命中统一经 content_for_llm 原样 pretty JSON，
+    // 避免同一检索因缓存路径不同而出现字段或正文差异。
     let parsed = serde_json::from_str::<Value>(&raw).ok()?;
     // 旧版本曾把 HTTP 200 内的 code=401/404/500/501 业务错误写进永久缓存。
     // 命中时再次校验，失败外壳一律当 miss，绝不把它作为“本地权威结果”返回。
     let validated = crate::yuandian::validate_business_response(parsed).ok()?;
+    let gated =
+        crate::local_kb::validity::legal_response_for_request(query_type, cache_params, validated);
+    let validated = gated.value;
     if response_is_empty(query_type, &validated) {
         return None;
     }
@@ -703,6 +689,26 @@ pub(crate) fn save_and_wrap(
     resp: Value,
 ) -> ToolResult {
     let credits = crate::db::credits::credits_for_query_type(query_type);
+    let historical =
+        crate::local_kb::validity::historical_research_requested(query_type, cache_params);
+    let gated =
+        crate::local_kb::validity::legal_response_for_request(query_type, cache_params, resp);
+    if !gated.inactive_sources.is_empty() {
+        if historical {
+            crate::dlog!(
+                "明确历史法研究保留 {} 项并附时效警告: {}",
+                gated.inactive_sources.len(),
+                query_type
+            );
+        } else {
+            crate::dlog!(
+                "元典法律结果时效门禁剔除 {} 项: {}",
+                gated.inactive_sources.len(),
+                query_type
+            );
+        }
+    }
+    let resp = gated.value;
     // sidecar 存「完整响应 pretty JSON」(含 content 全文,供命中复用 / 人读 / 可追溯)。
     let body = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into());
     if let Some(kb) = ctx.local_kb {
@@ -730,7 +736,7 @@ pub(crate) fn save_and_wrap(
         }
     }
     ToolResult {
-        // 喂 LLM 的内容:搜索类瘦身(只给定位+短摘要),其余原样。缓存仍是上面的完整 body。
+        // 搜索与详情都把完整响应交给模型；缓存仍是上面的完整 body。
         content: content_for_llm(query_type, &resp),
         yuandian_credits_used: credits,
         kb_hit: false,

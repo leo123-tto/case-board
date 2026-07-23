@@ -1,6 +1,6 @@
 //! V0.2 D4-D5.B · 模型路由(V0.3 重构:统一到 `settings.cloud_llm_model` 单一字段)。
 //!
-//! 把 `(TaskType, user_message, Settings)` 映射到具体 DeepSeek 模型 + 温度 + max_tokens。
+//! 把 `(TaskType, 当前消息, 最近上下文, Settings)` 映射到具体 DeepSeek 模型 + 温度 + max_tokens。
 //!
 //! **用户在设置里只有一个选择 `cloud_llm_model`(= 三档「模型档位」)**:
 //!   - `"deepseek-v4-flash"`(默认)= **全局 Flash**:所有任务都走 flash(便宜,约 pro 的 1/3 价)。
@@ -102,8 +102,22 @@ impl ModelChoice {
     }
 }
 
-/// 路由主入口。统一读 `settings.cloud_llm_model` 这一个「模型档位」字段。
+/// 兼容旧调用点的无上下文入口。
 pub fn route_model(task: TaskType, user_message: &str, settings: &Settings) -> ModelChoice {
+    route_model_with_context(task, user_message, &[], None, settings)
+}
+
+/// 上下文感知的路由主入口。统一读 `settings.cloud_llm_model` 这一个「模型档位」字段。
+///
+/// `history` 使用已经准备回放给模型的最近消息，避免路由器和实际请求看到两套上下文。
+/// `previous_model` 只在 auto 档且当前消息明确依赖前文时用于续跑继承；用户强制档位永远优先。
+pub fn route_model_with_context(
+    task: TaskType,
+    user_message: &str,
+    history: &[(String, String)],
+    previous_model: Option<&str>,
+    settings: &Settings,
+) -> ModelChoice {
     // 2026-06-15:MiniMax 后端不套用 DeepSeek 的 flash/pro/auto 档位 —— 用户直接填模型名。
     if settings.effective_cloud_llm_backend() == "minimax" {
         let model = settings
@@ -153,8 +167,82 @@ pub fn route_model(task: TaskType, user_message: &str, settings: &Settings) -> M
         | TaskType::DeepAnalysis
         | TaskType::CriminalDeepAnalysis => ModelChoice::pro(false),
         // 自由问 → 启发式
-        TaskType::FreeChat => route_free_chat(user_message),
+        TaskType::FreeChat => route_free_chat_with_context(user_message, history, previous_model),
     }
+}
+
+fn route_free_chat_with_context(
+    current_message: &str,
+    history: &[(String, String)],
+    previous_model: Option<&str>,
+) -> ModelChoice {
+    let current_choice = route_free_chat(current_message);
+    if current_choice.model == "deepseek-v4-pro" || !message_depends_on_context(current_message) {
+        return current_choice;
+    }
+
+    // 明确的续跑/指代消息优先继承上一轮 Pro；不能再因“继续执行”只有四个字就降到 Flash。
+    if previous_model.is_some_and(|model| model.contains("pro")) {
+        return ModelChoice::pro(false);
+    }
+
+    // 回看最近实质性用户任务。跳过连续的“继续/重试”短指令，直到找到真正的任务描述。
+    // 只读 user 消息，避免把助手自己可能发散的计划或工具名称当成用户复杂度要求。
+    for (role, content) in history.iter().rev() {
+        let is_brief_context_pointer =
+            message_depends_on_context(content) && content.chars().count() < 30;
+        if role != "user" || content.trim().is_empty() || is_brief_context_pointer {
+            continue;
+        }
+        return route_free_chat(content);
+    }
+
+    current_choice
+}
+
+fn message_depends_on_context(message: &str) -> bool {
+    let normalized: String = message
+        .trim()
+        .chars()
+        .filter(|ch| {
+            !ch.is_whitespace() && !matches!(ch, '，' | '。' | '！' | '？' | ',' | '.' | '!' | '?')
+        })
+        .collect();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    const CONTINUATION_PREFIXES: &[&str] = &[
+        "继续",
+        "接着",
+        "重试",
+        "再试",
+        "重新执行",
+        "恢复执行",
+        "往下做",
+    ];
+    const CONTEXT_REFERENCES: &[&str] = &[
+        "上面",
+        "上述",
+        "前面",
+        "前述",
+        "之前",
+        "刚才",
+        "这个方案",
+        "那个方案",
+        "第一个方案",
+        "第二个方案",
+        "第三个方案",
+        "按此",
+        "照此",
+    ];
+
+    CONTINUATION_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+        || CONTEXT_REFERENCES
+            .iter()
+            .any(|reference| normalized.contains(reference))
 }
 
 /// 启发式:短问(<30 字)或不带"推理类"关键词 → flash;否则 pro。

@@ -17,8 +17,9 @@ get_regulation_detail — 拿一部法规的整部全文(目录 + 各章节条�
 - refer_date: 可选,YYYY-MM-DD,定位时点版本(适用于修订过多次的法规)
 
 注意事项:
-- 优先用本地缓存(命中 0 积分；miss 调整部法规详情为 5 积分，并自动收口主库)
+- 优先用本地缓存(命中 0 积分；miss 调整部法规详情为 5 积分)。普通请求只把现行有效全文作为当前依据；失效、废止或尚未生效详情会被拒绝并自动补检现行替代法源。明确 `refer_date` 时可保留历史全文到 raw/cache，并带 `historical_research_only` 警告
 - 返回字段:`{id, fgmc, content, effect_level, publish_date, implement_date, valid, region, issuer}`
-  - `content` 是整部法规全文,可能几千到上万字 — agent_loop 会自动落盘成 KB 文件,LLM 只看摘要 + 关键章节
-- 长法规(如民法典 1260 条)单次调用积分仍是 1,**不要在 LLM 里反复调同部法规**,本地缓存 + KB 写盘后下次直接复用
+  - `content` 是整部法规全文,可能几千到上万字；现行全文或明确历史时点全文通过对应时效策略后完整交给模型并落盘，不做预览裁剪
+- 本接口当前为 **5 积分/次**；不要反复调同部法规，本地缓存 + KB 写盘后下次直接复用
+- 工具返回 `inactive_source_rejected` 时，只能使用 `replacement_search` 中真实取得的现行法源；明确历史时点返回 `historical_research_only` 时，只能按历史版本引用，不得称为现行有效
 - `<CITATIONS>` 标 `type: "law"`,title 写法规全名(无具体条号,因为引用的是整部)

@@ -14,16 +14,15 @@ search_regulations — 检索法规(整部),返回法规元信息列表(法规�
 输入字段(**至少填 keyword 或 fgmc 之一**,纯过滤无关键词时元典容易返回过宽):
 - keyword: 可选,中文关键词,搜法规标题或内容片段
 - fgmc: 可选,法规名模糊匹配
-- effect_level: 可选,枚举「宪法 / 法律 / 行政法规 / 地方性法规 / 司法解释」
-- region: 可选,地方法规过滤(省级名)
-- valid_only: 可选,布尔,默认 true(只返回现行有效法规)
-- publish_date_start / publish_date_end: 可选,YYYY-MM-DD,发布日期范围
-- implement_date_start / implement_date_end: 可选,YYYY-MM-DD,实施日期范围
+- search_mode: 可选,`AND` / `OR`,控制关键词分词组合方式
+- xljb_1 / sxx / dy / fbbm: 可选,分别过滤效力级别、时效性、地域、发布部门
+- fbrq_start / fbrq_end、ssrq_start / ssrq_end: 可选,YYYY-MM-DD,发布日期或实施日期范围
 - top_k: 可选,默认 20
 
 注意事项:
+- Rust 宿主会先查法规全文文件名目录、BM25 和适用的本地向量索引；本地强命中时直接返回，不调用元典
+- 本地不足时可按准确性需要与 `search_laws`、`law_vector_search` 组合多轮检索；避免用完全相同的条件重复调用
 - 优先用本地缓存(命中 0 积分；miss 调法规关键词检索为 10 积分)
-- 返回字段:`[{id, fgmc, effect_level, publish_date, implement_date, valid, region, content?}]`
-  - `content` 仅在 keyword 命中正文时返回高亮片段
+- 外部付费响应保留可用候选和字段，不做预览截断。普通请求先剔除失效、废止和尚未生效候选；用户明确选择非现行 `sxx` 时则带 `historical_research_only` 保留，引用必须标明版本、适用时点和非现行状态
 - 看到列表后通常下一步是 `get_regulation_detail` 拿挑中的那部法规全文
 - `<CITATIONS>` 标 `type: "law"`,title 写法规名(无条号)

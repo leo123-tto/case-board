@@ -797,22 +797,57 @@ pub async fn extract_text_for_element_conversion(
     filename: &str,
     ocr_ctx: &OcrContext,
 ) -> Result<String, String> {
-    let kind = text_extraction_kind(filename);
-    if matches!(kind, TextKind::Unsupported) {
+    if matches!(text_extraction_kind(filename), TextKind::Unsupported) {
         return Err("仅支持 .docx、.doc 和 .pdf 格式".into());
     }
+    let extracted = extract_text_with_ocr(path, filename, ocr_ctx).await?;
+    if extracted.text_md.trim().chars().count() < 30 {
+        return Err("文书可识别文字太少，无法进行要素化".into());
+    }
+    Ok(extracted.text_md)
+}
 
-    let text = match extract_text(path, kind) {
-        Ok((text, _)) => text,
+/// 工作区通用文本抽取结果。只做原生读取 / OCR，不运行案件字段 LLM。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedText {
+    pub text_md: String,
+    pub backend: String,
+    pub quality_status: String,
+}
+
+pub async fn extract_text_with_ocr(
+    path: &Path,
+    filename: &str,
+    ocr_ctx: &OcrContext,
+) -> Result<ExtractedText, String> {
+    if !path.is_file() {
+        return Err(format!("材料不存在或不是文件: {}", path.display()));
+    }
+    let kind = text_extraction_kind(filename);
+    if matches!(kind, TextKind::Unsupported) {
+        return Err(format!("不支持的材料格式: {filename}"));
+    }
+    let (text_md, backend) = match extract_text(path, kind) {
+        Ok(value) => value,
         Err(error) if error == "__NEEDS_OCR__" => {
-            ocr_fallback(path.to_path_buf(), ocr_ctx.clone()).await?.0
+            ocr_fallback(path.to_path_buf(), ocr_ctx.clone()).await?
         }
         Err(error) => return Err(error),
     };
-    if text.trim().chars().count() < 30 {
-        return Err("文书可识别文字太少，无法进行要素化".into());
+    let chars = text_md.trim().chars().count();
+    if chars < 10 {
+        return Err(format!("可识别文字太少({chars} 字符)"));
     }
-    Ok(text)
+    let quality_status = if chars < 80 || ocr_quality_note(backend, &text_md).contains("_review") {
+        "review"
+    } else {
+        "ready"
+    };
+    Ok(ExtractedText {
+        text_md,
+        backend: backend.to_string(),
+        quality_status: quality_status.to_string(),
+    })
 }
 
 /// 用 OCR 后端兜底抽文本,失败返回真错。

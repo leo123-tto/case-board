@@ -365,6 +365,8 @@ export interface ToolCallRecord {
   success: boolean;
   /** 失败时的脱敏短错(成功为 null) */
   error_short: string | null;
+  /** 宿主筛选后的可审计结果摘要；只含公开 URL、法规名/条号等安全字段。 */
+  result_preview?: unknown;
   /** epoch 毫秒,开始时间 */
   started_at_ms: number;
   /** epoch 毫秒,结束时间 */
@@ -476,9 +478,20 @@ export interface SaveMemoryNoteInput {
 /* ------------------------------------------------------------------ */
 
 /** 对应 Rust `settings::Settings`。所有字段都可空(用户没填时为 null)。 */
+export type PiThinkingLevel =
+  | "off"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
 export interface Settings {
   /** 用户的显示称呼(例:"刘律师"),首页问候用。 */
   user_display_name: string | null;
+  /** 首页天气手动城市。null = 自动使用系统定位，失败时仅展示网络粗定位。 */
+  weather_city: string | null;
   /** 2026-05-23 加:用户是否完成 onboarding。默认 false,首次启动会强制弹 wizard。 */
   setup_completed: boolean;
 
@@ -486,6 +499,12 @@ export interface Settings {
   ocr_provider: ProviderChoice | null;
   /** 2026-05-23 晚六:LLM 后端单独选 (local / cloud) */
   llm_provider: ProviderChoice | null;
+  /** Agent Runtime:缺省/native 保持 CaseBoard 原生循环；pi 使用独立 Sidecar。 */
+  agent_runtime: "native" | "pi" | null;
+  pi_provider_id: string | null;
+  pi_model_id: string | null;
+  /** 按 provider/model 分别记住 Pi SDK 原生推理强度。 */
+  pi_model_thinking_levels: Record<string, Record<string, PiThinkingLevel>>;
 
   /** 本机模型目录(留空就用智能默认:LM Studio / ~/.cache/caseboard/models) */
   local_model_dir: string | null;
@@ -549,6 +568,8 @@ export interface Settings {
   embedding_verified_at: string | null;
   /** 本地知识库语义索引「自动维护」开关。null/true=开(默认),false=关。 */
   kb_semantic_auto_index: boolean | null;
+  /** 内置 AI 受控写回开关。默认 false；只允许新增 L1 raw，不允许覆盖/删除/Wiki 提升。 */
+  ai_kb_maintenance_enabled: boolean;
 
   /** 2026-05-25 V0.1.6:MinerU key 验证通过时间(ISO 8601)。非 null = 绿勾。 */
   mineru_verified_at: string | null;

@@ -1,7 +1,8 @@
 //! 整库关键词检索 + 文件读取(带路径穿越防护)。
 //!
-//! 默认搜索范围:整个 `local_kb_root` 下的 `.md` / `.txt` 文件。
-//! **排除**:`raw/yuandian-cache/`(那是元典缓存,LLM 走专用元典工具命中;确需搜可显式 include)
+//! 通用工具默认可在 `local_kb_root` 下做宽口径 `.md` / `.txt` 搜索；法规、案例、
+//! 企业等外部调用门禁会改用明确 scope 分层检索，不把自建目录当作同等可信原文。
+//! **排除**：元典缓存、迁移收件箱、归档和技术目录；详情缓存确需搜索时显式 include。
 //!
 //! `read_kb_file` 的安全约束:
 //!   1. `canonicalize` + `starts_with` 防穿越(LLM 给 `../../etc/passwd` 直接拒)
@@ -51,7 +52,7 @@ impl KbScope {
 
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
-    /// None = 默认 [Notes, Sources, Topics, GapLog](排除 yuandian-cache)
+    /// None = 默认宽口径 Root（仍排除元典缓存、收件箱、归档和技术目录）。
     pub scopes: Option<Vec<KbScope>>,
     pub max_results: usize,
     /// 每条命中里抽多少 char 作为预览片段
@@ -198,7 +199,16 @@ fn should_skip_root_search_path(root_canonical: &Path, path: &Path) -> bool {
     rel.split('/').any(|seg| {
         matches!(
             seg,
-            ".git" | "node_modules" | "target" | "dist" | "__MACOSX" | ".DS_Store"
+            "_inbox"
+                | "_deprecated"
+                | "00_ARCHIVE"
+                | "archive"
+                | ".git"
+                | "node_modules"
+                | "target"
+                | "dist"
+                | "__MACOSX"
+                | ".DS_Store"
         )
     })
 }
@@ -228,10 +238,21 @@ fn load_search_doc(
         Ok(s) => s,
         Err(_) => return Ok(None), // 二进制或编码问题:跳过,不致命
     };
+    if super::validity::is_inactive_regulation_text(&content) {
+        return Ok(None);
+    }
     let relative = path
         .strip_prefix(root_canonical)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+    if relative.starts_with("raw/yuandian-cache/")
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("SEARCH-"))
+    {
+        return Ok(None);
+    }
     let title = extract_title(path, &content);
     let search_text = if query.case_sensitive {
         format!("{relative}\n{title}\n{content}")
@@ -363,6 +384,8 @@ impl LexicalQuery {
         };
         let mut terms = tokenize(&exact);
         let article_re = regex::Regex::new(r"第?\s*(\d{1,4})\s*条").expect("static regex");
+        let chinese_article_re =
+            regex::Regex::new(r"第[零〇一二三四五六七八九十百千万两]+条").expect("static regex");
         let mut law_hint = None;
         let mut article_markers = Vec::new();
         if let Some(caps) = article_re.captures(&exact) {
@@ -381,6 +404,17 @@ impl LexicalQuery {
                     terms.extend(tokenize(&hint));
                     law_hint = Some(hint);
                 }
+            }
+        } else if let Some(m) = chinese_article_re.find(&exact) {
+            let marker = m.as_str().to_string();
+            article_markers.push(marker.clone());
+            terms.push(marker);
+            let hint = exact[..m.start()]
+                .trim_matches(|c: char| c.is_whitespace() || "《》“”\"'，,：:".contains(c))
+                .to_string();
+            if !hint.is_empty() {
+                terms.extend(tokenize(&hint));
+                law_hint = Some(hint);
             }
         }
         terms.extend(article_markers.iter().cloned());
@@ -603,8 +637,16 @@ pub fn read_kb_file(
         }
     }
     let content = std::fs::read_to_string(&target)?;
+    let historical_only = super::validity::is_inactive_regulation_text(&content);
     let chars: Vec<char> = content.chars().collect();
     let start = offset.unwrap_or(0).min(chars.len());
     let take = length.unwrap_or(10_000).min(chars.len() - start);
-    Ok(chars[start..start + take].iter().collect())
+    let selected: String = chars[start..start + take].iter().collect();
+    if historical_only {
+        Ok(format!(
+            "> [!WARNING] historical_research_only：该文件标注为失效、废止或尚未生效，仅供历史适用法研究；不得作为现行有效依据，引用前必须核实施行区间和后续修订。\n\n{selected}"
+        ))
+    } else {
+        Ok(selected)
+    }
 }

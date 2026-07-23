@@ -217,7 +217,17 @@ impl LocalKb {
     ) -> Result<PathBuf, KbError> {
         let safe_id = sanitize_detail_name(obj_id);
         let safe_name = sanitize_detail_name(display_name);
-        let file_name = format!("{}-{}_{}.md", type_label, safe_id, safe_name);
+        let historical_suffix = params
+            .get("refer_date")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|date| !date.is_empty())
+            .map(sanitize_detail_name);
+        let file_name = if let Some(date) = historical_suffix {
+            format!("{}-{}_{}_历史-{}.md", type_label, safe_id, safe_name, date)
+        } else {
+            format!("{}-{}_{}.md", type_label, safe_id, safe_name)
+        };
         let file_path = self.yuandian_cache_dir.join(&file_name);
         let now = now_local_str();
 

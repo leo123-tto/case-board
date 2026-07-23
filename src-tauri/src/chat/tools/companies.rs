@@ -33,6 +33,19 @@ fn entity_cache_key(eid: &EntityId) -> String {
     }
 }
 
+fn entity_lookup_term(eid: &EntityId) -> &str {
+    match eid {
+        EntityId::Id(value) | EntityId::Uscc(value) => value,
+    }
+}
+
+fn entity_local_query(eid: &EntityId, facet: Option<&str>) -> String {
+    match facet.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(facet) => format!("{} {facet}", entity_lookup_term(eid)),
+        None => entity_lookup_term(eid).to_string(),
+    }
+}
+
 pub struct EnterpriseSearch;
 
 #[async_trait]
@@ -44,26 +57,28 @@ impl Tool for EnterpriseSearch {
         include_str!("descriptions/enterprise_search.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "中文企业名(全称/简称/关键字)"}
-            },
-            "required": ["name"]
-        })
+        super::yuandian_schema::enterprise_search()
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
-        // D5-6:底层 enterprise_search 只接 name(top_k 硬编码 10),不再在 schema 暴露 LLM 设不动的 top_k
         let name = require_str(args, "name")?;
-        let cache_params = json!({"name": name});
+        let top_k = opt_u32(args, "top_k").unwrap_or(10).clamp(1, 50);
+        let cache_params = json!({"name": name, "top_k": top_k});
         if let Some(r) = try_kb_hit(ctx, "rh_enterpriseSearch", &cache_params) {
             return Ok(r);
         }
+        if let crate::chat::retrieval_policy::ExternalGateDecision::UseLocal(result) =
+            crate::chat::retrieval_policy::local_first_gate(
+                ctx,
+                crate::local_kb::retrieval::RetrievalDomain::Enterprise,
+                name,
+            )
+            .await?
+        {
+            return Ok(result);
+        }
         let api_key = yuandian_key(ctx)?;
-        // yuandian::enterprise_search 现签名只接 name(top_k 在底层硬编码 10),
-        // V0.2 当前先用,后续若需要可扩 Params struct
-        let resp = yuandian::enterprise_search(api_key, name).await?;
+        let resp = yuandian::enterprise_search_with_limit(api_key, name, top_k).await?;
         Ok(save_and_wrap(
             ctx,
             "rh_enterpriseSearch",
@@ -85,13 +100,7 @@ impl Tool for EnterpriseAggregationSummary {
         include_str!("descriptions/enterprise_aggregation_summary.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "元典企业 ID(优先填)"},
-                "tyshxydm": {"type": "string", "description": "统一社会信用代码 18 位"}
-            }
-        })
+        super::yuandian_schema::enterprise_entity()
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
@@ -101,9 +110,19 @@ impl Tool for EnterpriseAggregationSummary {
         if let Some(r) = try_kb_hit(ctx, "rh_enterpriseAggregationSummary", &cache_params) {
             return Ok(r);
         }
+        if let crate::chat::retrieval_policy::ExternalGateDecision::UseLocal(result) =
+            crate::chat::retrieval_policy::local_first_gate(
+                ctx,
+                crate::local_kb::retrieval::RetrievalDomain::Enterprise,
+                &entity_local_query(&eid, None),
+            )
+            .await?
+        {
+            return Ok(result);
+        }
         let api_key = yuandian_key(ctx)?;
         let resp = yuandian::enterprise_aggregation_summary(api_key, &eid).await?;
-        // 聚合 5 积分
+        // 聚合 10 积分
         Ok(save_and_wrap(
             ctx,
             "rh_enterpriseAggregationSummary",
@@ -125,13 +144,7 @@ impl Tool for EnterpriseBaseInfo {
         include_str!("descriptions/enterprise_base_info.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "tyshxydm": {"type": "string", "description": "USCC 18 位"}
-            }
-        })
+        super::yuandian_schema::enterprise_entity()
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
@@ -140,6 +153,16 @@ impl Tool for EnterpriseBaseInfo {
         let cache_params = json!({"entity": cache_key});
         if let Some(r) = try_kb_hit(ctx, "rh_enterpriseBaseInfo", &cache_params) {
             return Ok(r);
+        }
+        if let crate::chat::retrieval_policy::ExternalGateDecision::UseLocal(result) =
+            crate::chat::retrieval_policy::local_first_gate(
+                ctx,
+                crate::local_kb::retrieval::RetrievalDomain::Enterprise,
+                &entity_local_query(&eid, Some("基本信息")),
+            )
+            .await?
+        {
+            return Ok(result);
         }
         let api_key = yuandian_key(ctx)?;
         let resp = yuandian::enterprise_base_info(api_key, &eid).await?;
@@ -164,14 +187,7 @@ impl Tool for EnterpriseChangeInfo {
         include_str!("descriptions/enterprise_change_info.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "tyshxydm": {"type": "string"},
-                "page": {"type": "integer", "description": "默认 1,每页 20 条"}
-            }
-        })
+        super::yuandian_schema::enterprise_paged()
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
@@ -181,6 +197,16 @@ impl Tool for EnterpriseChangeInfo {
         let cache_params = json!({"entity": cache_key, "page": page});
         if let Some(r) = try_kb_hit(ctx, "rh_enterpriseChangeInfo", &cache_params) {
             return Ok(r);
+        }
+        if let crate::chat::retrieval_policy::ExternalGateDecision::UseLocal(result) =
+            crate::chat::retrieval_policy::local_first_gate(
+                ctx,
+                crate::local_kb::retrieval::RetrievalDomain::Enterprise,
+                &entity_local_query(&eid, Some("变更")),
+            )
+            .await?
+        {
+            return Ok(result);
         }
         let api_key = yuandian_key(ctx)?;
         let resp = yuandian::enterprise_change_info(api_key, &eid, page).await?;
@@ -205,14 +231,7 @@ impl Tool for EnterpriseWritList {
         include_str!("descriptions/enterprise_writ_list.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "tyshxydm": {"type": "string"},
-                "page": {"type": "integer", "description": "默认 1,每页 20 条"}
-            }
-        })
+        super::yuandian_schema::enterprise_paged()
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
@@ -222,6 +241,16 @@ impl Tool for EnterpriseWritList {
         let cache_params = json!({"entity": cache_key, "page": page});
         if let Some(r) = try_kb_hit(ctx, "rh_enterpriseWritList", &cache_params) {
             return Ok(r);
+        }
+        if let crate::chat::retrieval_policy::ExternalGateDecision::UseLocal(result) =
+            crate::chat::retrieval_policy::local_first_gate(
+                ctx,
+                crate::local_kb::retrieval::RetrievalDomain::Enterprise,
+                &entity_local_query(&eid, Some("裁判文书")),
+            )
+            .await?
+        {
+            return Ok(result);
         }
         let api_key = yuandian_key(ctx)?;
         let resp = yuandian::enterprise_writ_list(api_key, &eid, page).await?;
@@ -246,15 +275,7 @@ impl Tool for EnterpriseAnnualReport {
         include_str!("descriptions/enterprise_annual_report.md")
     }
     fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "tyshxydm": {"type": "string"},
-                "year": {"type": "integer", "description": "自然年,如 2024"}
-            },
-            "required": ["year"]
-        })
+        super::yuandian_schema::enterprise_annual_report()
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
@@ -265,6 +286,16 @@ impl Tool for EnterpriseAnnualReport {
         let cache_params = json!({"entity": cache_key, "year": year});
         if let Some(r) = try_kb_hit(ctx, "rh_enterpriseAnnualReport", &cache_params) {
             return Ok(r);
+        }
+        if let crate::chat::retrieval_policy::ExternalGateDecision::UseLocal(result) =
+            crate::chat::retrieval_policy::local_first_gate(
+                ctx,
+                crate::local_kb::retrieval::RetrievalDomain::Enterprise,
+                &entity_local_query(&eid, Some(&format!("{year} 年报"))),
+            )
+            .await?
+        {
+            return Ok(result);
         }
         let api_key = yuandian_key(ctx)?;
         let resp = yuandian::enterprise_annual_report(api_key, &eid, year).await?;

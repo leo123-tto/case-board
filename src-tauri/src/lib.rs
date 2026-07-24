@@ -12,6 +12,7 @@ pub mod diagnostic_log;
 pub mod doc_search;
 pub mod docx_extract;
 pub mod docx_filing;
+pub mod docx_gate;
 pub mod element_convert;
 pub mod embedding;
 pub mod export;
@@ -1775,7 +1776,7 @@ async fn export_case_work_report_docx(
     content_md: Option<String>,
 ) -> Result<String, String> {
     if let Some(content) = content_md.filter(|v| !v.trim().is_empty()) {
-        let bytes = crate::docx_filing::build_report_docx_bytes("案件工作汇报", &content)?;
+        let bytes = crate::docx_filing::build_report_docx_bytes("案件工作汇报", &content, None)?;
         std::fs::write(&save_path, bytes).map_err(|e| format!("写入工作汇报 Word 失败:{e}"))?;
         return Ok(save_path);
     }
@@ -4606,7 +4607,7 @@ async fn export_filing_docx(
     let md = std::fs::read_to_string(&md_path).map_err(|e| format!("读文书 MD 失败:{}", e))?;
     let title = docx_filing::extract_filing_title(&md)
         .unwrap_or_else(|| filename.trim_end_matches(".md").to_string());
-    let bytes = docx_filing::build_filing_docx_bytes(&title, &md)?;
+    let bytes = docx_filing::build_filing_docx_bytes(&title, &md, None)?;
     std::fs::write(&save_path, &bytes).map_err(|e| format!("写 docx 失败:{}", e))?;
     Ok(save_path)
 }

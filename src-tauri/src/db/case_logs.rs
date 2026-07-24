@@ -54,7 +54,7 @@ pub async fn export_work_report_docx(
     save_path: &str,
 ) -> Result<String, String> {
     let body = generate_work_report(pool, case_id).await?;
-    let bytes = crate::docx_filing::build_report_docx_bytes("案件工作汇报", &body)?;
+    let bytes = crate::docx_filing::build_report_docx_bytes("案件工作汇报", &body, None)?;
     std::fs::write(save_path, bytes).map_err(|e| format!("写入工作汇报 Word 失败:{e}"))?;
     Ok(save_path.to_string())
 }

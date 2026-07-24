@@ -969,7 +969,7 @@ fn build_element_docx(
     if template_id == "complaint_private_lending" {
         private_lending_docx(fields)
     } else {
-        crate::docx_filing::build_filing_docx_bytes(title, &generic_element_markdown(fields))
+        crate::docx_filing::build_filing_docx_bytes(title, &generic_element_markdown(fields), None)
     }
 }
 

@@ -154,7 +154,7 @@ pub async fn export_contract_draft_docx(
     save_path: String,
 ) -> Result<String, String> {
     let (title, body) = split_title_body(&contract_name, &draft_md);
-    let bytes = crate::docx_filing::build_filing_docx_bytes(&title, &body)?;
+    let bytes = crate::docx_filing::build_filing_docx_bytes(&title, &body, None)?;
     std::fs::write(&save_path, &bytes).map_err(|e| format!("写合同草案 docx 失败:{}", e))?;
     Ok(save_path)
 }

@@ -148,5 +148,5 @@ pub fn build_opinion_docx(
 ) -> Result<Vec<u8>, String> {
     let title = opinion_title(contract_name);
     let md = build_opinion_md(result, stance_label, strictness_label, skipped);
-    crate::docx_filing::build_report_docx_bytes(&title, &md)
+    crate::docx_filing::build_report_docx_bytes(&title, &md, None)
 }

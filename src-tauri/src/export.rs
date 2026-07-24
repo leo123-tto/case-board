@@ -640,7 +640,7 @@ pub async fn export_report_docx_to(
     let generated = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
     let body = format!("{preamble}{md}\n\n---\n\n报告由 CaseBoard 自动生成 · {generated}");
 
-    let bytes = crate::docx_filing::build_report_docx_bytes(&title, &body)?;
+    let bytes = crate::docx_filing::build_report_docx_bytes(&title, &body, None)?;
     std::fs::write(save_path, &bytes).map_err(|e| format!("写 docx 失败:{}", e))?;
     Ok(save_path.to_path_buf())
 }
@@ -740,7 +740,7 @@ pub async fn export_editor_document_to(
     let md = strip_artifact_cruft(&raw);
     match format {
         "docx" => {
-            let bytes = crate::docx_filing::build_editor_docx_bytes(title, &md)?;
+            let bytes = crate::docx_filing::build_editor_docx_bytes(title, &md, None)?;
             std::fs::write(save_path, bytes).map_err(|e| format!("写 docx 失败:{e}"))?;
         }
         "html" => {
@@ -796,7 +796,7 @@ pub async fn export_md_docx_to(
 ) -> Result<PathBuf, String> {
     let raw = std::fs::read_to_string(md_path).map_err(|e| format!("读 MD 失败:{}", e))?;
     let md = strip_artifact_cruft(&raw);
-    let bytes = crate::docx_filing::build_report_docx_bytes(title, &md)?;
+    let bytes = crate::docx_filing::build_report_docx_bytes(title, &md, None)?;
     std::fs::write(save_path, &bytes).map_err(|e| format!("写 docx 失败:{}", e))?;
     Ok(save_path.to_path_buf())
 }

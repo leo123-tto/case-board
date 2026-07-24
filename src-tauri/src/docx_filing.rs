@@ -44,6 +44,22 @@ use zip::{CompressionMethod, ZipWriter};
 
 // ───────────────────────── 角色 → 精确 OOXML 数值 ─────────────────────────
 
+/// 页眉输入参数(2026-07-24 V0.4.16 P0 #1)。
+///
+/// - **不写死任何机构名** — 调用方从 settings 注入,避免硬编码"信拓集团"之类的。
+/// - **字段都可空** — 全部 `None` 时,`build_docx_bytes` 仍 put 一个空 header 部件
+///   (SECTPR 永远引用 rId4 → word/header1.xml,Word 完整性约束)。
+/// - **隐私** — 调用方不应传入真实案件信息;测试 fixture 全用占位符(`{{ORG_NAME}}` 等)。
+#[derive(Default, Clone, Debug)]
+pub struct HeaderInputs {
+    /// 机构/律所名(出现在页眉第一行)
+    pub org: Option<String>,
+    /// 案件名/文书名(出现在页眉第一行,与 `org` 用 " · " 分隔)
+    pub case_name: Option<String>,
+    /// 案号(出现在页眉第二行)
+    pub case_no: Option<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Role {
     Title,
@@ -151,6 +167,43 @@ fn xml_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// 渲染页眉部件(机构 + 案件名 + 案号 + 底部分隔线)。2026-07-24 V0.4.16 P0 #1。
+///
+/// 格式:
+/// ```text
+/// [org]  ·  [case_name]
+/// 案号:[case_no]
+/// ─────────────  (底部分隔线,pBdr)
+/// ```
+///
+/// 输入字段都是 `Option<String>`,都为空时:
+/// - 行 1 输出空字符串(整段空白 run 会被 Word 渲染成空行)
+/// - 行 2 输出空字符串(同上)
+/// - 分隔线仍保留(让页眉区有视觉边界)
+fn render_header_xml(input: &HeaderInputs) -> String {
+    let org = input.org.as_deref().unwrap_or("");
+    let case_name = input.case_name.as_deref().unwrap_or("");
+    let case_no = input.case_no.as_deref().unwrap_or("");
+    // 行 1: 机构 · 案件名(三态组合)
+    let line1 = match (org.is_empty(), case_name.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => xml_escape(case_name),
+        (false, true) => xml_escape(org),
+        (false, false) => format!("{}  ·  {}", xml_escape(org), xml_escape(case_name)),
+    };
+    // 行 2: 案号(无案号则空)
+    let line2 = if !case_no.is_empty() {
+        format!("案号:{}", xml_escape(case_no))
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml" mc:Ignorable="w14 w15"><w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr><w:spacing w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Times New Roman" w:eastAsia="仿宋_GB2312"/><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr><w:t xml:space="preserve">{line1}</w:t></w:r></w:p><w:p><w:pPr><w:spacing w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Times New Roman" w:eastAsia="仿宋_GB2312"/><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr><w:t xml:space="preserve">{line2}</w:t></w:r></w:p></w:hdr>"#,
+        line1 = line1,
+        line2 = line2,
+    )
 }
 
 /// 把中文语境里的半角标点规范化为全角(导出 Word 时静默执行,借鉴开源「文格」audit_text 的自动版)。
@@ -671,25 +724,56 @@ pub(crate) fn render_document_xml(title: &str, body_md: &str, profile: Profile) 
 
 /// 法律文书档:base + 法律叠加(列表去圆点 / 软换行并段 / 不渲染分隔线)。
 /// 排版本身(方正小标宋居中标题 / 黑体小标题 / 仿宋正文 / 首行缩进 / 两端对齐 / 1.5 行距)与 base 一致。
-pub fn build_filing_docx_bytes(title: &str, body_md: &str) -> Result<Vec<u8>, String> {
-    build_docx_bytes(title, body_md, Profile::Filing)
+///
+/// `header`:页眉参数(V0.4.16 加)。None = 不传任何字段,header1.xml 仍存在但内容为空。
+pub fn build_filing_docx_bytes(
+    title: &str,
+    body_md: &str,
+    header: Option<&HeaderInputs>,
+) -> Result<Vec<u8>, String> {
+    build_docx_bytes(title, body_md, Profile::Filing, header)
 }
 
 /// 通用报告档:忠实 MD 渲染(无序列表带圆点 / 嵌套缩进 / 分隔线 / 保留结构)。
 /// 案件分析报告、风险/深挖报告、通用 MD 导出走这条(替代旧的 textutil HTML 路径)。
-pub fn build_report_docx_bytes(title: &str, body_md: &str) -> Result<Vec<u8>, String> {
-    build_docx_bytes(title, body_md, Profile::Base)
+///
+/// `header`:页眉参数(V0.4.16 加)。None = 不传任何字段,header1.xml 仍存在但内容为空。
+pub fn build_report_docx_bytes(
+    title: &str,
+    body_md: &str,
+    header: Option<&HeaderInputs>,
+) -> Result<Vec<u8>, String> {
+    build_docx_bytes(title, body_md, Profile::Base, header)
 }
 
 /// Milkdown 可视编辑器导出档：保留编辑器的标题层级、正文字号/行距、
 /// 列表、表格、加粗/斜体和预格式块，与报告档和法律文书档相互隔离。
-pub fn build_editor_docx_bytes(title: &str, body_md: &str) -> Result<Vec<u8>, String> {
-    build_docx_bytes(title, body_md, Profile::Editor)
+///
+/// `header`:页眉参数(V0.4.16 加)。None = 不传任何字段,header1.xml 仍存在但内容为空。
+pub fn build_editor_docx_bytes(
+    title: &str,
+    body_md: &str,
+    header: Option<&HeaderInputs>,
+) -> Result<Vec<u8>, String> {
+    build_docx_bytes(title, body_md, Profile::Editor, header)
 }
 
-/// 把 (标题, 正文 MD, 档位) 打包成完整 .docx 字节流。纯函数,便于测试。
-fn build_docx_bytes(title: &str, body_md: &str, profile: Profile) -> Result<Vec<u8>, String> {
+/// 把 (标题, 正文 MD, 档位, 页眉) 打包成完整 .docx 字节流。纯函数,便于测试。
+///
+/// **2026-07-24 V0.4.16**:加 `header` 参数(P0 #1);`header` 为 `None` 时仍写一个空 header1.xml
+/// 部件(SECTPR 永远引用 rId4,Word 完整性约束)。`header` 为 `Some` 时调用方传 `&HeaderInputs`,
+/// 字段全 `None` 也合法(全部走空字符串路径)。
+fn build_docx_bytes(
+    title: &str,
+    body_md: &str,
+    profile: Profile,
+    header: Option<&HeaderInputs>,
+) -> Result<Vec<u8>, String> {
     let document_xml = render_document_xml(title, body_md, profile);
+    // header 永远 put(SECTPR 引用 rId4,缺文件 Word 报错);None 时也 put 空内容
+    let header_xml = header.map(render_header_xml).unwrap_or_else(|| {
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr><w:spacing w:line="240" w:lineRule="auto"/></w:pPr></w:p></w:hdr>"#.to_string()
+    });
     let mut buf = Vec::new();
     {
         let cursor = std::io::Cursor::new(&mut buf);
@@ -708,6 +792,7 @@ fn build_docx_bytes(title: &str, body_md: &str, profile: Profile) -> Result<Vec<
         put("word/styles.xml", STYLES_XML)?;
         put("word/settings.xml", SETTINGS_XML)?;
         put("word/fontTable.xml", FONT_TABLE_XML)?;
+        put("word/header1.xml", &header_xml)?;
         put("word/footer1.xml", FOOTER1_XML)?;
         put("word/document.xml", &document_xml)?;
         zip.finish().map_err(|e| format!("zip finish 失败:{}", e))?;
@@ -737,15 +822,20 @@ pub fn extract_filing_title(md: &str) -> Option<String> {
 
 const DOC_OPEN: &str = r#"<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:w10="urn:schemas-microsoft-com:office:word" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml" mc:Ignorable="w14 w15">"#;
 
-/// 页面/页边距/版式网格 —— 与全部 15 份样本字节级一致(A4 / 1英寸边距 / docGrid linePitch=360)。
-/// 页脚引用 rId4 → word/footer1.xml(PAGE / NUMPAGES 字段,见 `FOOTER1_XML`)。
-const SECTPR: &str = r#"<w:sectPr><w:footerReference r:id="rId4" w:type="default"/><w:pgSz w:w="11906" w:h="16838" w:orient="portrait"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/><w:docGrid w:linePitch="360"/></w:sectPr>"#;
+/// 页面/页边距/版式网格 + 页眉/页脚引用(2026-07-24 V0.4.16 加 P0 #2 页脚 / P0 #1 页眉)。
+///
+/// 引用关系(在 `DOCUMENT_RELS` 注册):
+/// - `rId4` = word/header1.xml(见 `render_header_xml`)
+/// - `rId5` = word/footer1.xml(PAGE / NUMPAGES 字段,见 `FOOTER1_XML`)
+///
+/// `header`/`footer` 区域高度保持 708 twip(0.5 英寸),与原 15 份样本口径一致。
+const SECTPR: &str = r#"<w:sectPr><w:headerReference r:id="rId4" w:type="default"/><w:footerReference r:id="rId5" w:type="default"/><w:pgSz w:w="11906" w:h="16838" w:orient="portrait"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/><w:docGrid w:linePitch="360"/></w:sectPr>"#;
 
-const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/><Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/></Types>"#;
+const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/></Types>"#;
 
 const RELS_DOTRELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
 
-const DOCUMENT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable" Target="fontTable.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/></Relationships>"#;
+const DOCUMENT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable" Target="fontTable.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/><Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/></Relationships>"#;
 
 /// 页脚部件:居中「第 PAGE 页 / 共 NUMPAGES 页」。PAGE/NUMPAGES 用 `fldSimple` 字段,
 /// **不硬编码数字**(文格 / 法院对「页码硬编码」零容忍,删段后字段会自动重排)。

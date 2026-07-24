@@ -39,7 +39,10 @@ thiserror = "1"
 # Pi Runtime provider 凭据只进系统凭据库，不回写 settings.json。
 # 3.6.3 的 MSRV 为 Rust 1.75；只启用 macOS Keychain / Windows Credential Manager。
 keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+# 用 native-roots(系统钥匙串根证书)而非纯 webpki-roots 静态快照:
+# 某些服务(如智谱 GLM bigmodel 用 TrustAsia DV TLS RSA CA 2024 中间证书)的 CA 链不在
+# webpki-roots 收录范围 → rustls TLS 握手失败 → 上层报"网络错误"。native-roots 读系统根证书,与 curl 一致。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream", "multipart"] }
 # OCR 同步调用 + 临时 PDF 转 PNG 用(2026-05-23 加,本机 vision OCR 路径)
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 tempfile = "3"

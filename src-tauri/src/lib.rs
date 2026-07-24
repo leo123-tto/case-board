@@ -4446,7 +4446,7 @@ async fn yuandian_full_report(
 ) -> Result<yuandian::full_report::FullReportResult, String> {
     let settings = settings::read_settings().unwrap_or_default();
     let llm_config = llm::LlmConfig::from_settings(&settings);
-    Ok(yuandian::full_report::run_full_report(pool.inner(), &case_id, &llm_config).await)
+    yuandian::full_report::run_full_report(pool.inner(), &case_id, &llm_config).await
 }
 
 /// 2026-05-24 k-9 · P2 深挖:用 P1 LLM 给的 dig_hints 拉关联公司 / 案号 / 第三方主体,
@@ -4462,7 +4462,7 @@ async fn yuandian_deep_dive(
         .as_deref()
         .ok_or_else(|| "元典 API key 未配置 — 请到 Settings 里填".to_string())?;
     let llm_config = llm::LlmConfig::from_settings(&settings);
-    Ok(yuandian::deep_dive::run_deep_dive(pool.inner(), &case_id, api_key, &llm_config).await)
+    yuandian::deep_dive::run_deep_dive(pool.inner(), &case_id, api_key, &llm_config).await
 }
 
 #[tauri::command]
@@ -4476,8 +4476,13 @@ async fn yuandian_basic_query(
         .as_deref()
         .ok_or_else(|| "元典 API key 未配置 — 请到 Settings 里填".to_string())?;
 
-    // P1.1 跑元典 16 端点
-    let orch = yuandian::orchestrator::basic_query(pool.inner(), &case_id, api_key).await?;
+    // 读锁必须覆盖 P1 元典查询和 P1.2 风险评估，避免两者之间保存 B 而报告仍使用 A。
+    let _query_guard = yuandian::orchestrator::acquire_execution_query_read_guard(&case_id).await;
+
+    // P1.1 跑元典 16 端点；此处已由 command 持锁，不能再次取读锁。
+    let orch =
+        yuandian::orchestrator::basic_query_while_read_locked(pool.inner(), &case_id, api_key)
+            .await?;
 
     // P1.2 LLM 写风险报告
     let llm_config = llm::LlmConfig::from_settings(&settings);
@@ -4569,16 +4574,34 @@ async fn export_md_docx(
 /// Milkdown 案件内文书工作区与独立 AI 文稿工作区的统一导出入口。
 #[tauri::command]
 async fn export_editor_document(
+    pool: tauri::State<'_, SqlitePool>,
     md_path: String,
     title: String,
     format: String,
     save_path: String,
+    word_template: Option<String>,
+    case_id: Option<String>,
 ) -> Result<String, String> {
-    let p = export::export_editor_document_to(
+    let parsed_template = if format == "docx" {
+        Some(match word_template.as_deref() {
+            Some(value) => docx_filing::WordTemplate::parse(value)?,
+            None => docx_filing::WordTemplate::default(),
+        })
+    } else {
+        None
+    };
+    let header_inputs = if parsed_template == Some(docx_filing::WordTemplate::LegalFiling) {
+        export::load_editor_header_inputs(pool.inner(), &title, case_id.as_deref()).await?
+    } else {
+        docx_filing::HeaderInputs::default()
+    };
+    let p = export::export_editor_document_with_template_to(
         std::path::Path::new(&md_path),
         &title,
         &format,
         std::path::Path::new(&save_path),
+        word_template.as_deref(),
+        &header_inputs,
     )
     .await?;
     Ok(p.to_string_lossy().to_string())
@@ -4878,14 +4901,32 @@ async fn update_workflow_status(
 /// `overrides_json = Some(...)` → 整段覆盖。
 ///
 /// 结构由前端 `userOverrides.ts` 定义(fields / hidden_sections / deleted_rows /
-/// section_order),后端不解析,sqlite 列定义见 migration 0016。
+/// section_order)。精确委托人和我方代理立场由专用 command 管理，通用整包写只能保留它们。
 #[tauri::command]
 async fn update_case_overrides(
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
     overrides_json: Option<String>,
 ) -> Result<(), String> {
-    cases_db::update_user_overrides(pool.inner(), &case_id, overrides_json.as_deref())
+    yuandian::orchestrator::update_case_overrides_unless_execution_running(
+        pool.inner(),
+        &case_id,
+        overrides_json.as_deref(),
+    )
+    .await
+}
+
+/// 保存律师代理的唯一诉讼阵营及该阵营内的精确委托当事人。
+#[tauri::command]
+async fn update_case_representation(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    input: db::case_representation::RepresentationInput,
+) -> Result<db::case_representation::CaseRepresentation, String> {
+    // 不在长查询后排队；拿不到锁即告诉用户稍后再保存。
+    let _write_guard =
+        yuandian::orchestrator::try_acquire_case_representation_write_guard(&case_id)?;
+    db::case_representation::update_case_representation(pool.inner(), &case_id, input)
         .await
         .map_err(db_err)
 }
@@ -4908,6 +4949,9 @@ async fn reset_case_our_side(
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
 ) -> Result<(), String> {
+    // 与精确委托人保存共用同一把写锁，避免查询中清空立场/委托人。
+    let _write_guard =
+        yuandian::orchestrator::try_acquire_case_representation_write_guard(&case_id)?;
     cases_db::reset_our_side(pool.inner(), &case_id)
         .await
         .map_err(db_err)?;
@@ -7289,6 +7333,7 @@ pub fn run() {
             delete_express_track,
             update_workflow_status,
             update_case_overrides,
+            update_case_representation,
             update_case_calendar_event_override,
             reset_case_our_side,
             get_deepseek_balance,
@@ -7329,6 +7374,9 @@ pub fn run() {
             ai_workspace::chat::steer_ai_workspace_chat,
             ai_workspace::commands::add_ai_workspace_sources,
             ai_workspace::commands::list_ai_workspace_documents,
+            ai_workspace::commands::get_ai_workspace_export_paths,
+            ai_workspace::commands::record_ai_workspace_export_path,
+            ai_workspace::commands::refresh_ai_workspace_exports,
             ai_workspace::commands::retry_ai_workspace_source,
             ai_workspace::commands::relink_ai_workspace_source,
             ai_workspace::commands::archive_ai_workspace_document,

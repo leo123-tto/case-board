@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "caseboard"
-version = "0.4.15"
+version = "0.4.16"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2088,6 +2088,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -3921,6 +3922,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",

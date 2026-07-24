@@ -1,6 +1,6 @@
 [package]
 name = "caseboard"
-version = "0.4.15"
+version = "0.4.16"
 description = "案件看板 · CaseBoard"
 authors = ["CaseBoard Contributors"]
 edition = "2021"
@@ -39,7 +39,7 @@ thiserror = "1"
 # Pi Runtime provider 凭据只进系统凭据库，不回写 settings.json。
 # 3.6.3 的 MSRV 为 Rust 1.75；只启用 macOS Keychain / Windows Credential Manager。
 keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream", "multipart"] }
 # OCR 同步调用 + 临时 PDF 转 PNG 用(2026-05-23 加,本机 vision OCR 路径)
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 tempfile = "3"

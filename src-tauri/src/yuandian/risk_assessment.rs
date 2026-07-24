@@ -175,6 +175,9 @@ pub async fn run_assessment(
     raw_files: &[String],
 ) -> AssessmentReport {
     let start = std::time::Instant::now();
+    if let Err(error) = super::artifact_binding::current_owner(pool, case_id).await {
+        return error_report(case_id, &error, start);
+    }
 
     let raw_dir = match raw_dir_for_case(case_id) {
         Ok(p) => p,
@@ -276,18 +279,25 @@ pub async fn run_assessment(
     let report_path_str = report_path.to_string_lossy().to_string();
     let dig_path_str = dig_path.to_string_lossy().to_string();
 
-    // 写 cases.risk_assessment_path + at
+    // 原子发布 P1 路径、raw 清单和生成时委托人快照；新 P1 同时使旧 P2/full 失效。
     let now = chrono::Utc::now().to_rfc3339();
-    if let Err(e) = sqlx::query(
-        "UPDATE cases SET risk_assessment_path = ?, risk_assessment_at = ? WHERE id = ?",
+    if let Err(error) = super::artifact_binding::publish_p1(
+        pool,
+        case_id,
+        super::artifact_binding::P1Artifacts {
+            risk_report_path: report_path_str.clone(),
+            dig_hints_path: dig_path_str.clone(),
+            raw_files: raw_files.to_vec(),
+        },
+        &now,
     )
-    .bind(&report_path_str)
-    .bind(&now)
-    .bind(case_id)
-    .execute(pool)
     .await
     {
-        crate::dlog!("[risk] 写 cases 失败:{}", e);
+        return error_report(
+            case_id,
+            &format!("绑定 P1 产物到当前委托人失败:{error}"),
+            start,
+        );
     }
 
     AssessmentReport {

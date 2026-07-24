@@ -12,6 +12,7 @@
 //!
 //! 前端通过 Tauri 文件保存 dialog 拿到目标路径,调下面两个 command 即可。
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use pulldown_cmark::{html, Options, Parser};
@@ -736,20 +737,126 @@ pub async fn export_editor_document_to(
     format: &str,
     save_path: &Path,
 ) -> Result<PathBuf, String> {
+    export_editor_document_with_template_to(
+        md_path,
+        title,
+        format,
+        save_path,
+        None,
+        &crate::docx_filing::HeaderInputs::default(),
+    )
+    .await
+}
+
+fn write_editor_export_atomically(
+    save_path: &Path,
+    bytes: &[u8],
+    format_label: &str,
+) -> Result<(), String> {
+    let parent = save_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("写 {format_label} 失败:创建临时文件:{error}"))?;
+    temporary
+        .write_all(bytes)
+        .map_err(|error| format!("写 {format_label} 失败:写临时文件:{error}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("写 {format_label} 失败:同步临时文件:{error}"))?;
+    temporary
+        .persist(save_path)
+        .map_err(|error| format!("写 {format_label} 失败:原子替换:{}", error.error))?;
+    Ok(())
+}
+
+/// 模板感知的编辑器导出入口。`word_template=None` 对 docx 稳定回退 Editor；
+/// HTML 不接受 Word 模板。所有组合校验均发生在写盘之前。
+pub async fn export_editor_document_with_template_to(
+    md_path: &Path,
+    title: &str,
+    format: &str,
+    save_path: &Path,
+    word_template: Option<&str>,
+    header_inputs: &crate::docx_filing::HeaderInputs,
+) -> Result<PathBuf, String> {
+    let template = match format {
+        "docx" => Some(match word_template {
+            Some(value) => crate::docx_filing::WordTemplate::parse(value)?,
+            None => crate::docx_filing::WordTemplate::default(),
+        }),
+        "html" if word_template.is_some() => {
+            return Err("HTML 导出不接受 Word 模板".to_string());
+        }
+        "html" => None,
+        _ => return Err("仅支持导出 docx 或 html".to_string()),
+    };
     let raw = std::fs::read_to_string(md_path).map_err(|e| format!("读 MD 失败:{e}"))?;
     let md = strip_artifact_cruft(&raw);
     match format {
         "docx" => {
-            let bytes = crate::docx_filing::build_editor_docx_bytes(title, &md)?;
-            std::fs::write(save_path, bytes).map_err(|e| format!("写 docx 失败:{e}"))?;
+            let bytes = crate::docx_filing::build_editor_document_docx_bytes(
+                title,
+                &md,
+                template.expect("docx template resolved"),
+                header_inputs,
+            )?;
+            write_editor_export_atomically(save_path, &bytes, "docx")?;
         }
         "html" => {
             let html = render_editor_html(title, &md);
-            std::fs::write(save_path, html).map_err(|e| format!("写 HTML 失败:{e}"))?;
+            write_editor_export_atomically(save_path, html.as_bytes(), "HTML")?;
         }
-        _ => return Err("仅支持导出 docx 或 html".to_string()),
+        _ => unreachable!("format validated before reading"),
     }
     Ok(save_path.to_path_buf())
+}
+
+/// 从本地默认律师档案与可选案件记录解析法律页眉。前端只传案件 id，
+/// 不传律所、案件名或案号正文。
+pub(crate) async fn load_editor_header_inputs(
+    pool: &SqlitePool,
+    document_title: &str,
+    case_id: Option<&str>,
+) -> Result<crate::docx_filing::HeaderInputs, String> {
+    let law_firm: Option<String> = sqlx::query_scalar(
+        "SELECT trim(law_firm) FROM lawyer_profiles \
+         WHERE is_default = 1 AND law_firm IS NOT NULL AND length(trim(law_firm)) > 0 \
+         ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("查默认律师档案失败:{error}"))?;
+
+    if let Some(case_id) = case_id {
+        let case_row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT trim(name), \
+                    COALESCE(NULLIF(trim(agg_case_no), ''), NULLIF(trim(case_no), '')) \
+             FROM cases WHERE id = ?",
+        )
+        .bind(case_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| format!("查案件页眉信息失败:{error}"))?;
+        let (case_name, case_no) =
+            case_row.ok_or_else(|| "案件不存在，无法生成可信页眉".to_string())?;
+        return Ok(crate::docx_filing::HeaderInputs {
+            law_firm,
+            case_name: (!case_name.is_empty()).then_some(case_name),
+            case_no,
+            document_title: None,
+        });
+    }
+
+    let document_title = document_title.trim();
+    Ok(crate::docx_filing::HeaderInputs {
+        law_firm,
+        document_title: (!document_title.is_empty()).then(|| document_title.to_string()),
+        case_name: None,
+        case_no: None,
+    })
 }
 
 /// 通用 MD → 自定义样式 HTML(单文件,内嵌 CSS)。

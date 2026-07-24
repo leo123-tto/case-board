@@ -10,14 +10,17 @@
 //!
 //! 替代了 `db/aggregator.rs::aggregate_case_facts`,**不再做规则去污**,全部交给 LLM。
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use uuid::Uuid;
 
 use crate::db::case_instances::NewInstance;
 use crate::llm::global_extract::{
     build_corpus_with_char_budget, extract_combined, global_extract_input_char_budget,
-    report_path_for_case, BudgetedCorpus, DocInput, GlobalExtractTable, InstanceExtract,
-    RepaymentExtract,
+    report_path_for_case, BudgetedCorpus, ConfirmedRepresentation, DocInput, GlobalExtractTable,
+    InstanceExtract, RepaymentExtract,
 };
 use crate::llm::LlmConfig;
 
@@ -60,6 +63,19 @@ struct AnalysisInputPart {
     category: Option<String>,
     stage: Option<String>,
     text_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepresentationSnapshot {
+    representation: Option<ConfirmedRepresentation>,
+    user_overrides_json: Option<String>,
+    agg_our_side: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReportGeneration {
+    path: std::path::PathBuf,
+    temp_path: std::path::PathBuf,
 }
 
 fn analysis_input_signature(parts: &[AnalysisInputPart]) -> String {
@@ -236,87 +252,154 @@ pub async fn run_global_extract(
         corpus_budget
     );
 
-    // 2b. 读已锁定的「我方代理立场」:人工确认优先,否则读取第一次 AI 识别值。
-    // 一旦有值就回喂给 LLM,新增材料/重新分析只能沿该立场写报告,不能自行翻转。
-    let confirmed_our_side = read_locked_our_side(pool, case_id).await;
+    // 2b. 读已锁定的代理范围。精确人工委托人优先；旧案件仅有粗立场时保持兼容。
+    // 损坏的 representation 必须中断本次分析，绝不能静默扩大成整方代理。
+    let representation_snapshot = match capture_representation_snapshot(pool, case_id).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return GlobalExtractReport {
+                case_id: case_id.into(),
+                docs_included: docs_count,
+                table_ok: false,
+                report_ok: false,
+                report_path: None,
+                elapsed_ms: start.elapsed().as_millis(),
+                warning,
+                error: Some(format!("案件精确委托人状态无效: {error}")),
+            }
+        }
+    };
 
     // 3. 单次 LLM call 同时拿表格 + 报告(2026-05-24 i 合并)
-    let combined = extract_combined(llm_config, &corpus, confirmed_our_side.as_deref()).await;
+    let combined = extract_combined(
+        llm_config,
+        &corpus,
+        representation_snapshot.representation.as_ref(),
+    )
+    .await;
 
     let (table_ok, report_ok, report_path_str, err) = match combined {
-        Ok(r) => {
+        Ok(mut r) => {
+            if let Some(confirmed) = representation_snapshot.representation.as_ref() {
+                if let Err(error) = apply_confirmed_representation(&mut r.table, confirmed) {
+                    return GlobalExtractReport {
+                        case_id: case_id.into(),
+                        docs_included: docs_count,
+                        table_ok: false,
+                        report_ok: false,
+                        report_path: None,
+                        elapsed_ms: start.elapsed().as_millis(),
+                        warning,
+                        error: Some(error),
+                    };
+                }
+            }
             for validation_warning in &r.validation_warnings {
                 warning = append_warning(warning, validation_warning.clone());
             }
             let mut persistence_errors = Vec::new();
-            // 报告 MD 落盘
-            let report_path = match report_path_for_case(case_id) {
-                Ok(p) => match std::fs::write(&p, &r.report_md) {
-                    Ok(_) => Some(p.to_string_lossy().to_string()),
-                    Err(e) => {
-                        crate::dlog!("[global_extract] 写报告 MD 失败:{}", e);
-                        persistence_errors.push(format!("写案件分析报告失败: {}", e));
-                        None
-                    }
-                },
-                Err(e) => {
-                    crate::dlog!("[global_extract] 算报告路径失败:{}", e);
-                    persistence_errors.push(format!("准备案件分析报告路径失败: {}", e));
-                    None
-                }
-            };
-            // 写 cases 表
-            let table_ok =
-                match write_table_to_cases(pool, case_id, &r.table, report_path.as_deref()).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        crate::dlog!("[global_extract] 写 cases 失败:{}", e);
-                        persistence_errors.push(format!("写案件画像字段失败: {}", e));
-                        false
-                    }
+            // 主画像先以开始时的代理范围做 CAS 写入；失败时报告和下游表均不得落盘。
+            if let Err(error) = write_table_to_cases_guarded(
+                pool,
+                case_id,
+                &r.table,
+                None,
+                &representation_snapshot,
+            )
+            .await
+            {
+                return GlobalExtractReport {
+                    case_id: case_id.into(),
+                    docs_included: docs_count,
+                    table_ok: false,
+                    report_ok: false,
+                    report_path: None,
+                    elapsed_ms: start.elapsed().as_millis(),
+                    warning,
+                    error: Some(error.to_string()),
                 };
+            }
 
-            if table_ok {
-                // 审级与还款是画像的下游表；主表失败时不继续制造半写入状态。
-                let mut downstream_ok = true;
-                if let Err(e) = write_instances(pool, case_id, &r.table.instances).await {
-                    downstream_ok = false;
-                    crate::dlog!("[global_extract] 写 case_instances 失败:{}", e);
-                    warning = append_warning(
-                        warning,
-                        format!("案件画像已更新，但审级明细保存失败: {}", e),
-                    );
-                }
-                if let Err(e) =
-                    write_repayments(pool, case_id, &r.table.repayments, &payment_sources).await
-                {
-                    downstream_ok = false;
-                    crate::dlog!("[global_extract] 写还款记录失败:{}", e);
-                    warning = append_warning(
-                        warning,
-                        format!("案件画像已更新，但 AI 识别还款记录保存失败: {}", e),
-                    );
-                }
-                let freshness_result = if downstream_ok {
-                    crate::db::ai_jobs::mark_case_analysis_current(pool, case_id, &input_signature)
-                        .await
-                } else {
-                    crate::db::ai_jobs::mark_case_analysis_stale(
+            // 审级与还款是画像的下游表；代理范围变更时绝不能继续写入旧分析。
+            let mut downstream_ok = true;
+            if !representation_snapshot_is_current(pool, case_id, &representation_snapshot)
+                .await
+                .unwrap_or(false)
+            {
+                return representation_changed_report(case_id, docs_count, start, warning);
+            }
+            if let Err(e) = write_instances(pool, case_id, &r.table.instances).await {
+                downstream_ok = false;
+                crate::dlog!("[global_extract] 写 case_instances 失败:{}", e);
+                warning = append_warning(
+                    warning,
+                    format!("案件画像已更新，但审级明细保存失败: {}", e),
+                );
+            }
+            if let Err(e) =
+                write_repayments(pool, case_id, &r.table.repayments, &payment_sources).await
+            {
+                downstream_ok = false;
+                crate::dlog!("[global_extract] 写还款记录失败:{}", e);
+                warning = append_warning(
+                    warning,
+                    format!("案件画像已更新，但 AI 识别还款记录保存失败: {}", e),
+                );
+            }
+
+            let report_path = if downstream_ok {
+                let generation = report_path_for_case(case_id)
+                    .map(|path| path.parent().map(std::path::Path::to_path_buf))
+                    .map_err(|error| error.to_string())
+                    .and_then(|dir| dir.ok_or_else(|| "报告目录无效".to_string()))
+                    .and_then(|dir| write_report_generation(&dir, case_id, &r.report_md));
+                match generation {
+                    Ok(generation) => match publish_report_generation_if_snapshot_current(
                         pool,
                         case_id,
-                        "analysis_persistence_partial",
+                        &input_signature,
+                        &representation_snapshot,
+                        generation,
                     )
                     .await
-                };
-                if let Err(e) = freshness_result {
-                    crate::dlog!("[global_extract] 写分析新鲜度标记失败:{}", e);
-                    warning = append_warning(
-                        warning,
-                        format!("案件画像已写入，但分析新鲜度标记保存失败: {}", e),
-                    );
+                    {
+                        Ok(path) => Some(path),
+                        Err(error) => {
+                            if error == REPRESENTATION_CHANGED_ERROR {
+                                return representation_changed_report(
+                                    case_id, docs_count, start, warning,
+                                );
+                            }
+                            persistence_errors.push(format!("发布案件分析报告失败: {error}"));
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        persistence_errors.push(format!("写案件分析报告失败: {error}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if !(downstream_ok && report_path.is_some())
+                && representation_snapshot_is_current(pool, case_id, &representation_snapshot)
+                    .await
+                    .unwrap_or(false)
+            {
+                if let Err(e) = crate::db::ai_jobs::mark_case_analysis_stale(
+                    pool,
+                    case_id,
+                    "analysis_persistence_partial",
+                )
+                .await
+                {
+                    persistence_errors.push(format!("写分析新鲜度标记失败: {e}"));
                 }
             }
 
+            let table_ok = true;
             let report_ok = report_path.is_some();
             let error = (!persistence_errors.is_empty()).then(|| persistence_errors.join("；"));
             (table_ok, report_ok, report_path, error)
@@ -382,6 +465,122 @@ fn append_warning(existing: Option<String>, next: String) -> Option<String> {
         Some(prev) if !prev.trim().is_empty() => Some(format!("{} {}", prev.trim(), next)),
         _ => Some(next.to_string()),
     }
+}
+
+const REPRESENTATION_CHANGED_ERROR: &str = "律师已修改委托人，已丢弃本次分析，请重新分析";
+
+fn representation_changed_report(
+    case_id: &str,
+    docs_included: usize,
+    start: std::time::Instant,
+    warning: Option<String>,
+) -> GlobalExtractReport {
+    GlobalExtractReport {
+        case_id: case_id.into(),
+        docs_included,
+        table_ok: false,
+        report_ok: false,
+        report_path: None,
+        elapsed_ms: start.elapsed().as_millis(),
+        warning,
+        error: Some(REPRESENTATION_CHANGED_ERROR.into()),
+    }
+}
+
+/// 生成一份独立候选报告。它绝不触碰当前 `case_report_path`，是否发布由最终 CAS 决定。
+fn write_report_generation(
+    report_dir: &std::path::Path,
+    case_id: &str,
+    report_md: &str,
+) -> Result<ReportGeneration, String> {
+    let generation_id = Uuid::new_v4();
+    let path = report_dir.join(format!("{case_id}-{generation_id}.md"));
+    let temp_path = report_dir.join(format!(".{case_id}-{generation_id}.tmp"));
+    write_report_generation_to_paths(&path, &temp_path, report_md)
+}
+
+/// 低层写入便于可靠覆盖 write/rename 失败时的清理路径测试。
+fn write_report_generation_to_paths(
+    path: &std::path::Path,
+    temp_path: &std::path::Path,
+    report_md: &str,
+) -> Result<ReportGeneration, String> {
+    if let Err(error) = std::fs::write(temp_path, report_md) {
+        let _ = std::fs::remove_file(temp_path);
+        return Err(error.to_string());
+    }
+    if let Err(error) = std::fs::rename(temp_path, path) {
+        let _ = std::fs::remove_file(temp_path);
+        return Err(error.to_string());
+    }
+    Ok(ReportGeneration {
+        path: path.to_path_buf(),
+        temp_path: temp_path.to_path_buf(),
+    })
+}
+
+fn discard_report_generation(generation: &ReportGeneration) {
+    let _ = std::fs::remove_file(&generation.temp_path);
+    let _ = std::fs::remove_file(&generation.path);
+}
+
+/// 候选 generation 只有在最终 representation snapshot CAS 成功时才发布到数据库。
+async fn publish_report_generation_if_snapshot_current(
+    pool: &SqlitePool,
+    case_id: &str,
+    input_signature: &str,
+    expected: &RepresentationSnapshot,
+    generation: ReportGeneration,
+) -> Result<String, String> {
+    let report_path = generation.path.to_string_lossy().to_string();
+    match mark_case_analysis_current_if_representation_current(
+        pool,
+        case_id,
+        input_signature,
+        Some(&report_path),
+        expected,
+    )
+    .await
+    {
+        // 旧 path 可能来自历史固定文件或其他功能，不能据 filename 猜测归属后删除；受控的
+        // generation 清理留待后续单独治理。本轮的核心是不覆盖旧路径，且失败必删新候选。
+        Ok(true) => Ok(report_path),
+        Ok(false) => {
+            discard_report_generation(&generation);
+            Err(REPRESENTATION_CHANGED_ERROR.into())
+        }
+        Err(error) => {
+            discard_report_generation(&generation);
+            Err(error.to_string())
+        }
+    }
+}
+
+/// 只有代理范围仍是本轮输入时才把分析标为 current，并同步报告路径。
+async fn mark_case_analysis_current_if_representation_current(
+    pool: &SqlitePool,
+    case_id: &str,
+    input_signature: &str,
+    report_path: Option<&str>,
+    expected: &RepresentationSnapshot,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE cases SET analysis_input_signature = ?, analysis_stale = 0, \
+            analysis_stale_reason = NULL, case_report_path = COALESCE(?, case_report_path), \
+            case_report_generated_at = CASE WHEN ? IS NULL THEN case_report_generated_at ELSE ? END, \
+            updated_at = datetime('now') \
+         WHERE id = ? AND user_overrides_json IS ? AND agg_our_side IS ?",
+    )
+    .bind(input_signature)
+    .bind(report_path)
+    .bind(report_path)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(case_id)
+    .bind(&expected.user_overrides_json)
+    .bind(&expected.agg_our_side)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 /// 对所有案件依次跑一遍全局抽。**串行**(每个案件单 LLM call 已经够慢),
@@ -617,27 +816,175 @@ pub fn workflow_status_en_to_zh(en: &str) -> &str {
     }
 }
 
-/// 读取已经锁定的立场。人工 override 优先;没有人工值时,首次 AI 识别的 agg_our_side
-/// 也视为已锁定并回喂。只有显式「重置立场」把二者清空后,AI 才能重新判断。
-async fn read_locked_our_side(pool: &SqlitePool, case_id: &str) -> Option<String> {
+/// 捕获本轮分析所依据的代理范围及原始权威状态；后续写入必须以这份快照做 CAS。
+async fn capture_representation_snapshot(
+    pool: &SqlitePool,
+    case_id: &str,
+) -> Result<RepresentationSnapshot, String> {
     let row: (Option<String>, Option<String>) =
         sqlx::query_as("SELECT user_overrides_json, agg_our_side FROM cases WHERE id = ?")
             .bind(case_id)
             .fetch_optional(pool)
             .await
-            .ok()
-            .flatten()?;
-    crate::db::cases::effective_our_side(row.1.as_deref(), row.0.as_deref())
+            .map_err(|error| format!("读取案件代理范围失败: {error}"))?
+            .ok_or_else(|| "案件不存在".to_string())?;
+    crate::db::case_representation::effective_representation(row.0.as_deref(), row.1.as_deref())
+        .map(|representation| RepresentationSnapshot {
+            representation: representation.map(|representation| ConfirmedRepresentation {
+                side: representation.side,
+                parties: representation.parties,
+            }),
+            user_overrides_json: row.0,
+            agg_our_side: row.1,
+        })
+        .map_err(|error| error.to_string())
 }
 
-/// 把 LLM 抽出来的 GlobalExtractTable 写到 cases 表里。
-async fn write_table_to_cases(
+async fn representation_snapshot_is_current(
+    pool: &SqlitePool,
+    case_id: &str,
+    expected: &RepresentationSnapshot,
+) -> Result<bool, String> {
+    let current: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT user_overrides_json, agg_our_side FROM cases WHERE id = ?")
+            .bind(case_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| format!("复核案件代理范围失败: {error}"))?;
+    Ok(current.is_some_and(|current| {
+        current.0 == expected.user_overrides_json && current.1 == expected.agg_our_side
+    }))
+}
+
+/// 精确人工名单是事实上的利益冲突边界，不能信任重分析模型把同阵营全标成我方。
+fn apply_confirmed_representation(
+    table: &mut GlobalExtractTable,
+    confirmed: &ConfirmedRepresentation,
+) -> Result<(), String> {
+    if confirmed.parties.is_empty() {
+        table.our_side = Some(confirmed.side.clone());
+        return Ok(());
+    }
+
+    let exact_parties = confirmed
+        .parties
+        .iter()
+        .filter(|party| !party.name.trim().is_empty())
+        .collect::<Vec<_>>();
+    for exact in &exact_parties {
+        let matched = table
+            .party_contacts
+            .iter()
+            .filter(|party| {
+                party
+                    .name
+                    .as_deref()
+                    .zip(party.role.as_deref())
+                    .is_some_and(|(name, role)| {
+                        name.trim() == exact.name.trim() && role.trim() == exact.role.trim()
+                    })
+            })
+            .count();
+        if matched != 1 {
+            return Err(format!(
+                "精确委托人“{}”（{}）在本轮当事人联系人中匹配{}条，当前版本无法自动区分；已停止发布本轮案件画像和报告",
+                exact.name, exact.role, matched
+            ));
+        }
+    }
+    table.our_side = Some(confirmed.side.clone());
+    for party in &mut table.party_contacts {
+        party.is_our_side = Some(
+            party
+                .name
+                .as_deref()
+                .zip(party.role.as_deref())
+                .is_some_and(|(name, role)| {
+                    exact_parties.iter().any(|exact| {
+                        exact.name.trim() == name.trim() && exact.role.trim() == role.trim()
+                    })
+                }),
+        );
+    }
+
+    let main_roles_by_name = main_party_roles_by_name(&table.party_contacts);
+    for instance in &mut table.instances {
+        for party in &mut instance.party_roles {
+            party.is_our_side = Some(
+                party
+                    .name
+                    .as_deref()
+                    .and_then(|name| main_roles_by_name.get(name.trim()))
+                    .filter(|roles| roles.len() == 1)
+                    .is_some_and(|roles| {
+                        exact_parties.iter().any(|exact| {
+                            exact.name.trim() == party.name.as_deref().unwrap_or_default().trim()
+                                && roles.contains(exact.role.trim())
+                        })
+                    }),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn main_party_roles_by_name(
+    contacts: &[crate::llm::global_extract::PartyContact],
+) -> std::collections::HashMap<String, HashSet<String>> {
+    let mut roles_by_name = std::collections::HashMap::new();
+    for contact in contacts {
+        let Some(name) = contact
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let Some(role) = contact
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|role| matches!(*role, "原告" | "被告" | "第三人"))
+        else {
+            continue;
+        };
+        roles_by_name
+            .entry(name.to_string())
+            .or_insert_with(HashSet::new)
+            .insert(role.to_string());
+    }
+    roles_by_name
+}
+
+/// 用全案分析开始前捕获的代理范围写入 cases；快照不一致时 CAS 拒绝写入。
+async fn write_table_to_cases_guarded(
     pool: &SqlitePool,
     case_id: &str,
     t: &GlobalExtractTable,
     report_path: Option<&str>,
+    expected: &RepresentationSnapshot,
 ) -> Result<(), sqlx::Error> {
     let now = chrono::Utc::now().to_rfc3339();
+
+    let (overrides_json, existing_our_side): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT user_overrides_json, agg_our_side FROM cases WHERE id = ?")
+            .bind(case_id)
+            .fetch_optional(pool)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?;
+    if overrides_json != expected.user_overrides_json || existing_our_side != expected.agg_our_side
+    {
+        return Err(sqlx::Error::Protocol(
+            "律师已修改委托人，已丢弃本次分析，请重新分析".into(),
+        ));
+    }
+    let mut corrected_table = t.clone();
+    if let Some(confirmed) = expected.representation.as_ref() {
+        apply_confirmed_representation(&mut corrected_table, confirmed)
+            .map_err(sqlx::Error::Protocol)?;
+    }
+    let t = &corrected_table;
 
     // D3-1:数组/文本 agg_* 字段空值时返回 None → 配合下方 SQL 的 COALESCE 跳过覆盖,
     // 防"重抽期间个别文档失败、语料变子集"用更小结果把已抽到的当事人/日期/费用静默抹掉。
@@ -653,12 +1000,6 @@ async fn write_table_to_cases(
     let status_text_opt = t.status_text.as_deref().filter(|s| !s.trim().is_empty());
     let summary_opt = t.summary.as_deref().filter(|s| !s.trim().is_empty());
     let our_side_opt = t.our_side.as_deref().filter(|s| !s.trim().is_empty());
-    let overrides_json: Option<String> =
-        sqlx::query_scalar("SELECT user_overrides_json FROM cases WHERE id = ?")
-            .bind(case_id)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
     let manual_our_side = crate::db::cases::user_override_our_side(overrides_json.as_deref());
     let has_manual_our_side = manual_our_side.is_some();
     let manual_or_llm_our_side = manual_our_side.as_deref().or(our_side_opt);
@@ -696,7 +1037,7 @@ async fn write_table_to_cases(
             workflow_status = CASE WHEN workflow_status_locked = 1 \
                 THEN workflow_status ELSE COALESCE(?, workflow_status) END, \
             agg_computed_at = ? \
-         WHERE id = ?",
+         WHERE id = ? AND user_overrides_json IS ? AND agg_our_side IS ?",
     )
     .bind(&t.case_no)
     .bind(&t.court)
@@ -726,11 +1067,15 @@ async fn write_table_to_cases(
     .bind(workflow_status_to_set)
     .bind(&now)
     .bind(case_id)
+    .bind(&expected.user_overrides_json)
+    .bind(&expected.agg_our_side)
     .execute(pool)
     .await?;
 
     if result.rows_affected() == 0 {
-        return Err(sqlx::Error::RowNotFound);
+        return Err(sqlx::Error::Protocol(
+            "律师已修改委托人，已丢弃本次分析，请重新分析".into(),
+        ));
     }
 
     Ok(())

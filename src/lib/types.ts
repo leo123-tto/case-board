@@ -163,6 +163,25 @@ export interface Case {
   analysis_stale_reason: string | null;
 }
 
+/** 律师在单一诉讼阵营内选择的具体委托当事人。 */
+export interface RepresentedParty {
+  name: string;
+  role: string;
+}
+
+/** 保存后优先于旧版 `agg_our_side` 的精确代理关系。 */
+export interface CaseRepresentation {
+  version: number;
+  side: string;
+  parties: RepresentedParty[];
+}
+
+/** 提交给 `update_case_representation` 的精确代理选择。 */
+export interface RepresentationInput {
+  side: string;
+  party_names: string[];
+}
+
 /**
  * 审级实例(case_instances 表一行)。一个案件 = N 个审级:[仲裁]→一审→二审→[再审]。
  * seq 最大者 is_current=true;handlers/party_roles 是 JSON 字符串。

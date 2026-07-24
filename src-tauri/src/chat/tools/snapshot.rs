@@ -16,7 +16,6 @@ const SUPPORTED_FIELDS: &[&str] = &[
     "agg_claim_amount",
     "agg_status_text",
     "agg_resolution",
-    "agg_our_side",
     "case_summary",
     "case_stage",
     "case_status",
@@ -63,6 +62,12 @@ impl Tool for UpdateCaseSnapshotField {
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
         let case_id = ctx.case_id.ok_or(ToolError::NoCaseBound)?;
         let path = require_str(args, "field_path")?;
+        if path == "agg_our_side" {
+            return Err(ToolError::InvalidArgs(
+                "我方代理立场和精确委托人只能在案件详情中专用选择或重置，不能通过 AI 助手修改"
+                    .into(),
+            ));
+        }
         if !SUPPORTED_FIELDS.contains(&path) {
             return Err(ToolError::InvalidArgs(format!(
                 "不支持的案件画像字段: {}",

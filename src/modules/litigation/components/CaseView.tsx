@@ -421,7 +421,7 @@ export function CaseView({
   return (
     <main className="app-shell flex h-full w-full flex-col">
       {/* Header */}
-      <header className="app-subheader border-b px-4 py-4 sm:px-6 xl:px-8">
+      <header className="app-subheader relative z-30 border-b px-4 py-4 sm:px-6 xl:px-8">
         <div className="mx-auto flex max-w-6xl flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div className="min-w-0 flex-1">
             <button

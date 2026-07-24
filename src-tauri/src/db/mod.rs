@@ -20,6 +20,7 @@ use sqlx::SqlitePool;
 pub mod ai_jobs;
 pub mod ai_workspace_chat;
 pub mod ai_workspace_documents;
+pub mod ai_workspace_local_exports;
 pub mod ai_workspace_proposals;
 pub mod ai_workspaces;
 pub mod bookmarks;
@@ -28,6 +29,7 @@ pub mod case_chat_conversations;
 pub mod case_instances;
 pub mod case_logs;
 pub mod case_memories;
+pub mod case_representation;
 pub mod case_visuals;
 pub mod cases;
 pub mod chat;
@@ -105,8 +107,8 @@ pub async fn init_pool(db_path: &str) -> Result<SqlitePool, DbError> {
         .map_err(|e| DbError::Connect(e.to_string()))?;
 
     // 2026-06-15:跑迁移前先对齐 _sqlx_migrations 校验值,根治「migration N ... has been modified」
-    // 启动崩溃。病根 = 不同发布分支对**同一批已发布迁移**做了注释与示例文字改动，
-    // SQL 一字未改但 SHA-384 变了 → 老用户 DB 里
+    // 启动崩溃。病根 = 双轨发布(私人仓 vs 开源仓)对**同一批已发布迁移**做了去身份化注释改动
+    // (内部发布仓名→公开域名、本地路径→泛化),SQL 一字未改但 SHA-384 变了 → 老用户 DB 里
     // 存的旧校验值对不上新二进制内嵌值 → sqlx 启动中止(release 是 panic=abort,直接闪退)。
     // 详见 docs/反馈问题排查-2026-06-15.md。
     reconcile_migration_checksums(&pool).await?;

@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::db::case_representation::RepresentedParty;
 use crate::tabular_digest::{
     spreadsheet_text_to_markdown_digest, DEFAULT_SPREADSHEET_DIGEST_MAX_CHARS,
 };
@@ -155,6 +156,13 @@ pub struct DocInput {
     pub text_md: String,
 }
 
+/// 律师已经确认的代理范围。`parties` 为空时代表旧案件只有案件级粗立场。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedRepresentation {
+    pub side: String,
+    pub parties: Vec<RepresentedParty>,
+}
+
 /// === 单次 Prompt 同时输出表格 + 报告 ===
 ///
 /// 2026-05-24 i · 合并 call:用一个 prompt + JSON output 同时输出 `table` 和 `report_md`。
@@ -213,6 +221,7 @@ const SYSTEM_PROMPT_COMBINED: &str = r###"你是资深律师助理,精通法律�
    - 信号不足或相互冲突、判不出我方是谁 → null(绝不瞎猜,让律师补)
    - ⚠️ 看「我方」实体阵营(攻方/守方),**不要**被审级称谓带偏(一审被告→二审"上诉人",实体上仍是 `"被告方"`)
    - 若 corpus 开头出现【律师已确认:我方代理立场=XXX】,**以该值为准**,据此回填 is_our_side 并撰写报告侧重,不得改判
+   - 若同时出现【律师已确认:具体委托人=甲、乙】和【利益冲突边界:...】,精确名单是最高优先级：**只有律师已确认的具体委托人可以标记 is_our_side=true**；同阵营的其他当事人必须标记 false，绝不能因同属该阵营扩大委托范围。报告只能围绕该精确委托人的利益展开。
 4. 日期统一 YYYY-MM-DD,金额数字(元)不要"万元"
 5. workflow_status 严格从 11 档选一个:接案 / 立案中 / 仲裁中 / 待开庭 / 审理中 / 已调解 / 上诉期 / 二审中 / 再审中 / 执行中 / 已结案
 5a. 语料开头会给你 `【当前日期=YYYY-MM-DD】`。`workflow_status` 和 `status_text` 必须结合当前日期判断先后:
@@ -525,12 +534,37 @@ fn clip_text_preserving_edges(text: &str, char_budget: usize) -> (String, bool, 
 
 fn build_combined_user_content(
     corpus: &str,
-    confirmed_our_side: Option<&str>,
+    confirmed_representation: Option<&ConfirmedRepresentation>,
     today: &str,
 ) -> String {
     let mut user_content = format!("【当前日期={}】\n", today);
-    if let Some(side) = confirmed_our_side.map(str::trim).filter(|s| !s.is_empty()) {
-        user_content.push_str(&format!("【律师已确认:我方代理立场={}】\n", side));
+    if let Some(confirmed) = confirmed_representation {
+        let side = confirmed.side.trim();
+        if !side.is_empty() {
+            user_content.push_str(&format!("【律师已确认:我方代理立场={}】\n", side));
+        }
+        let parties = confirmed
+            .parties
+            .iter()
+            .map(|party| party.name.trim())
+            .filter(|party| !party.is_empty())
+            .collect::<Vec<_>>();
+        if !parties.is_empty() {
+            user_content.push_str(&format!(
+                "【律师已确认:具体委托人={}】\n",
+                parties.join("、")
+            ));
+            let side_party_label = match side {
+                "原告方" => "原告",
+                "被告方" => "被告",
+                "第三人" => "第三人",
+                _ => "同阵营当事人",
+            };
+            user_content.push_str(&format!(
+                "【利益冲突边界:同阵营其他{}不是我方委托人】\n",
+                side_party_label
+            ));
+        }
     }
     user_content.push('\n');
     user_content.push_str(corpus);
@@ -548,11 +582,11 @@ fn global_extract_output_budget(capability: &ProviderCapability) -> u32 {
 fn build_combined_extract_request(
     config: &LlmConfig,
     corpus: &str,
-    confirmed_our_side: Option<&str>,
+    confirmed_representation: Option<&ConfirmedRepresentation>,
     today: &str,
 ) -> (ProviderCapability, NonStreamChatRequest) {
     let capability = ProviderCapability::from_backend("", &config.endpoint, &config.model);
-    let user_content = build_combined_user_content(corpus, confirmed_our_side, today);
+    let user_content = build_combined_user_content(corpus, confirmed_representation, today);
     (
         capability,
         NonStreamChatRequest {
@@ -575,11 +609,11 @@ fn build_combined_extract_request(
 pub async fn extract_combined(
     config: &LlmConfig,
     corpus: &str,
-    confirmed_our_side: Option<&str>,
+    confirmed_representation: Option<&ConfirmedRepresentation>,
 ) -> Result<CombinedExtractResult, LlmError> {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let (capability, request) =
-        build_combined_extract_request(config, corpus, confirmed_our_side, &today);
+        build_combined_extract_request(config, corpus, confirmed_representation, &today);
     let output = complete_non_stream_chat(config, &capability, request)
         .await
         .map_err(gateway_error_to_llm_error)?;
@@ -890,7 +924,8 @@ fn strip_markdown_fence(s: &str) -> String {
     trimmed.to_string()
 }
 
-/// 报告 MD 落盘路径:`~/Library/Application Support/CaseBoard/reports/<case_id>.md`
+/// reports 目录锚点。全案分析的新报告会在同目录发布独立 generation；这里保留固定路径
+/// 用于兼容历史报告和定位目录，绝不能拿它覆盖当前已发布报告。
 pub fn report_path_for_case(case_id: &str) -> Result<PathBuf, String> {
     let base = crate::db::app_data_dir().map_err(|e| format!("无法定位 app data dir: {}", e))?;
     let dir = base.join("reports");

@@ -354,6 +354,187 @@ pub async fn update_user_overrides(
     Ok(())
 }
 
+/// 供通用 overlay 编辑器写入的受保护合并。
+///
+/// 精确委托人(`representation`)与我方立场(`fields.agg_our_side`)只允许案件详情的
+/// 专用保存/重置动作修改。整包 debounce 写入可能基于旧快照，故缺少受保护键时必须从
+/// 当前值补回；显式携带不同值则 fail-loud，不能把 A 静默覆盖为 B 或删除。
+pub async fn update_user_overrides_preserving_representation(
+    pool: &SqlitePool,
+    id: &str,
+    incoming: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let result = async {
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT user_overrides_json FROM cases WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or(sqlx::Error::RowNotFound)?;
+        let current = parse_user_overrides_object(current.as_deref(), "当前")?;
+        let mut incoming = parse_user_overrides_object(incoming, "提交")?;
+        preserve_protected_representation_keys(&current, &mut incoming)?;
+        let next_json = normalize_empty_override_containers(&mut incoming)?;
+        sqlx::query(
+            "UPDATE cases SET user_overrides_json = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(next_json)
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(error)
+        }
+    }
+}
+
+fn parse_user_overrides_object(
+    raw: Option<&str>,
+    source: &str,
+) -> Result<serde_json::Value, sqlx::Error> {
+    let value = match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
+        Some(raw) => serde_json::from_str(raw).map_err(|error| {
+            sqlx::Error::Protocol(format!(
+                "{source} user_overrides_json 已损坏，拒绝覆盖: {error}"
+            ))
+        })?,
+        None => serde_json::json!({}),
+    };
+    if !value.is_object() {
+        return Err(sqlx::Error::Protocol(format!(
+            "{source} user_overrides_json 不是对象，拒绝覆盖"
+        )));
+    }
+    // `effective_representation` 同时校验 representation 结构、姓名规范化和与立场的一致性。
+    let serialized = serde_json::to_string(&value).map_err(|error| {
+        sqlx::Error::Protocol(format!("序列化 {source} user_overrides_json 失败: {error}"))
+    })?;
+    crate::db::case_representation::effective_representation(Some(&serialized), None).map_err(
+        |error| sqlx::Error::Protocol(format!("{source}精确委托人状态无效，拒绝覆盖: {error}")),
+    )?;
+    if value
+        .get("fields")
+        .is_some_and(|fields| !fields.is_object())
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "{source} user_overrides_json.fields 不是对象，拒绝覆盖"
+        )));
+    }
+    if let Some(our_side) = value
+        .get("fields")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|fields| fields.get("agg_our_side"))
+    {
+        if !our_side.is_null() && !our_side.is_string() {
+            return Err(sqlx::Error::Protocol(format!(
+                "{source} fields.agg_our_side 必须是字符串或 null，拒绝覆盖"
+            )));
+        }
+    }
+    Ok(value)
+}
+
+fn protected_override_write_error() -> sqlx::Error {
+    sqlx::Error::Protocol(
+        "精确委托人和我方代理立场只能在案件详情中专用选择或重置，执行产物绑定只能由查询流程更新；不能通过通用编辑修改".into(),
+    )
+}
+
+fn protected_field_value(root: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+    match path {
+        "representation" => root.get("representation").cloned(),
+        "execution_artifacts" => root.get("execution_artifacts").cloned(),
+        "fields.agg_our_side" => root
+            .get("fields")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|fields| fields.get("agg_our_side"))
+            .cloned(),
+        _ => None,
+    }
+}
+
+fn preserve_protected_representation_keys(
+    current: &serde_json::Value,
+    incoming: &mut serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    for path in [
+        "representation",
+        "fields.agg_our_side",
+        "execution_artifacts",
+    ] {
+        let current_value = protected_field_value(current, path);
+        let incoming_value = protected_field_value(incoming, path);
+        if incoming_value.is_some() && incoming_value != current_value {
+            return Err(protected_override_write_error());
+        }
+        let Some(current_value) = current_value else {
+            continue;
+        };
+        let root = incoming.as_object_mut().expect("已校验为对象");
+        match path {
+            "representation" => {
+                root.insert("representation".to_string(), current_value);
+            }
+            "execution_artifacts" => {
+                root.insert("execution_artifacts".to_string(), current_value);
+            }
+            "fields.agg_our_side" => {
+                let fields = root
+                    .entry("fields")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .expect("已校验 fields 为对象");
+                fields.insert("agg_our_side".to_string(), current_value);
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+/// 对齐前端 `serializeOverrides`：所有已知容器都为空时用 SQL NULL 表示没有人工覆盖。
+/// 未知顶层键（即便值为空数组/对象）保留，避免通用整包写删除未来扩展字段。
+fn normalize_empty_override_containers(
+    overrides: &mut serde_json::Value,
+) -> Result<Option<String>, sqlx::Error> {
+    let root = overrides
+        .as_object_mut()
+        .ok_or_else(|| sqlx::Error::Protocol("user_overrides_json 不是对象，拒绝覆盖".into()))?;
+    for key in [
+        "fields",
+        "hidden_sections",
+        "deleted_rows",
+        "section_order",
+        "calendar_events",
+    ] {
+        if root.get(key).is_some_and(is_empty_known_override_container) {
+            root.remove(key);
+        }
+    }
+    if root.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(overrides)
+        .map(Some)
+        .map_err(|error| sqlx::Error::Protocol(format!("序列化 user_overrides_json 失败: {error}")))
+}
+
+fn is_empty_known_override_container(value: &serde_json::Value) -> bool {
+    value.as_array().is_some_and(Vec::is_empty)
+        || value.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
 /// 原子修改 user_overrides_json.fields 的一个字段，保留其它人工覆盖。
 /// 遇到损坏或非对象 JSON 时 fail-loud，绝不静默重置用户已有内容。
 pub async fn patch_user_override_field(
@@ -362,6 +543,9 @@ pub async fn patch_user_override_field(
     path: &str,
     value: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    if path == "agg_our_side" {
+        return Err(protected_override_write_error());
+    }
     let mut conn = pool.acquire().await?;
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
     let result = async {
@@ -593,6 +777,9 @@ pub async fn reset_our_side(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Err
     let cleaned = clear_our_side_override_json(current.as_deref());
     sqlx::query(
         "UPDATE cases SET agg_our_side = NULL, user_overrides_json = ?, \
+         risk_assessment_path = NULL, risk_assessment_at = NULL, \
+         deep_dive_report_path = NULL, deep_dive_at = NULL, \
+         full_report_path = NULL, full_report_at = NULL, \
          updated_at = datetime('now') WHERE id = ?",
     )
     .bind(cleaned)
@@ -620,6 +807,8 @@ fn clear_our_side_override_json(json: Option<&str>) -> Option<String> {
             root.remove("fields");
         }
     }
+    root.remove("representation");
+    root.remove(crate::yuandian::artifact_binding::OVERRIDE_KEY);
     if root.is_empty() {
         None
     } else {

@@ -266,6 +266,27 @@ fn visualization_consent_from_message(message: &str) -> bool {
     .any(|word| text.contains(word))
 }
 
+fn build_case_chat_constitution_prompt(
+    case: &crate::db::cases::Case,
+    docs: &[crate::db::documents::Document],
+    attached_ids: &[String],
+    editing_doc_id: Option<&str>,
+    ai_soul_md: Option<&str>,
+    global_memories: &[String],
+    case_memories: &[String],
+) -> Result<String, String> {
+    build_system_prompt_with_memory(
+        case,
+        docs,
+        attached_ids,
+        editing_doc_id,
+        ai_soul_md,
+        global_memories,
+        case_memories,
+    )
+    .map_err(|error| format!("案件精确委托人状态无效，请到案件详情重新确认具体委托人：{error}"))
+}
+
 /// `case_chat` 主入口。返回时流式已经完成(或取消 / 错误)。
 pub async fn case_chat_impl(
     app: AppHandle,
@@ -314,7 +335,72 @@ pub async fn case_chat_impl(
         .and_then(|row| row.model.clone());
     let history = clip_history_for_replay(&history_rows, 4000);
 
-    // ── 4. 入库 user 消息 ────────────────────────────────────────────
+    // ── 4. 预构建案件 Prompt ─────────────────────────────────────────
+    // 在 user 消息、chat_task、cancel registry 与流式转发启动前完成。精确委托人状态
+    // 损坏时，这里向 IPC 返回可修复错误，不会留下没有 terminal 状态的半截任务。
+    let attached_doc_ids_clone = input.attached_doc_ids.clone();
+    let attached_ids: Vec<String> = attached_doc_ids_clone.clone().unwrap_or_default();
+    let case = crate::db::cases::get_case(pool, &input.case_id)
+        .await
+        .map_err(|e| format!("读案件失败: {e}"))?
+        .ok_or_else(|| "案件不存在".to_string())?;
+    let docs = crate::db::documents::list_documents_by_case(pool, &input.case_id)
+        .await
+        .map_err(|e| format!("读文档失败: {e}"))?;
+    let based_on_doc_ids = crate::chat::constitution::material_doc_ids(&docs, &attached_ids);
+    let case_memories = crate::db::case_memories::list_active(pool, &input.case_id)
+        .await
+        .map_err(|e| format!("读取案件记忆失败: {e}"))?
+        .into_iter()
+        .map(|m| m.content)
+        .collect::<Vec<_>>();
+    let mut global_memories = crate::db::case_memories::list_active_global_memories(pool)
+        .await
+        .map_err(|e| format!("读取全局记忆失败: {e}"))?
+        .into_iter()
+        .map(|m| m.content)
+        .collect::<Vec<_>>();
+    let memory_modes = allowed_memory_modes_for_chat(task, input.editing_doc_id.is_some());
+    match crate::memory_vault::build_prompt_pack_for_modes(&settings, &memory_modes) {
+        Ok(pack) => global_memories.extend(pack.items),
+        Err(e) => crate::dlog!("[memory] 读取 Markdown 记忆库失败: {}", e),
+    }
+    let global_memories = cap_prompt_memories(global_memories, 8_000, "全局记忆");
+    let case_memories = cap_prompt_memories(case_memories, 6_000, "本案记忆");
+    let mut constitution_prompt = build_case_chat_constitution_prompt(
+        &case,
+        &docs,
+        &attached_ids,
+        input.editing_doc_id.as_deref(),
+        settings.ai_soul_md.as_deref(),
+        &global_memories,
+        &case_memories,
+    )?;
+    constitution_prompt.push_str(&task_contract_prompt(task));
+    constitution_prompt.push_str(artifact_intent.prompt_contract());
+
+    let mut user_message_final = match task_user_prompt(task) {
+        Some(template) if input.user_message.trim().is_empty() => template.to_string(),
+        Some(template) => format!(
+            "{}\n\n[用户附加要求]\n{}",
+            template,
+            input.user_message.trim()
+        ),
+        None => input.user_message.clone(),
+    };
+    let research_requirement =
+        crate::chat::policy::explicit_research_requirement(&input.user_message);
+    let runtime = AgentRuntimeKind::from_settings(&settings);
+    if runtime == AgentRuntimeKind::Native {
+        constitution_prompt.push_str(&crate::chat::skills::native_prompt(
+            input.skill_name.as_deref(),
+        )?);
+    } else if let Some(skill_name) = input.skill_name.as_deref() {
+        crate::chat::skills::resolve(skill_name)?;
+        user_message_final = format!("/skill:{skill_name} {user_message_final}");
+    }
+
+    // ── 5. 入库 user 消息 ────────────────────────────────────────────
     let user_msg_id = uuid::Uuid::new_v4().to_string();
     // V0.2 D6.5 · user 消息上写 attached_doc_ids,方便 history 重放时还原引用清单
     let attached_doc_ids_json = input
@@ -389,25 +475,7 @@ pub async fn case_chat_impl(
         streamed
     });
 
-    // ── 7. 拼 user_prompt(固定任务前缀 + 用户原话) ──────────────────
-    let mut user_message_final = match task_user_prompt(task) {
-        Some(template) => {
-            if input.user_message.trim().is_empty() {
-                template.to_string()
-            } else {
-                format!(
-                    "{}\n\n[用户附加要求]\n{}",
-                    template,
-                    input.user_message.trim()
-                )
-            }
-        }
-        None => input.user_message.clone(),
-    };
-    let research_requirement =
-        crate::chat::policy::explicit_research_requirement(&input.user_message);
-
-    // V0.2 D4-D5.D · 用 model_router 替换硬编码 temperature/max_tokens
+    // ── 8. 用 model_router 选择温度 / token 上限 ──────────────────────
     // V0.3 · model_router 统一读 cloud_llm_model 档位(全局 flash/pro 或 auto 自动挡);
     // 把选中的模型回写进 llm_config,**agent_loop 和 stream 两条路径都用同一个模型**(不再分叉)。
     // ⚠️ 只在云端档覆盖:本地档(ollama)的 model 是本机模型名,绝不能被 DeepSeek 档位名覆盖。
@@ -422,12 +490,10 @@ pub async fn case_chat_impl(
         llm_config.model = choice.model.clone();
     }
 
-    // ── 8. 统一走 agent_loop(V0.3.3:已删无工具 stream 路径)──────────────
+    // ── 9. 统一走 agent_loop(V0.3.3:已删无工具 stream 路径)──────────────
     // 所有 chat 都进 agent_loop:既能 save_artifact 起草落盘,也能 read_case_doc / 查法条 /
     // semantic_search_case_docs —— 兑现「有材料+上下文,想写什么都能写」。工具是否被调由模型按
     // 宪法 + tool_choice=auto 自行决定(简单问答仍可直接答)。
-    let attached_doc_ids_clone = input.attached_doc_ids.clone();
-
     // 每次 chat 都建 chat_task(落 tool_calls / citations / finish);失败不阻断聊天,task_id=null。
     let chat_task_id: Option<String> = {
         let tid = uuid::Uuid::new_v4().to_string();
@@ -458,57 +524,6 @@ pub async fn case_chat_impl(
             }
         }
     };
-
-    // 拉案件 + 文档,constitution 拼完整宪法 prompt(带 attached_ids 焦点段)
-    let case = crate::db::cases::get_case(pool, &input.case_id)
-        .await
-        .map_err(|e| format!("读案件失败: {}", e))?
-        .ok_or_else(|| "案件不存在".to_string())?;
-    let docs = crate::db::documents::list_documents_by_case(pool, &input.case_id)
-        .await
-        .map_err(|e| format!("读文档失败: {}", e))?;
-    let attached_ids: Vec<String> = attached_doc_ids_clone.clone().unwrap_or_default();
-    // based_on:本轮喂进上下文的「材料文档」id(写 chat_messages.based_on);原由 build_context 返回
-    let based_on_doc_ids = crate::chat::constitution::material_doc_ids(&docs, &attached_ids);
-    let case_memories = crate::db::case_memories::list_active(pool, &input.case_id)
-        .await
-        .map_err(|e| format!("读取案件记忆失败: {}", e))?
-        .into_iter()
-        .map(|m| m.content)
-        .collect::<Vec<_>>();
-    let mut global_memories = crate::db::case_memories::list_active_global_memories(pool)
-        .await
-        .map_err(|e| format!("读取全局记忆失败: {}", e))?
-        .into_iter()
-        .map(|m| m.content)
-        .collect::<Vec<_>>();
-    let memory_modes = allowed_memory_modes_for_chat(task, input.editing_doc_id.is_some());
-    match crate::memory_vault::build_prompt_pack_for_modes(&settings, &memory_modes) {
-        Ok(pack) => global_memories.extend(pack.items),
-        Err(e) => crate::dlog!("[memory] 读取 Markdown 记忆库失败: {}", e),
-    }
-    let global_memories = cap_prompt_memories(global_memories, 8_000, "全局记忆");
-    let case_memories = cap_prompt_memories(case_memories, 6_000, "本案记忆");
-    let mut constitution_prompt = build_system_prompt_with_memory(
-        &case,
-        &docs,
-        &attached_ids,
-        input.editing_doc_id.as_deref(),
-        settings.ai_soul_md.as_deref(),
-        &global_memories,
-        &case_memories,
-    );
-    constitution_prompt.push_str(&task_contract_prompt(task));
-    constitution_prompt.push_str(artifact_intent.prompt_contract());
-    let runtime = AgentRuntimeKind::from_settings(&settings);
-    if runtime == AgentRuntimeKind::Native {
-        constitution_prompt.push_str(&crate::chat::skills::native_prompt(
-            input.skill_name.as_deref(),
-        )?);
-    } else if let Some(skill_name) = input.skill_name.as_deref() {
-        crate::chat::skills::resolve(skill_name)?;
-        user_message_final = format!("/skill:{skill_name} {user_message_final}");
-    }
 
     let registry_tools = ToolRegistry::for_current_credentials();
     // V0.3.6 · 外部 MCP server(白名单,默认空 = 零开销零变化)。连/列失败的 server 跳过+dlog,不拖垮 chat。

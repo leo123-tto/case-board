@@ -20,12 +20,63 @@
 //!
 //! **积分账**:V0.1.8 平均 ~16 接口/企业 → V0.1.9 ~5-8 接口/企业(省一半)。
 
-use std::path::PathBuf;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use crate::yuandian::{self, file_name, save_json, EntityId};
+
+type CaseExecutionLock = Arc<RwLock<()>>;
+type BasicCaseQueryRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// 查询会持续数十秒，精确委托人不得在其间变更。锁按案件隔离，互不影响其它案件。
+static CASE_EXECUTION_LOCKS: OnceLock<Mutex<HashMap<String, CaseExecutionLock>>> = OnceLock::new();
+
+fn case_execution_lock(case_id: &str) -> CaseExecutionLock {
+    let locks = CASE_EXECUTION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().expect("案件查询锁注册表已损坏");
+    locks
+        .entry(case_id.to_string())
+        .or_insert_with(|| Arc::new(RwLock::new(())))
+        .clone()
+}
+
+/// 外部查询入口必须持有至全部元典、文件和 LLM 工作结束；读锁允许同案只读查询并行。
+pub(crate) async fn acquire_execution_query_read_guard(case_id: &str) -> OwnedRwLockReadGuard<()> {
+    case_execution_lock(case_id).read_owned().await
+}
+
+/// 人工修改精确委托人时只尝试获取写锁，绝不能在长查询后面默默排队。
+pub(crate) fn try_acquire_case_representation_write_guard(
+    case_id: &str,
+) -> Result<OwnedRwLockWriteGuard<()>, String> {
+    case_execution_lock(case_id)
+        .try_write_owned()
+        .map_err(|_| "执行查询正在进行，结束后再修改委托人".to_string())
+}
+
+/// 通用 overlay 写入同样会携带或覆盖委托人相关 JSON，必须与执行查询互斥。
+pub(crate) async fn update_case_overrides_unless_execution_running(
+    pool: &SqlitePool,
+    case_id: &str,
+    incoming: Option<&str>,
+) -> Result<(), String> {
+    let _write_guard = try_acquire_case_representation_write_guard(case_id)?;
+    crate::db::cases::update_user_overrides_preserving_representation(pool, case_id, incoming)
+        .await
+        .map_err(|error| error.to_string())
+}
 
 /// 被执行主体(自然人或企业)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +150,42 @@ pub async fn exec_stance_for_case(pool: &SqlitePool, case_id: &str) -> ExecStanc
     ExecStance::from_our_side(our_side.as_deref())
 }
 
+/// 所有会发起元典或 LLM 外部调用的执行入口共用此守卫。
+///
+/// 精确委托人存在时，当前阶段只能用 `name + role` 与联系人匹配；每个精确元组
+/// 必须恰好命中一条。解析损坏、缺失或同名同角色歧义一律在任何文件 I/O 或外部调用前
+/// 返回错误，禁止各个 IPC 入口各自退回旧的粗立场逻辑。
+pub(crate) async fn exact_representation_for_external_query(
+    pool: &SqlitePool,
+    case_id: &str,
+) -> Result<Option<crate::db::case_representation::CaseRepresentation>, String> {
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT agg_party_contacts, agg_our_side, user_overrides_json FROM cases WHERE id = ?",
+    )
+    .bind(case_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("查案件精确委托人状态失败: {error}"))?;
+    let Some((party_contacts, agg_our_side, user_overrides_json)) = row else {
+        return Err(format!("案件不存在:{case_id}"));
+    };
+
+    let representation = crate::db::case_representation::effective_representation(
+        user_overrides_json.as_deref(),
+        agg_our_side.as_deref(),
+    )
+    .map_err(|error| format!("案件精确委托人状态无效: {error}"))?;
+    let explicit_representation =
+        representation.filter(|representation| !representation.parties.is_empty());
+    if let Some(representation) = &explicit_representation {
+        validate_exact_representation_contacts(
+            party_contacts.as_deref(),
+            representation.parties.as_slice(),
+        )?;
+    }
+    Ok(explicit_representation)
+}
+
 /// 编排结果汇报(给前端 Toast + 给 LLM 评估用)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorReport {
@@ -121,23 +208,48 @@ pub async fn basic_query(
     case_id: &str,
     api_key: &str,
 ) -> Result<OrchestratorReport, String> {
+    let _query_guard = acquire_execution_query_read_guard(case_id).await;
+    basic_query_while_read_locked(pool, case_id, api_key).await
+}
+
+/// 供 `yuandian_basic_query` 在同一读锁内串起 P1 与风险评估时调用。
+/// 调用方必须持有 [`acquire_execution_query_read_guard`] 返回的 guard。
+pub(crate) async fn basic_query_while_read_locked(
+    pool: &SqlitePool,
+    case_id: &str,
+    api_key: &str,
+) -> Result<OrchestratorReport, String> {
     let start = std::time::Instant::now();
+    let explicit_representation = exact_representation_for_external_query(pool, case_id).await?;
 
     // 1. 拿 case 的 party_contacts + agg_filed_at(立案日,拒执 cutoff)
-    let row: Option<(Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT agg_party_contacts, agg_filed_at FROM cases WHERE id = ?")
-            .bind(case_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| format!("查 case 失败:{}", e))?;
-    let (party_json, filed_at) = match row {
-        Some((p, f)) => (p, f),
-        None => (None, None),
+    let row: Option<BasicCaseQueryRow> = sqlx::query_as(
+        "SELECT agg_party_contacts, agg_filed_at, agg_our_side, user_overrides_json \
+             FROM cases WHERE id = ?",
+    )
+    .bind(case_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("查 case 失败:{}", e))?;
+    let (party_json, filed_at, agg_our_side, user_overrides_json) = match row {
+        Some((p, f, side, overrides)) => (p, f, side, overrides),
+        None => (None, None, None, None),
     };
 
     // Phase 2:按执行立场选查询对象。债权人模式查对方(被执行人);债务人模式查我方客户(做暴露面自查)。
-    let stance = exec_stance_for_case(pool, case_id).await;
-    let subjects = extract_target_subjects(party_json.as_deref(), stance);
+    // 粗立场只负责决定债权人/债务人模式，不能再用于判断单个当事人是否受托。
+    let our_side = crate::db::cases::effective_our_side(
+        agg_our_side.as_deref(),
+        user_overrides_json.as_deref(),
+    );
+    let stance = ExecStance::from_our_side(our_side.as_deref());
+    let subjects = extract_target_subjects(
+        party_json.as_deref(),
+        stance,
+        explicit_representation
+            .as_ref()
+            .map(|representation| representation.parties.as_slice()),
+    );
     if subjects.is_empty() {
         let who = match stance {
             ExecStance::Creditor => "被执行人",
@@ -201,9 +313,13 @@ pub async fn basic_query(
 }
 
 /// 从 agg_party_contacts JSON 抽出要查询的主体列表。
-/// - 债权人模式:对方(被告/被执行/被申请,或 is_our_side==false)。
-/// - 债务人模式:我方客户(is_our_side==true,排除代理人/法务;is_our_side 缺失时退回按被执行类角色)。
-fn extract_target_subjects(json: Option<&str>, stance: ExecStance) -> Vec<Subject> {
+/// - 有精确委托人时：债务人模式只查精确名单；债权人模式排除精确名单。
+/// - 旧案件无精确名单：保留 is_our_side 与角色的原有兼容行为。
+fn extract_target_subjects(
+    json: Option<&str>,
+    stance: ExecStance,
+    represented_parties: Option<&[crate::db::case_representation::RepresentedParty]>,
+) -> Vec<Subject> {
     let Some(j) = json else { return vec![] };
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(j) else {
         return vec![];
@@ -231,21 +347,33 @@ fn extract_target_subjects(json: Option<&str>, stance: ExecStance) -> Vec<Subjec
             || role.contains("被申请")
             || role.contains("被告人");
 
+        let is_explicitly_represented = represented_parties.is_some_and(|represented| {
+            represented
+                .iter()
+                .any(|party| party.name.trim() == name && party.role.trim() == role.trim())
+        });
+
         let is_target = match stance {
             // 债权人:查对方(被执行人)。is_our_side==false,或按被执行类角色兜底;
             // 但**绝不查我方**(is_our_side==true 时即便角色像被执行人也排除,防数据矛盾误查自己客户)。
-            ExecStance::Creditor => {
-                is_our_side == Some(false) || (is_our_side != Some(true) && role_is_executee)
-            }
+            ExecStance::Creditor => match represented_parties {
+                Some(_) => !is_explicitly_represented && role_is_executee,
+                None => {
+                    is_our_side == Some(false) || (is_our_side != Some(true) && role_is_executee)
+                }
+            },
             // 债务人:查我方客户本人做暴露面自查。is_our_side==true(排除代理人/法务);
             // is_our_side 缺失时退回"被执行类角色"(债务人案件里这正是我方客户)。
-            ExecStance::Debtor => {
-                if role.contains("代理") {
-                    false
-                } else {
-                    is_our_side == Some(true) || (is_our_side.is_none() && role_is_executee)
+            ExecStance::Debtor => match represented_parties {
+                Some(_) => is_explicitly_represented && !role.contains("代理"),
+                None => {
+                    if role.contains("代理") {
+                        false
+                    } else {
+                        is_our_side == Some(true) || (is_our_side.is_none() && role_is_executee)
+                    }
                 }
-            }
+            },
         };
         if !is_target {
             continue;
@@ -272,6 +400,53 @@ fn extract_target_subjects(json: Option<&str>, stance: ExecStance) -> Vec<Subjec
         out.push(Subject { name, kind, id_no });
     }
     out
+}
+
+/// 精确名单没有稳定实体 ID 时，同名同角色必须唯一；否则不能决定哪一条联系人记录
+/// 才是受托人。此校验必须在创建目录、写文件或调用外部接口之前完成。
+fn validate_exact_representation_contacts(
+    json: Option<&str>,
+    represented_parties: &[crate::db::case_representation::RepresentedParty],
+) -> Result<(), String> {
+    let json = json.ok_or_else(|| {
+        "精确委托人无法在当事人联系人中匹配，当前版本无法自动区分。请先重新分析并核对；若仍存在同名同角色，请勿继续查询并人工核验。"
+            .to_string()
+    })?;
+    let parsed: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| format!("当事人联系人格式无效，拒绝执行外部查询: {error}"))?;
+    let contacts = parsed
+        .as_array()
+        .ok_or_else(|| "当事人联系人格式无效，拒绝执行外部查询".to_string())?;
+
+    for represented in represented_parties {
+        let matched = contacts
+            .iter()
+            .filter(|contact| {
+                contact
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|name| name.trim() == represented.name)
+                    && contact
+                        .get("role")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|role| role.trim() == represented.role)
+            })
+            .count();
+        if matched != 1 {
+            return Err(ambiguous_exact_party_contact_error(
+                &represented.name,
+                &represented.role,
+                matched,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ambiguous_exact_party_contact_error(name: &str, role: &str, matched: usize) -> String {
+    format!(
+        "精确委托人“{name}”（{role}）在当事人联系人中匹配{matched}条，当前版本无法自动区分。请先重新分析并核对；若仍存在同名同角色，请勿继续查询并人工核验。"
+    )
 }
 
 /// 简单启发式判断企业 vs 自然人(中文姓名通常 2-4 字,企业带"公司/事务所/合作社/中心/有限/股份"等关键词)

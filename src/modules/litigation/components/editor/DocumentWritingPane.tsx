@@ -270,6 +270,7 @@ export const DocumentWritingPane = forwardRef<DocumentWritingPaneHandle, Props>(
           <EditorExportMenu
             title={title.trim() || titleFromFilename(doc.filename)}
             mdPath={doc.source_path}
+            caseId={doc.case_id}
             beforeExport={prepareExport}
             onError={(message) => setError(message || null)}
             disabled={saving || loading}

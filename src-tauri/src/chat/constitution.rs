@@ -91,8 +91,9 @@ pub const CONSTITUTION_HEADER: &str = "# 案件 AI 助手宪法\n\n\
 - `submission_stage`:判断是否随诉状/答辩状提交、补充提交、二审新证据或待确认。\n\
 不要把传票、开庭通知、法院文书、程序材料、参考材料、AI 产物当作我方证据目录或质证主语料;确需引用时只作程序背景或旁证并说明理由。\n\n\
 ## 第七条 站对我方立场(分析 / 对抗 / 检索 / 写作通用)\n\
-案件快照【当事人】里有「我方代理立场」(原告方 / 被告方 / 第三人)和每个当事人的 [我方]/[对方] 标记。\n\
-**冲突裁决:以案件级「我方代理立场」为准**——律师刚改过立场、当事人 [我方]/[对方] 标记或案件报告可能还是旧的(需「重新分析」才同步),二者矛盾时一律信案件级那一行,别被个别旧标记带偏。\n\
+案件快照【当事人】里有「我方代理立场」(原告方 / 被告方 / 第三人)、可能存在的「我方具体委托人」，以及每个当事人的标记。\n\
+**冲突裁决:精确人工名单最高优先级**——有「我方具体委托人」时，只把标为 [我方委托人] 的精确名单当作客户；同阵营的 [非我方委托人] 不是我方客户。精确人工名单优先于案件级粗立场、聚合 `is_our_side` 和案件报告中的旧标记，绝不因同阵营或陈旧 AI 数据扩大客户范围。\n\
+没有精确名单的旧案件，才以案件级「我方代理立场」为准——律师刚改过立场、当事人 [我方]/[对方] 标记或案件报告可能还是旧的(需「重新分析」才同步),二者矛盾时一律信案件级那一行，别被个别旧标记带偏。\n\
 **一切分析、对抗推演、类案检索的支持度判断、文书写作,都要站在我方立场、服务我方**:\n\
 - 我方=原告方 → 论证我方诉请成立、举证到位,预判并击破对方抗辩;\n\
 - 我方=被告方 → 找对方诉请的法律/证据缺陷、组织我方抗辩、用举证责任分配为我方争取,**不要替对方论证其请求成立**;\n\
@@ -130,7 +131,7 @@ pub fn build_system_prompt(
     docs: &[Document],
     attached_ids: &[String],
     editing_doc_id: Option<&str>,
-) -> String {
+) -> Result<String, String> {
     build_system_prompt_with_memory(case, docs, attached_ids, editing_doc_id, None, &[], &[])
 }
 
@@ -181,8 +182,8 @@ pub fn build_system_prompt_with_memory(
     ai_soul_md: Option<&str>,
     global_memories: &[String],
     case_memories: &[String],
-) -> String {
-    let snapshot = case_snapshot_md(case);
+) -> Result<String, String> {
+    let snapshot = case_snapshot_md(case)?;
     // V0.2.2 · AI 生成的摘要/报告 artifact 不进「本案文档材料」清单 —— 否则 LLM 会把自己
     // 之前的输出当原始材料引用(循环自证、污染依据)。用户在引用弹窗显式选的仍保留。
     // 2026-05-31 三档抽取改版:进 system prompt 的「本案文档材料」排除两类(除非用户显式引用):
@@ -294,7 +295,7 @@ pub fn build_system_prompt_with_memory(
         }
     }
 
-    sys
+    Ok(sys)
 }
 
 /// 估算 system prompt 的 char 数。给 commands.rs 在反馈 MD 写「prompt_tokens_est」用。

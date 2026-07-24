@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
+import type { WordTemplate } from "@/lib/api";
+
 import type {
   AddAiWorkspaceSourcesResult,
   AiWorkspaceChatInput,
@@ -10,6 +12,8 @@ import type {
   AiWorkspaceDocument,
   AiWorkspaceDocumentProposal,
   AiWorkspaceDocumentVersion,
+  AiWorkspaceExportPaths,
+  AiWorkspaceExportRefreshResult,
   AiWorkspaceMessage,
   AiWorkspaceTask,
   CreateAiWorkspaceArtifactInput,
@@ -161,6 +165,42 @@ export function listAiWorkspaceDocuments(
   return invoke<AiWorkspaceDocument[]>("list_ai_workspace_documents", {
     workspaceId,
   });
+}
+
+export function getAiWorkspaceExportPaths(
+  workspaceId: string,
+  documentId: string,
+): Promise<AiWorkspaceExportPaths> {
+  return invoke<AiWorkspaceExportPaths>("get_ai_workspace_export_paths", {
+    workspaceId,
+    documentId,
+  });
+}
+
+export function recordAiWorkspaceExportPath(
+  workspaceId: string,
+  documentId: string,
+  format: "docx" | "html",
+  path: string,
+  wordTemplate?: WordTemplate,
+): Promise<void> {
+  return invoke<void>("record_ai_workspace_export_path", {
+    workspaceId,
+    documentId,
+    format,
+    path,
+    wordTemplate,
+  });
+}
+
+export function refreshAiWorkspaceExports(
+  workspaceId: string,
+  documentId: string,
+): Promise<AiWorkspaceExportRefreshResult> {
+  return invoke<AiWorkspaceExportRefreshResult>(
+    "refresh_ai_workspace_exports",
+    { workspaceId, documentId },
+  );
 }
 
 export function retryAiWorkspaceSource(

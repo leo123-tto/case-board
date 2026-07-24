@@ -11,8 +11,11 @@
 //!   - `case_snapshot_md`:案件聚合字段 → 「案件信息卡」MD
 //!   - `lightweight_docs_md`:文档清单的轻量摘要(filename + category + extracted_fields)
 
-use crate::db::cases::Case;
 use crate::db::documents::Document;
+use crate::db::{
+    case_representation::{effective_representation, CaseRepresentation},
+    cases::Case,
+};
 use serde_json::Value;
 
 // =============================================================================
@@ -98,7 +101,17 @@ const PER_DOC_LIGHT_CHAR_LIMIT: usize = 600;
 /// 把 case.agg_* 字段拼成 MD 段(给 LLM 看的"案件信息卡")。
 ///
 /// V0.2 D4-D5 起,`chat::constitution::build_system_prompt` 也复用本函数 — 因此 `pub(crate)`。
-pub(crate) fn case_snapshot_md(case: &Case) -> String {
+pub(crate) fn case_snapshot_md(case: &Case) -> Result<String, String> {
+    // 精确委托人是律师手工确认的权威状态。损坏时必须让调用方可见，绝不能悄悄
+    // 回退成“代理整方”，否则会把同阵营的非委托人误当客户。
+    let representation = effective_representation(
+        case.user_overrides_json.as_deref(),
+        case.agg_our_side.as_deref(),
+    )
+    .map_err(|error| format!("案件精确委托人状态无效: {error}"))?;
+    let explicit_representation = representation
+        .as_ref()
+        .filter(|representation| !representation.parties.is_empty());
     let override_value = case
         .user_overrides_json
         .as_deref()
@@ -196,16 +209,28 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
         .filter(|s| !s.is_empty());
     let user_side = crate::db::cases::user_override_our_side(case.user_overrides_json.as_deref());
     let side_was_overridden = fields.is_some_and(|fields| fields.contains_key("agg_our_side"));
-    let effective_side = if side_was_overridden {
+    let effective_side = if let Some(representation) = explicit_representation {
+        Some(representation.side.as_str())
+    } else if side_was_overridden {
         user_side.as_deref()
     } else {
         user_side.as_deref().or(llm_side)
     };
     match effective_side {
         Some(side) => {
+            if let Some(representation) = explicit_representation {
+                push_kv(&mut s, "我方代理立场", Some(side));
+                let names = representation
+                    .parties
+                    .iter()
+                    .map(|party| party.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、");
+                push_kv(&mut s, "我方具体委托人", Some(&names));
+                s.push_str("- 同阵营其他当事人不是我方委托人。\n");
             // 律师改过立场、但 LLM 值(及每个当事人 is_our_side 标记)还没经「重新分析」同步时,
             // 二者会冲突 → 明确以案件级确认值为准,消除 AI 站反风险(advisor 命门:override 未重抽窗口)。
-            if user_side.is_some() && user_side.as_deref() != llm_side {
+            } else if user_side.is_some() && user_side.as_deref() != llm_side {
                 s.push_str(&format!(
                     "- 我方代理立场: {}(律师已确认,**与下方个别当事人 [我方]/[对方] 标记或案件报告冲突时一律以此为准**;旧标记/旧报告需「重新分析」后才同步)\n",
                     side
@@ -225,7 +250,7 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
 
     // 联系人(简略)
     if let Some(party_json) = &case.agg_party_contacts {
-        let summary = summarize_party_contacts(party_json);
+        let summary = summarize_party_contacts(party_json, explicit_representation)?;
         if !summary.is_empty() {
             s.push_str(&format!("- 当事人联系人:\n{}\n", indent_block(&summary, 2)));
         }
@@ -303,7 +328,7 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
         }
     }
 
-    s
+    Ok(s)
 }
 
 fn override_str<'a>(
@@ -367,24 +392,70 @@ fn format_amount(amount: f64) -> String {
     }
 }
 
-fn summarize_party_contacts(json: &str) -> String {
+fn summarize_party_contacts(
+    json: &str,
+    representation: Option<&CaseRepresentation>,
+) -> Result<String, String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
-        return String::new();
+        return Ok(String::new());
     };
     let Some(arr) = v.as_array() else {
-        return String::new();
+        return Ok(String::new());
     };
+    if let Some(representation) = representation {
+        for represented in &representation.parties {
+            let matched = arr
+                .iter()
+                .filter(|item| {
+                    item.get("name")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|name| name.trim() == represented.name.trim())
+                        && item
+                            .get("role")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|role| role.trim() == represented.role.trim())
+                })
+                .count();
+            if matched != 1 {
+                return Err(format!(
+                    "精确委托人“{}”（{}）在当事人联系人中匹配{}条，当前版本无法自动区分。请先重新分析并核对；若仍存在同名同角色，请人工核验",
+                    represented.name, represented.role, matched
+                ));
+            }
+        }
+    }
     let mut out = String::new();
     for item in arr {
         let name = item.get("name").and_then(|x| x.as_str()).unwrap_or("");
         let role = item.get("role").and_then(|x| x.as_str()).unwrap_or("");
         let phone = item.get("phone").and_then(|x| x.as_str()).unwrap_or("");
         let aliases = item.get("aliases").and_then(|x| x.as_array());
-        // 2026-06-13:把 is_our_side 标出来(此前读了却丢弃 → AI 看不到谁是我方,各 chip 只能瞎猜)。
-        let side = match item.get("is_our_side").and_then(|x| x.as_bool()) {
-            Some(true) => " [我方]",
-            Some(false) => " [对方]",
-            None => "",
+        // 精确委托人已确认时，不能再信陈旧的 AI `is_our_side`：同阵营内只有
+        // 精确名单是我方客户，其它同阵营人员必须明确标为非我方委托人。
+        let side = match representation {
+            Some(representation)
+                if representation
+                    .parties
+                    .iter()
+                    .any(|party| party.role == role) =>
+            {
+                if representation
+                    .parties
+                    .iter()
+                    .any(|party| party.role == role && party.name.trim() == name.trim())
+                {
+                    " [我方委托人]"
+                } else {
+                    " [非我方委托人]"
+                }
+            }
+            Some(_) => " [对方]",
+            // 旧案件尚未确认精确名单时，继续使用既有的 AI 标记。
+            None => match item.get("is_our_side").and_then(|x| x.as_bool()) {
+                Some(true) => " [我方]",
+                Some(false) => " [对方]",
+                None => "",
+            },
         };
         if name.is_empty() && role.is_empty() {
             continue;
@@ -404,7 +475,7 @@ fn summarize_party_contacts(json: &str) -> String {
         }
         out.push('\n');
     }
-    out
+    Ok(out)
 }
 
 fn summarize_court_contacts(json: &str) -> String {

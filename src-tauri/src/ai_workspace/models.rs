@@ -47,6 +47,26 @@ pub struct SourceAddError {
 pub struct AddAiWorkspaceSourcesResult {
     pub added: Vec<AiWorkspaceDocument>,
     pub errors: Vec<SourceAddError>,
+    pub preferred_export_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiWorkspaceExportWrite {
+    pub format: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiWorkspaceExportWriteError {
+    pub format: String,
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiWorkspaceExportRefreshResult {
+    pub written: Vec<AiWorkspaceExportWrite>,
+    pub errors: Vec<AiWorkspaceExportWriteError>,
 }
 
 #[derive(Debug, Clone, Serialize)]

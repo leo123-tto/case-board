@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::models::{
     AddAiWorkspaceSourcesResult, AiWorkspaceArtifactContent, AiWorkspaceDocumentProgress,
+    AiWorkspaceExportRefreshResult, AiWorkspaceExportWrite, AiWorkspaceExportWriteError,
     CreateAiWorkspaceArtifactInput, CreateAiWorkspaceArtifactVersionInput, CreateAiWorkspaceInput,
     ListAiWorkspacesInput, SaveAiWorkspaceArtifactInput, SourceAddError, UpdateAiWorkspaceInput,
     WorkspaceListView,
@@ -18,6 +19,7 @@ use crate::db::ai_workspace_chat::{
     self, AiWorkspaceConversation, AiWorkspaceMessage, AiWorkspaceTask,
 };
 use crate::db::ai_workspace_documents::{self, AiWorkspaceDocument};
+use crate::db::ai_workspace_local_exports::{self, AiWorkspaceExportPaths};
 use crate::db::ai_workspace_proposals::{self, AiWorkspaceDocumentProposal};
 use crate::db::ai_workspaces::{self, AiWorkspace, AiWorkspaceSummary};
 use crate::ingest::ocr::OcrContext;
@@ -285,6 +287,140 @@ fn canonical_source(path: &str) -> Result<(PathBuf, std::fs::Metadata), String> 
     Ok((canonical, metadata))
 }
 
+#[derive(Debug, Default)]
+struct CollectedWorkspaceSources {
+    files: Vec<PathBuf>,
+    errors: Vec<SourceAddError>,
+    preferred_export_dir: Option<PathBuf>,
+}
+
+fn workspace_source_extension_supported(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some(
+            "md" | "markdown"
+                | "txt"
+                | "html"
+                | "htm"
+                | "docx"
+                | "doc"
+                | "rtf"
+                | "odt"
+                | "ppt"
+                | "pptx"
+                | "xls"
+                | "xlsx"
+                | "pdf"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "webp"
+                | "bmp"
+                | "tiff"
+                | "tif"
+        )
+    )
+}
+
+fn hidden_path_entry(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+fn collect_directory_files(
+    directory: &Path,
+    files: &mut Vec<PathBuf>,
+    errors: &mut Vec<SourceAddError>,
+) {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            errors.push(SourceAddError {
+                path: directory.to_string_lossy().into_owned(),
+                error: format!("无法读取材料文件夹: {error}"),
+            });
+            return;
+        }
+    };
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::path);
+    for entry in entries {
+        let path = entry.path();
+        if hidden_path_entry(&path) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                errors.push(SourceAddError {
+                    path: path.to_string_lossy().into_owned(),
+                    error: format!("无法读取材料类型: {error}"),
+                });
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_directory_files(&path, files, errors);
+        } else if file_type.is_file() && workspace_source_extension_supported(&path) {
+            match path.canonicalize() {
+                Ok(canonical) => files.push(canonical),
+                Err(error) => errors.push(SourceAddError {
+                    path: path.to_string_lossy().into_owned(),
+                    error: format!("无法解析材料路径: {error}"),
+                }),
+            }
+        }
+    }
+}
+
+fn collect_workspace_source_paths(paths: Vec<String>) -> CollectedWorkspaceSources {
+    let mut collected = CollectedWorkspaceSources::default();
+    for source_path in paths {
+        let path = Path::new(&source_path);
+        let canonical = match path.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(_) => {
+                collected.errors.push(SourceAddError {
+                    path: source_path,
+                    error: "所选路径不是可读取文件".to_string(),
+                });
+                continue;
+            }
+        };
+        if canonical.is_file() {
+            collected.files.push(canonical);
+            continue;
+        }
+        if !canonical.is_dir() {
+            collected.errors.push(SourceAddError {
+                path: source_path,
+                error: "所选路径不是可读取文件或文件夹".to_string(),
+            });
+            continue;
+        }
+        let before = collected.files.len();
+        collect_directory_files(&canonical, &mut collected.files, &mut collected.errors);
+        if collected.files.len() > before {
+            collected.preferred_export_dir = Some(canonical);
+        } else {
+            collected.errors.push(SourceAddError {
+                path: source_path,
+                error: "文件夹中没有支持的材料文件".to_string(),
+            });
+        }
+    }
+    collected.files.sort();
+    collected.files.dedup();
+    collected
+}
+
 fn mime_type_for(path: &Path) -> Option<&'static str> {
     match path
         .extension()
@@ -321,11 +457,14 @@ pub(crate) async fn add_ai_workspace_sources_impl(
     paths: Vec<String>,
 ) -> Result<AddAiWorkspaceSourcesResult, String> {
     ensure_workspace_exists(pool, workspace_id).await?;
+    let collected = collect_workspace_source_paths(paths);
     let mut added = Vec::new();
-    let mut errors = Vec::new();
-    for source_path in paths {
+    let mut errors = collected.errors;
+    for canonical in collected.files {
+        let source_path = canonical.to_string_lossy().into_owned();
         let result = async {
-            let (canonical, metadata) = canonical_source(&source_path)?;
+            let metadata = std::fs::metadata(&canonical)
+                .map_err(|error| format!("无法读取材料信息: {error}"))?;
             let filename = canonical
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -358,7 +497,147 @@ pub(crate) async fn add_ai_workspace_sources_impl(
             }),
         }
     }
-    Ok(AddAiWorkspaceSourcesResult { added, errors })
+    let preferred_export_dir = collected
+        .preferred_export_dir
+        .filter(|directory| {
+            added.iter().any(|document| {
+                document
+                    .source_path
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).starts_with(directory))
+            })
+        })
+        .map(|directory| directory.to_string_lossy().into_owned());
+    if let Some(directory) = preferred_export_dir.as_deref() {
+        if let Err(error) =
+            ai_workspace_local_exports::set_preferred_export_dir(pool, workspace_id, directory)
+                .await
+        {
+            errors.push(SourceAddError {
+                path: directory.to_string(),
+                error: format!("记录默认导出文件夹失败: {error}"),
+            });
+        }
+    }
+    Ok(AddAiWorkspaceSourcesResult {
+        added,
+        errors,
+        preferred_export_dir,
+    })
+}
+
+pub(crate) async fn get_ai_workspace_export_paths_impl(
+    pool: &SqlitePool,
+    workspace_id: &str,
+    document_id: &str,
+) -> Result<AiWorkspaceExportPaths, String> {
+    ensure_workspace_exists(pool, workspace_id).await?;
+    let mut paths = ai_workspace_local_exports::get_export_paths(pool, workspace_id, document_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if paths
+        .preferred_export_dir
+        .as_deref()
+        .is_some_and(|path| !Path::new(path).is_dir())
+    {
+        paths.preferred_export_dir = None;
+    }
+    Ok(paths)
+}
+
+pub(crate) async fn record_ai_workspace_export_path_impl(
+    pool: &SqlitePool,
+    workspace_id: &str,
+    document_id: &str,
+    format: &str,
+    path: &str,
+) -> Result<(), String> {
+    record_ai_workspace_export_path_with_template_impl(
+        pool,
+        workspace_id,
+        document_id,
+        format,
+        path,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn record_ai_workspace_export_path_with_template_impl(
+    pool: &SqlitePool,
+    workspace_id: &str,
+    document_id: &str,
+    format: &str,
+    path: &str,
+    word_template: Option<&str>,
+) -> Result<(), String> {
+    ensure_workspace_exists(pool, workspace_id).await?;
+    let canonical = Path::new(path)
+        .canonicalize()
+        .map_err(|error| format!("无法确认导出文件路径: {error}"))?;
+    if !canonical.is_file() {
+        return Err("导出路径不是可读取文件".to_string());
+    }
+    ai_workspace_local_exports::record_export_path_with_template(
+        pool,
+        workspace_id,
+        document_id,
+        format,
+        canonical.to_string_lossy().as_ref(),
+        word_template,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn refresh_ai_workspace_exports_impl(
+    pool: &SqlitePool,
+    workspace_id: &str,
+    document_id: &str,
+) -> Result<AiWorkspaceExportRefreshResult, String> {
+    ensure_workspace_exists(pool, workspace_id).await?;
+    let document = scoped_document(pool, workspace_id, document_id).await?;
+    if document.kind != "artifact" {
+        return Err("只有 AI 文稿可以更新导出文件".to_string());
+    }
+    let content_path = document
+        .content_path
+        .as_deref()
+        .ok_or_else(|| "文稿没有内部 Markdown 路径".to_string())?;
+    let records = ai_workspace_local_exports::list_export_records(pool, workspace_id, document_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut written = Vec::new();
+    let mut errors = Vec::new();
+    for record in records {
+        let header_inputs =
+            if record.format == "docx" && record.word_template.as_deref() == Some("legal_filing") {
+                crate::export::load_editor_header_inputs(pool, &document.title, None).await?
+            } else {
+                crate::docx_filing::HeaderInputs::default()
+            };
+        match crate::export::export_editor_document_with_template_to(
+            Path::new(content_path),
+            &document.title,
+            &record.format,
+            Path::new(&record.export_path),
+            record.word_template.as_deref(),
+            &header_inputs,
+        )
+        .await
+        {
+            Ok(output) => written.push(AiWorkspaceExportWrite {
+                format: record.format,
+                path: output.to_string_lossy().into_owned(),
+            }),
+            Err(error) => errors.push(AiWorkspaceExportWriteError {
+                format: record.format,
+                path: record.export_path,
+                error,
+            }),
+        }
+    }
+    Ok(AiWorkspaceExportRefreshResult { written, errors })
 }
 
 async fn scoped_document(
@@ -975,6 +1254,58 @@ pub async fn list_ai_workspace_documents(
     ai_workspace_documents::list_documents(pool.inner(), &workspace_id)
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_ai_workspace_export_paths(
+    pool: State<'_, SqlitePool>,
+    workspace_id: String,
+    document_id: String,
+) -> Result<AiWorkspaceExportPaths, String> {
+    get_ai_workspace_export_paths_impl(pool.inner(), &workspace_id, &document_id).await
+}
+
+#[tauri::command]
+pub async fn record_ai_workspace_export_path(
+    pool: State<'_, SqlitePool>,
+    workspace_id: String,
+    document_id: String,
+    format: String,
+    path: String,
+    word_template: Option<String>,
+) -> Result<(), String> {
+    match word_template.as_deref() {
+        Some(template) => {
+            record_ai_workspace_export_path_with_template_impl(
+                pool.inner(),
+                &workspace_id,
+                &document_id,
+                &format,
+                &path,
+                Some(template),
+            )
+            .await
+        }
+        None => {
+            record_ai_workspace_export_path_impl(
+                pool.inner(),
+                &workspace_id,
+                &document_id,
+                &format,
+                &path,
+            )
+            .await
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn refresh_ai_workspace_exports(
+    pool: State<'_, SqlitePool>,
+    workspace_id: String,
+    document_id: String,
+) -> Result<AiWorkspaceExportRefreshResult, String> {
+    refresh_ai_workspace_exports_impl(pool.inner(), &workspace_id, &document_id).await
 }
 
 #[tauri::command]

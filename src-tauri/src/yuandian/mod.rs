@@ -9,6 +9,7 @@
 //! 申请 key:https://open.chineselaw.com/
 //! 不入 git;落 settings.json 本地保存。
 
+pub(crate) mod artifact_binding;
 pub mod balance;
 pub mod deep_dive;
 pub mod full_report;

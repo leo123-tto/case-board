@@ -36,9 +36,11 @@
 //!
 //! 容器骨架(`[Content_Types]`/`_rels`/`styles`/`settings`/`sectPr`)取自真实样本,换取 Word 有效性。
 
-use std::io::Write;
+use std::io::{Read, Write};
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use quick_xml::events::Event as XmlEvent;
+use quick_xml::Reader as XmlReader;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -107,6 +109,69 @@ pub enum Profile {
     Editor,
 }
 
+/// 编辑器 Word 导出的稳定模板标识。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum WordTemplate {
+    /// 保持 Milkdown 编辑器当前排版，也是缺省行为。
+    #[default]
+    Editor,
+    /// 法律文书固定排版。
+    LegalFiling,
+}
+
+impl WordTemplate {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "editor" => Ok(Self::Editor),
+            "legal_filing" => Ok(Self::LegalFiling),
+            _ => Err("Word 模板仅支持 editor 或 legal_filing".to_string()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Editor => "editor",
+            Self::LegalFiling => "legal_filing",
+        }
+    }
+}
+
+/// 法律文书页眉所需的可信本地字段。调用方只能用后端查询结果构造。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeaderInputs {
+    pub law_firm: Option<String>,
+    pub document_title: Option<String>,
+    pub case_name: Option<String>,
+    pub case_no: Option<String>,
+}
+
+impl HeaderInputs {
+    fn lines(&self) -> Vec<String> {
+        let clean = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let mut lines = Vec::with_capacity(2);
+        if let Some(law_firm) = clean(&self.law_firm) {
+            lines.push(law_firm);
+        }
+        let case_line = [clean(&self.case_name), clean(&self.case_no)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if !case_line.is_empty() {
+            lines.push(case_line);
+        } else if let Some(document_title) = clean(&self.document_title) {
+            lines.push(document_title);
+        }
+        lines
+    }
+}
+
 struct Run {
     text: String,
     bold: bool,
@@ -151,6 +216,21 @@ fn xml_escape(s: &str) -> String {
         }
     }
     out
+}
+
+fn validate_xml_1_0_text(context: &str, value: &str) -> Result<(), String> {
+    if let Some(ch) = value.chars().find(|ch| {
+        !matches!(
+            *ch as u32,
+            0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+        )
+    }) {
+        return Err(format!(
+            "OOXML {context}包含 XML 1.0 非法字符 U+{:04X}",
+            ch as u32
+        ));
+    }
+    Ok(())
 }
 
 /// 把中文语境里的半角标点规范化为全角(导出 Word 时静默执行,借鉴开源「文格」audit_text 的自动版)。
@@ -611,6 +691,16 @@ fn render_preformatted(text: &str) -> String {
 
 /// 生成完整的 `word/document.xml`。`pub(crate)` 供测试做结构断言。
 pub(crate) fn render_document_xml(title: &str, body_md: &str, profile: Profile) -> String {
+    render_document_xml_with_references(title, body_md, profile, None, None)
+}
+
+fn render_document_xml_with_references(
+    title: &str,
+    body_md: &str,
+    profile: Profile,
+    header_relationship: Option<&str>,
+    footer_relationship: Option<&str>,
+) -> String {
     let mut blocks = parse_blocks(body_md, profile);
 
     // 去重:若正文首块是与 title 同名的标题,丢掉(LLM 常在正文重复写标题)
@@ -658,12 +748,32 @@ pub(crate) fn render_document_xml(title: &str, body_md: &str, profile: Profile) 
         body.push_str("<w:p/>");
     }
 
+    let sect = render_sectpr(header_relationship, footer_relationship);
     format!(
         "{decl}{open}<w:body>{body}{sect}</w:body></w:document>",
         decl = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
         open = DOC_OPEN,
         body = body,
-        sect = SECTPR,
+        sect = sect,
+    )
+}
+
+fn render_sectpr(header_relationship: Option<&str>, footer_relationship: Option<&str>) -> String {
+    let mut references = String::new();
+    if let Some(relationship) = header_relationship {
+        references.push_str(&format!(
+            r#"<w:headerReference w:type="default" r:id="{}"/>"#,
+            xml_escape(relationship)
+        ));
+    }
+    if let Some(relationship) = footer_relationship {
+        references.push_str(&format!(
+            r#"<w:footerReference w:type="default" r:id="{}"/>"#,
+            xml_escape(relationship)
+        ));
+    }
+    format!(
+        r#"<w:sectPr>{references}<w:pgSz w:w="11906" w:h="16838" w:orient="portrait"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/><w:docGrid w:linePitch="360"/></w:sectPr>"#
     )
 }
 
@@ -672,24 +782,73 @@ pub(crate) fn render_document_xml(title: &str, body_md: &str, profile: Profile) 
 /// 法律文书档:base + 法律叠加(列表去圆点 / 软换行并段 / 不渲染分隔线)。
 /// 排版本身(方正小标宋居中标题 / 黑体小标题 / 仿宋正文 / 首行缩进 / 两端对齐 / 1.5 行距)与 base 一致。
 pub fn build_filing_docx_bytes(title: &str, body_md: &str) -> Result<Vec<u8>, String> {
-    build_docx_bytes(title, body_md, Profile::Filing)
+    build_docx_bytes(
+        title,
+        body_md,
+        Profile::Filing,
+        Some(&HeaderInputs::default()),
+    )
 }
 
 /// 通用报告档:忠实 MD 渲染(无序列表带圆点 / 嵌套缩进 / 分隔线 / 保留结构)。
 /// 案件分析报告、风险/深挖报告、通用 MD 导出走这条(替代旧的 textutil HTML 路径)。
 pub fn build_report_docx_bytes(title: &str, body_md: &str) -> Result<Vec<u8>, String> {
-    build_docx_bytes(title, body_md, Profile::Base)
+    build_docx_bytes(title, body_md, Profile::Base, None)
 }
 
 /// Milkdown 可视编辑器导出档：保留编辑器的标题层级、正文字号/行距、
 /// 列表、表格、加粗/斜体和预格式块，与报告档和法律文书档相互隔离。
 pub fn build_editor_docx_bytes(title: &str, body_md: &str) -> Result<Vec<u8>, String> {
-    build_docx_bytes(title, body_md, Profile::Editor)
+    build_docx_bytes(title, body_md, Profile::Editor, None)
 }
 
-/// 把 (标题, 正文 MD, 档位) 打包成完整 .docx 字节流。纯函数,便于测试。
-fn build_docx_bytes(title: &str, body_md: &str, profile: Profile) -> Result<Vec<u8>, String> {
-    let document_xml = render_document_xml(title, body_md, profile);
+/// 编辑器统一 Word 导出的模板感知入口。旧的 [`build_editor_docx_bytes`] 保持 Editor 默认。
+pub fn build_editor_document_docx_bytes(
+    title: &str,
+    body_md: &str,
+    template: WordTemplate,
+    header_inputs: &HeaderInputs,
+) -> Result<Vec<u8>, String> {
+    match template {
+        WordTemplate::Editor => build_docx_bytes(title, body_md, Profile::Editor, None),
+        WordTemplate::LegalFiling => {
+            build_docx_bytes(title, body_md, Profile::Filing, Some(header_inputs))
+        }
+    }
+}
+
+/// 把 (标题, 正文 MD, 档位) 打包成完整 .docx 字节流。`legal_header_inputs`
+/// 为 `Some` 时才注册法律模板页眉/页脚部件。
+fn build_docx_bytes(
+    title: &str,
+    body_md: &str,
+    profile: Profile,
+    legal_header_inputs: Option<&HeaderInputs>,
+) -> Result<Vec<u8>, String> {
+    validate_xml_1_0_text("标题", title)?;
+    validate_xml_1_0_text("正文", body_md)?;
+    let header_lines = legal_header_inputs
+        .map(HeaderInputs::lines)
+        .unwrap_or_default();
+    for line in &header_lines {
+        validate_xml_1_0_text("页眉", line)?;
+    }
+    let header_xml = (!header_lines.is_empty()).then(|| render_header_xml(&header_lines));
+    let legal_template = legal_header_inputs.is_some();
+    let document_xml = if legal_template {
+        render_document_xml_with_references(
+            title,
+            body_md,
+            profile,
+            header_xml.as_ref().map(|_| "rId4"),
+            Some("rId5"),
+        )
+    } else {
+        render_document_xml(title, body_md, profile)
+    };
+    let content_types = render_content_types(legal_template, header_xml.is_some());
+    let document_rels = render_document_relationships(legal_template, header_xml.is_some());
+    let settings_xml = render_settings_xml(legal_template);
     let mut buf = Vec::new();
     {
         let cursor = std::io::Cursor::new(&mut buf);
@@ -702,16 +861,365 @@ fn build_docx_bytes(title: &str, body_md: &str, profile: Profile) -> Result<Vec<
                 .map_err(|e| format!("zip write {} 失败:{}", name, e))?;
             Ok(())
         };
-        put("[Content_Types].xml", CONTENT_TYPES)?;
+        put("[Content_Types].xml", &content_types)?;
         put("_rels/.rels", RELS_DOTRELS)?;
-        put("word/_rels/document.xml.rels", DOCUMENT_RELS)?;
+        put("word/_rels/document.xml.rels", &document_rels)?;
         put("word/styles.xml", STYLES_XML)?;
-        put("word/settings.xml", SETTINGS_XML)?;
+        put("word/settings.xml", &settings_xml)?;
         put("word/fontTable.xml", FONT_TABLE_XML)?;
         put("word/document.xml", &document_xml)?;
+        if let Some(header_xml) = header_xml.as_deref() {
+            put("word/header1.xml", header_xml)?;
+        }
+        if legal_template {
+            put("word/footer1.xml", &render_footer_xml())?;
+        }
         zip.finish().map_err(|e| format!("zip finish 失败:{}", e))?;
     }
+    if legal_header_inputs.is_some() {
+        validate_template_docx(&buf, WordTemplate::LegalFiling, !header_lines.is_empty())?;
+    } else {
+        validate_template_docx(&buf, WordTemplate::Editor, false)?;
+    }
     Ok(buf)
+}
+
+fn render_header_xml(lines: &[String]) -> String {
+    let mut body = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        let border = if index + 1 == lines.len() {
+            r#"<w:pBdr><w:bottom w:val="single" w:sz="6" w:space="4" w:color="808080"/></w:pBdr>"#
+        } else {
+            ""
+        };
+        body.push_str(&format!(
+            r#"<w:p><w:pPr>{border}<w:spacing w:after="80"/><w:jc w:val="center"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Times New Roman" w:eastAsia="仿宋_GB2312"/><w:sz w:val="18"/><w:szCs w:val="18"/></w:rPr><w:t xml:space="preserve">{text}</w:t></w:r></w:p>"#,
+            text = xml_escape(line)
+        ));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{body}</w:hdr>"#
+    )
+}
+
+fn render_page_field(instruction: &str) -> String {
+    format!(
+        r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> {instruction} </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#
+    )
+}
+
+fn render_footer_xml() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:ftr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>第 </w:t></w:r>{page}<w:r><w:t> 页 / 共 </w:t></w:r>{pages}<w:r><w:t> 页</w:t></w:r></w:p></w:ftr>"#,
+        page = render_page_field("PAGE"),
+        pages = render_page_field("NUMPAGES")
+    )
+}
+
+fn render_content_types(legal_template: bool, has_header: bool) -> String {
+    let mut xml = CONTENT_TYPES
+        .strip_suffix("</Types>")
+        .expect("content types skeleton must end with Types")
+        .to_string();
+    if has_header {
+        xml.push_str(r#"<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>"#);
+    }
+    if legal_template {
+        xml.push_str(r#"<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>"#);
+    }
+    xml.push_str("</Types>");
+    xml
+}
+
+fn render_document_relationships(legal_template: bool, has_header: bool) -> String {
+    let mut xml = DOCUMENT_RELS
+        .strip_suffix("</Relationships>")
+        .expect("relationship skeleton must end with Relationships")
+        .to_string();
+    if has_header {
+        xml.push_str(r#"<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>"#);
+    }
+    if legal_template {
+        xml.push_str(r#"<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>"#);
+    }
+    xml.push_str("</Relationships>");
+    xml
+}
+
+fn render_settings_xml(legal_template: bool) -> String {
+    if !legal_template {
+        return SETTINGS_XML.to_string();
+    }
+    SETTINGS_XML.replacen(
+        "<w:compat>",
+        r#"<w:updateFields w:val="true"/><w:compat>"#,
+        1,
+    )
+}
+
+fn read_docx_entry(bytes: &[u8], name: &str) -> Result<String, String> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|error| format!("docx ZIP 无效:{error}"))?;
+    let mut entry = archive
+        .by_name(name)
+        .map_err(|error| format!("docx 缺少 {name}:{error}"))?;
+    let mut output = String::new();
+    entry
+        .read_to_string(&mut output)
+        .map_err(|error| format!("读取 docx 部件 {name} 失败:{error}"))?;
+    Ok(output)
+}
+
+fn docx_has_entry(bytes: &[u8], name: &str) -> Result<bool, String> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|error| format!("docx ZIP 无效:{error}"))?;
+    let exists = archive.by_name(name).is_ok();
+    Ok(exists)
+}
+
+fn validate_xml_part(part_name: &str, xml: &str, expected_root: &[u8]) -> Result<(), String> {
+    let mut reader = XmlReader::from_str(xml);
+    reader.config_mut().check_end_names = true;
+    let mut depth = 0usize;
+    let mut saw_root = false;
+    let mut root_closed = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(XmlEvent::Start(element)) => {
+                if depth == 0 {
+                    if saw_root {
+                        return Err(format!("OOXML {part_name} 包含多个根元素"));
+                    }
+                    if element.name().local_name().as_ref() != expected_root {
+                        return Err(format!("OOXML {part_name} 根元素无效"));
+                    }
+                    saw_root = true;
+                } else if root_closed {
+                    return Err(format!("OOXML {part_name} 根元素结束后仍有元素"));
+                }
+                depth += 1;
+            }
+            Ok(XmlEvent::Empty(element)) => {
+                if depth == 0 {
+                    if saw_root {
+                        return Err(format!("OOXML {part_name} 包含多个根元素"));
+                    }
+                    if element.name().local_name().as_ref() != expected_root {
+                        return Err(format!("OOXML {part_name} 根元素无效"));
+                    }
+                    saw_root = true;
+                    root_closed = true;
+                } else if root_closed {
+                    return Err(format!("OOXML {part_name} 根元素结束后仍有元素"));
+                }
+            }
+            Ok(XmlEvent::End(_)) => {
+                if depth == 0 {
+                    return Err(format!("OOXML {part_name} 包含多余结束标签"));
+                }
+                depth -= 1;
+                if depth == 0 {
+                    root_closed = true;
+                }
+            }
+            Ok(XmlEvent::Text(text)) => {
+                let raw: &[u8] = text.as_ref();
+                if depth == 0 && raw.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    return Err(format!("OOXML {part_name} 根元素外包含文本"));
+                }
+            }
+            Ok(XmlEvent::CData(data)) => {
+                let raw: &[u8] = data.as_ref();
+                if depth == 0 && !raw.is_empty() {
+                    return Err(format!("OOXML {part_name} 根元素外包含 CDATA"));
+                }
+            }
+            Ok(XmlEvent::Eof) => {
+                if !saw_root || depth != 0 || !root_closed {
+                    return Err(format!("OOXML {part_name} XML 结构不完整"));
+                }
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(format!("OOXML {part_name} XML 解析失败:{error}"));
+            }
+        }
+    }
+}
+
+fn relationship_exists(
+    part_name: &str,
+    xml: &str,
+    expected_type: &str,
+    expected_target: &str,
+) -> Result<bool, String> {
+    let mut reader = XmlReader::from_str(xml);
+    reader.config_mut().check_end_names = true;
+
+    loop {
+        match reader.read_event() {
+            Ok(XmlEvent::Start(element)) | Ok(XmlEvent::Empty(element))
+                if element.name().local_name().as_ref() == b"Relationship" =>
+            {
+                let mut relationship_type = None;
+                let mut target = None;
+                for attribute in element.attributes() {
+                    let attribute = attribute
+                        .map_err(|error| format!("OOXML {part_name} 属性解析失败:{error}"))?;
+                    let value = attribute
+                        .decode_and_unescape_value(reader.decoder())
+                        .map_err(|error| format!("OOXML {part_name} 属性解码失败:{error}"))?;
+                    match attribute.key.local_name().as_ref() {
+                        b"Type" => relationship_type = Some(value.into_owned()),
+                        b"Target" => target = Some(value.into_owned()),
+                        _ => {}
+                    }
+                }
+                if relationship_type.as_deref() == Some(expected_type)
+                    && target.as_deref() == Some(expected_target)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(XmlEvent::Eof) => return Ok(false),
+            Ok(_) => {}
+            Err(error) => {
+                return Err(format!("OOXML {part_name} XML 解析失败:{error}"));
+            }
+        }
+    }
+}
+
+/// 只校验本生成器承诺的模板关键结构，不扫描任意用户内容。
+fn validate_template_docx(
+    bytes: &[u8],
+    template: WordTemplate,
+    expects_header: bool,
+) -> Result<(), String> {
+    let content_types = read_docx_entry(bytes, "[Content_Types].xml")?;
+    let root_relationships = read_docx_entry(bytes, "_rels/.rels")?;
+    let relationships = read_docx_entry(bytes, "word/_rels/document.xml.rels")?;
+    let document = read_docx_entry(bytes, "word/document.xml")?;
+    let styles = read_docx_entry(bytes, "word/styles.xml")?;
+    let settings = read_docx_entry(bytes, "word/settings.xml")?;
+    let font_table = read_docx_entry(bytes, "word/fontTable.xml")?;
+    for (part_name, xml, expected_root) in [
+        (
+            "[Content_Types].xml",
+            content_types.as_str(),
+            b"Types".as_slice(),
+        ),
+        (
+            "_rels/.rels",
+            root_relationships.as_str(),
+            b"Relationships".as_slice(),
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            relationships.as_str(),
+            b"Relationships".as_slice(),
+        ),
+        (
+            "word/document.xml",
+            document.as_str(),
+            b"document".as_slice(),
+        ),
+        ("word/styles.xml", styles.as_str(), b"styles".as_slice()),
+        (
+            "word/settings.xml",
+            settings.as_str(),
+            b"settings".as_slice(),
+        ),
+        (
+            "word/fontTable.xml",
+            font_table.as_str(),
+            b"fonts".as_slice(),
+        ),
+    ] {
+        validate_xml_part(part_name, xml, expected_root)?;
+    }
+    if !relationship_exists(
+        "_rels/.rels",
+        &root_relationships,
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+        "word/document.xml",
+    )? {
+        return Err("docx 根关系缺少 officeDocument → word/document.xml".to_string());
+    }
+
+    match template {
+        WordTemplate::Editor => {
+            if docx_has_entry(bytes, "word/header1.xml")?
+                || docx_has_entry(bytes, "word/footer1.xml")?
+                || document.contains("w:headerReference")
+                || document.contains("w:footerReference")
+                || relationships.contains("relationships/header")
+                || relationships.contains("relationships/footer")
+                || content_types.contains("wordprocessingml.header+xml")
+                || content_types.contains("wordprocessingml.footer+xml")
+                || settings.contains("w:updateFields")
+            {
+                return Err("Editor 模板不得包含法律页眉页脚".to_string());
+            }
+        }
+        WordTemplate::LegalFiling => {
+            let footer = read_docx_entry(bytes, "word/footer1.xml")?;
+            validate_xml_part("word/footer1.xml", &footer, b"ftr")?;
+            if !document.contains(r#"<w:footerReference w:type="default" r:id="rId5"/>"#)
+                || !relationships.contains(
+                    r#"<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>"#,
+                )
+                || !content_types.contains(
+                    r#"<Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>"#,
+                )
+                || !settings.contains(r#"<w:updateFields w:val="true"/>"#)
+            {
+                return Err("法律文书模板页脚关系或字段更新设置无效".to_string());
+            }
+            for instruction in ["PAGE", "NUMPAGES"] {
+                let node =
+                    format!(r#"<w:instrText xml:space="preserve"> {instruction} </w:instrText>"#);
+                if footer.matches(&node).count() != 1 {
+                    return Err(format!("法律文书页脚字段 {instruction} 无效"));
+                }
+            }
+            for field_type in ["begin", "separate", "end"] {
+                let node = format!(r#"<w:fldChar w:fldCharType="{field_type}"/>"#);
+                if footer.matches(&node).count() != 2 {
+                    return Err(format!("法律文书页脚字段节点 {field_type} 无效"));
+                }
+            }
+            let has_header = docx_has_entry(bytes, "word/header1.xml")?;
+            if has_header != expects_header {
+                return Err("法律文书页眉部件与可信元数据状态不一致".to_string());
+            }
+            if has_header {
+                let header = read_docx_entry(bytes, "word/header1.xml")?;
+                validate_xml_part("word/header1.xml", &header, b"hdr")?;
+            }
+            let document_has_header =
+                document.contains(r#"<w:headerReference w:type="default" r:id="rId4"/>"#);
+            let relationships_have_header = relationships.contains(
+                r#"<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>"#,
+            );
+            let content_types_have_header = content_types.contains(
+                r#"<Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>"#,
+            );
+            if [
+                document_has_header,
+                relationships_have_header,
+                content_types_have_header,
+            ]
+            .into_iter()
+            .any(|present| present != expects_header)
+            {
+                return Err("法律文书页眉关系与 section 引用不一致".to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 从 `save_artifact` 写的元信息头 `<!-- filing · doc_type=.. · title=.. · ts=.. -->`
@@ -735,9 +1243,6 @@ pub fn extract_filing_title(md: &str) -> Option<String> {
 // ───────────────────────── 内嵌容器骨架(取自真实样本) ─────────────────────────
 
 const DOC_OPEN: &str = r#"<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:w10="urn:schemas-microsoft-com:office:word" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml" mc:Ignorable="w14 w15">"#;
-
-/// 页面/页边距/版式网格 —— 与全部 15 份样本字节级一致(A4 / 1英寸边距 / docGrid linePitch=360)。
-const SECTPR: &str = r#"<w:sectPr><w:pgSz w:w="11906" w:h="16838" w:orient="portrait"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/><w:docGrid w:linePitch="360"/></w:sectPr>"#;
 
 const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/></Types>"#;
 

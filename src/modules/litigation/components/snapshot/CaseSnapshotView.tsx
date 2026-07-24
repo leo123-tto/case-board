@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Pencil, RotateCcw } from "lucide-react";
 import {
   DndContext,
@@ -14,12 +14,28 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 
-import { type Case, type CaseInstance, type Document } from "@/lib/types";
-import { listCaseInstances, resetCaseOurSide } from "@/lib/api";
+import {
+  type Case,
+  type CaseInstance,
+  type CaseRepresentation,
+  type Document,
+} from "@/lib/types";
+import {
+  listCaseInstances,
+  resetCaseOurSide,
+  updateCaseRepresentation,
+} from "@/lib/api";
 import { confirmDialog } from "@/lib/dialog";
 import { toast } from "@/components/ui/toast";
 import { formatYuan } from "@/lib/format";
 import { computeCaseSnapshot } from "@/lib/caseSnapshot";
+import {
+  isRepresentationSide,
+  parseCaseRepresentation,
+  representationCandidates,
+  unresolvedRepresentationParties,
+  type RepresentationSide,
+} from "@/lib/caseRepresentation";
 import { extractExecutionCaseNoFromCase, getTrialCaseNo } from "@/lib/caseNumbers";
 import {
   applyFieldOverrides,
@@ -45,6 +61,8 @@ import { SortableCard } from "./SortableCard";
 import { TodosCard } from "@/components/TodosCard";
 import { CaseWorkLogSection } from "../CaseWorkLogSection";
 import { CaseWorkReportSection } from "../CaseWorkReportSection";
+
+type RepresentationBusy = "saving" | "resetting" | null;
 
 /**
  * 案件画像主视图。
@@ -84,27 +102,72 @@ export function CaseSnapshotView({
   // 刑事 tab 只做「标签级」适配(老板:先复刻框架 + 能做的轻适配,不深改字段管线)。
   const isCriminal = domain === "criminal";
   const ov = useCaseOverrides(caseData.id, caseData.user_overrides_json);
-  const [resettingOurSide, setResettingOurSide] = useState(false);
+  const activeCaseIdRef = useRef(caseData.id);
+  const representationRequestRef = useRef(0);
+  const representationBusyRef = useRef<RepresentationBusy>(null);
+  const [representationBusy, setRepresentationBusy] =
+    useState<RepresentationBusy>(null);
+  activeCaseIdRef.current = caseData.id;
+
+  const beginRepresentationRequest = (busy: Exclude<RepresentationBusy, null>) => {
+    if (representationBusyRef.current) return null;
+    const request = {
+      caseId: caseData.id,
+      id: representationRequestRef.current + 1,
+      busy,
+    };
+    representationRequestRef.current = request.id;
+    representationBusyRef.current = busy;
+    setRepresentationBusy(busy);
+    return request;
+  };
+
+  const requestIsActive = (request: {
+    caseId: string;
+    id: number;
+    busy: Exclude<RepresentationBusy, null>;
+  }) =>
+    activeCaseIdRef.current === request.caseId &&
+    representationRequestRef.current === request.id &&
+    representationBusyRef.current === request.busy;
+
+  const finishRepresentationRequest = (request: {
+    caseId: string;
+    id: number;
+    busy: Exclude<RepresentationBusy, null>;
+  }) => {
+    if (!requestIsActive(request)) return;
+    representationBusyRef.current = null;
+    setRepresentationBusy(null);
+  };
 
   const handleResetOurSide = async () => {
-    if (resettingOurSide) return;
+    const request = beginRepresentationRequest("resetting");
+    if (!request) return;
     const ok = await confirmDialog(
       "重置后会清空当前已锁定的我方代理立场。你可以重新人工选择,或点「重新分析」让 AI 重新识别。案件材料和其它人工修改不会变化。",
       { danger: true, okLabel: "重置立场" },
     );
-    if (!ok) return;
-    setResettingOurSide(true);
+    if (!ok) {
+      finishRepresentationRequest(request);
+      return;
+    }
+    if (!requestIsActive(request)) return;
     try {
       // 先把本地尚未落盘的其它编辑一起保存,再由后端只移除立场字段。
       ov.clearField("agg_our_side");
       await ov.flush();
-      await resetCaseOurSide(caseData.id);
+      if (!requestIsActive(request)) return;
+      await resetCaseOurSide(request.caseId);
+      if (!requestIsActive(request)) return;
       onReloadCase?.();
       toast("我方代理立场已重置 · 可重新选择,或重新分析让 AI 再识别", "success");
     } catch (e) {
-      toast(`重置立场失败:${e}`, "error");
+      if (requestIsActive(request)) {
+        toast(`重置立场失败:${e}`, "error");
+      }
     } finally {
-      setResettingOurSide(false);
+      finishRepresentationRequest(request);
     }
   };
 
@@ -128,6 +191,110 @@ export function CaseSnapshotView({
   // LLM snapshot + 用户 overlay
   const rawSnap = computeCaseSnapshot(caseData, documents);
   const snap = applyFieldOverrides(rawSnap, ov.overrides);
+  const parsedRepresentation = parseCaseRepresentation(caseData.user_overrides_json);
+  const invalidRepresentation = parsedRepresentation.status === "invalid";
+  const persistedRepresentation =
+    parsedRepresentation.status === "valid" ? parsedRepresentation.representation : null;
+  const [savedRepresentation, setSavedRepresentation] = useState<{
+    caseId: string;
+    representation: CaseRepresentation;
+  } | null>(() =>
+    persistedRepresentation
+      ? { caseId: caseData.id, representation: persistedRepresentation }
+      : null,
+  );
+  const savedRepresentationForCurrentCase =
+    savedRepresentation?.caseId === caseData.id
+      ? savedRepresentation.representation
+      : null;
+  const [draftSide, setDraftSide] = useState<RepresentationSide | "">(() =>
+    persistedRepresentation
+      ? persistedRepresentation.side as RepresentationSide
+      : invalidRepresentation
+        ? ""
+      : isRepresentationSide(snap.our_side)
+        ? snap.our_side
+        : "",
+  );
+  const [draftPartyNames, setDraftPartyNames] = useState<string[]>(() => {
+    if (!persistedRepresentation) return [];
+    const candidates = representationCandidates(rawSnap, persistedRepresentation.side as RepresentationSide);
+    return persistedRepresentation.parties
+      .map((party) => party.name)
+      .filter((name) => candidates.includes(name));
+  });
+  // 只在案件或已保存的 representation 变更时重置草稿，避免编辑中被其它 overlay 更新打断。
+  useEffect(() => {
+    const parsed = parseCaseRepresentation(caseData.user_overrides_json);
+    const valid = parsed.status === "valid" ? parsed.representation : null;
+    const nextSide = valid
+      ? valid.side as RepresentationSide
+      : parsed.status === "invalid"
+        ? ""
+      : isRepresentationSide(snap.our_side)
+        ? snap.our_side
+        : "";
+    const candidates = nextSide ? representationCandidates(rawSnap, nextSide) : [];
+    representationRequestRef.current += 1;
+    representationBusyRef.current = null;
+    setRepresentationBusy(null);
+    setSavedRepresentation(
+      valid ? { caseId: caseData.id, representation: valid } : null,
+    );
+    setDraftSide(nextSide);
+    setDraftPartyNames(
+      valid
+        ? valid.parties.map((party) => party.name).filter((name) => candidates.includes(name))
+        : [],
+    );
+    // 同一案件内的普通字段覆盖不能打断正在勾选的委托人。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [caseData.id, caseData.user_overrides_json]);
+
+  const representation = invalidRepresentation
+    ? null
+    : savedRepresentationForCurrentCase ?? persistedRepresentation;
+  const representationSide = representation?.side as RepresentationSide | undefined;
+  const exactCandidates = representationSide
+    ? representationCandidates(snap, representationSide)
+    : [];
+  const unresolvedParties = representation
+    ? unresolvedRepresentationParties(representation, exactCandidates)
+    : [];
+  const draftCandidates = draftSide ? representationCandidates(snap, draftSide) : [];
+
+  const toggleDraftParty = (name: string) => {
+    if (representationBusyRef.current) return;
+    setDraftPartyNames((current) =>
+      current.includes(name)
+        ? current.filter((currentName) => currentName !== name)
+        : [...current, name],
+    );
+  };
+
+  const handleSaveRepresentation = async () => {
+    if (!draftSide || draftPartyNames.length === 0) return;
+    const request = beginRepresentationRequest("saving");
+    if (!request) return;
+    try {
+      const saved = await updateCaseRepresentation(request.caseId, {
+        side: draftSide,
+        party_names: draftPartyNames,
+      });
+      if (!requestIsActive(request)) return;
+      setSavedRepresentation({ caseId: request.caseId, representation: saved });
+      setDraftSide(saved.side as RepresentationSide);
+      setDraftPartyNames(saved.parties.map((party) => party.name));
+      onReloadCase?.();
+      toast("已确认我方具体委托当事人", "success");
+    } catch (e) {
+      if (requestIsActive(request)) {
+        toast(`确认我方当事人失败:${e}`, "error");
+      }
+    } finally {
+      finishRepresentationRequest(request);
+    }
+  };
   const caseStatus = resolveCaseStatus(caseData, documents);
   const executionCaseNo = extractExecutionCaseNoFromCase(caseData);
   const isExecutionCase = caseStatus.id === "execution" && !!executionCaseNo;
@@ -595,15 +762,18 @@ export function CaseSnapshotView({
 
   // 2026-06-13:立场被改过、但 LLM 画像/报告还没按新立场重抽 → 持久提示(不分编辑模式)。
   // 判据:overlay 后的 our_side ≠ DB 里 LLM 原值;重新分析后 agg_our_side 同步即消失。
+  const displayedOurSide = invalidRepresentation
+    ? null
+    : representation?.side ?? snap.our_side;
   const ourSideStale =
-    !!snap.our_side && snap.our_side !== caseData.agg_our_side;
+    !!displayedOurSide && displayedOurSide !== caseData.agg_our_side;
 
   return (
     <div className="space-y-4">
       {/* 立场已改但未重抽:报告/画像仍是旧立场,提示去重新分析 */}
       {ourSideStale && (
         <div className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
-          ⚠️ 我方代理立场已改为「{snap.our_side}」,但案件画像 / 报告仍按旧立场生成。
+          ⚠️ 我方代理立场已改为「{displayedOurSide}」,但案件画像 / 报告仍按旧立场生成。
           请到下方「原文件 → 重新分析」重跑,报告才会按新立场调整侧重。
         </div>
       )}
@@ -705,7 +875,7 @@ export function CaseSnapshotView({
 
         {/* 我方代理立场 + 当事人对峙(2026-06-13:立场驱动报告侧重/AI 立场/各 chip)*/}
         <div className="mt-4 rounded-md bg-muted/40 px-4 py-3">
-          {/* 立场行:编辑态可选,非编辑态淡蓝 badge;未识别提示去确认 */}
+          {/* 精确委托人：只允许在一个法定阵营内勾选，旧粗立场不会被当成精确选择。 */}
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <span className="text-caption uppercase tracking-wider text-muted-foreground">
               我方代理立场
@@ -713,10 +883,15 @@ export function CaseSnapshotView({
             {isEditMode ? (
               <>
                 <select
-                  value={snap.our_side ?? ""}
+                  value={draftSide}
+                  disabled={representationBusy !== null}
                   onChange={(e) => {
+                    if (representationBusyRef.current) return;
                     const v = e.target.value;
-                    if (v) ov.setField("agg_our_side", v);
+                    if (isRepresentationSide(v)) {
+                      setDraftSide(v);
+                      setDraftPartyNames([]);
+                    }
                   }}
                   className="rounded border border-border bg-background px-2 py-0.5 text-sm text-foreground"
                   aria-label="选择我方代理立场"
@@ -725,44 +900,106 @@ export function CaseSnapshotView({
                   <option value="原告方">原告方</option>
                   <option value="被告方">被告方</option>
                   <option value="第三人">第三人</option>
-                  <option value="反诉混合">反诉混合</option>
                 </select>
                 <span className="text-xs text-sky-700">
-                  {ov.hasFieldOverride("agg_our_side")
-                    ? "人工确认 · 已锁定；重新分析后报告会同步新立场"
-                    : caseData.agg_our_side
-                      ? "AI 首次识别 · 已锁定；新增材料不会自动改判"
-                      : "尚未识别；选择后立即锁定"}
+                  {invalidRepresentation
+                    ? "精确委托人数据异常，请重新确认"
+                    : representation
+                    ? "已保存精确委托人；可重新勾选同阵营当事人"
+                    : snap.our_side
+                      ? "旧立场待确认具体委托人"
+                      : "请选择阵营并勾选具体委托人"}
                 </span>
-                {(snap.our_side || caseData.agg_our_side) && (
+                {(invalidRepresentation || representation || snap.our_side || caseData.agg_our_side) && (
                   <button
                     type="button"
                     onClick={() => void handleResetOurSide()}
-                    disabled={resettingOurSide}
+                    disabled={representationBusy !== null}
                     className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-background hover:text-foreground disabled:cursor-wait disabled:opacity-60"
                     title="清空当前锁定立场,允许重新选择或重新识别"
                   >
-                    <RotateCcw className={resettingOurSide ? "size-3 animate-spin" : "size-3"} />
+                    <RotateCcw className={representationBusy === "resetting" ? "size-3 animate-spin" : "size-3"} />
                     重置立场
                   </button>
                 )}
               </>
+            ) : invalidRepresentation ? (
+              <span className="text-sm text-destructive">精确委托人数据异常，请重新确认</span>
+            ) : representation ? (
+              <>
+                <span className="rounded bg-sky-50 px-2 py-0.5 text-sm font-medium text-sky-800">
+                  {representation.side}
+                </span>
+                <span className="text-sm text-foreground">
+                  {representation.parties.map((party) => party.name).join("、")}
+                </span>
+              </>
             ) : snap.our_side ? (
-              <span className="rounded bg-sky-50 px-2 py-0.5 text-sm font-medium text-sky-800">
-                {snap.our_side}
-              </span>
+              <>
+                <span className="rounded bg-sky-50 px-2 py-0.5 text-sm font-medium text-sky-800">
+                  {snap.our_side}
+                </span>
+                <span className="text-sm text-amber-700">尚未确认具体委托人</span>
+              </>
             ) : (
               <span className="text-sm text-muted-foreground">
                 未识别 —— 点右上角铅笔进入编辑模式确认我方是原告方还是被告方
               </span>
             )}
           </div>
+          {isEditMode && draftSide && (
+            <div className="mb-3 space-y-2 rounded border border-border bg-background/60 p-3">
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                {draftCandidates.map((name) => (
+                  <label key={name} className="inline-flex items-center gap-1.5 text-sm text-foreground">
+                    <input
+                      type="checkbox"
+                      aria-label={`选择${name}`}
+                      checked={draftPartyNames.includes(name)}
+                      disabled={representationBusy !== null}
+                      onChange={() => toggleDraftParty(name)}
+                    />
+                    {name}
+                  </label>
+                ))}
+                {draftCandidates.length === 0 && (
+                  <span className="text-xs text-muted-foreground">该阵营暂无可核验的当事人名单</span>
+                )}
+                {draftCandidates.length > 0 && (
+                  <button
+                    type="button"
+                    disabled={representationBusy !== null}
+                    className="text-xs text-sky-700 hover:text-sky-900"
+                    onClick={() => {
+                      if (representationBusyRef.current) return;
+                      setDraftPartyNames(draftCandidates);
+                    }}
+                  >
+                    全选本方
+                  </button>
+                )}
+              </div>
+              <button
+                type="button"
+                className="rounded bg-foreground px-2.5 py-1 text-xs font-medium text-background disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={draftPartyNames.length === 0 || representationBusy !== null}
+                onClick={() => void handleSaveRepresentation()}
+              >
+                {representationBusy === "saving" ? "确认中…" : "确认我方当事人"}
+              </button>
+            </div>
+          )}
+          {unresolvedParties.length > 0 && (
+            <div className="mb-3 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              人员匹配待核对：{unresolvedParties.join("、")}。当前聚合名单未找到上述已保存的精确委托人，请核对材料后重新确认。
+            </div>
+          )}
           {/* 对峙(P3a 仍只读 — array 字段 P3b 接);我方一侧淡蓝标注 */}
           <div className="flex items-center gap-3">
             <div className="min-w-0 flex-1">
               <div className="text-caption uppercase tracking-wider text-muted-foreground">
                 {isCriminal ? "被害方 / 控方" : "原告 / 申请人"}
-                {snap.our_side === "原告方" && (
+                {displayedOurSide === "原告方" && (
                   <span className="ml-1 font-medium text-sky-700">· 我方</span>
                 )}
               </div>
@@ -771,7 +1008,7 @@ export function CaseSnapshotView({
             <span className="shrink-0 font-mono text-xs text-muted-foreground">vs</span>
             <div className="min-w-0 flex-1 text-right">
               <div className="text-caption uppercase tracking-wider text-muted-foreground">
-                {snap.our_side === "被告方" && (
+                {displayedOurSide === "被告方" && (
                   <span className="mr-1 font-medium text-sky-700">我方 ·</span>
                 )}
                 {isCriminal ? "被告人 / 犯罪嫌疑人" : "被告 / 被申请人"}

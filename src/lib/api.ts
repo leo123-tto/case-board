@@ -24,6 +24,7 @@ import type {
 } from "@/modules/litigation/components/visualization/types";
 import type {
   CaseLog,
+  CaseRepresentation,
   ElementDocumentType,
   ElementDraft,
   SavedElementDocument,
@@ -44,6 +45,7 @@ import type {
   SaveMemoryNoteInput,
   NewCaseInstance,
   PiThinkingLevel,
+  RepresentationInput,
   Settings,
   UpdateInfo,
   VerifyResult,
@@ -744,14 +746,25 @@ export function exportMdDocx(
   return invoke<string>("export_md_docx", { mdPath, title, savePath });
 }
 
-/** 两个 Milkdown 编辑工作区共用的忠实排版导出。 */
+export type WordTemplate = "editor" | "legal_filing";
+
+/** 两个 Milkdown 编辑工作区共用的排版导出。 */
 export function exportEditorDocument(
   mdPath: string,
   title: string,
   format: "docx" | "html",
   savePath: string,
+  wordTemplate?: WordTemplate,
+  caseId?: string,
 ): Promise<string> {
-  return invoke<string>("export_editor_document", { mdPath, title, format, savePath });
+  return invoke<string>("export_editor_document", {
+    mdPath,
+    title,
+    format,
+    savePath,
+    wordTemplate,
+    caseId,
+  });
 }
 
 /**
@@ -1508,6 +1521,17 @@ export function updateCaseOverrides(
   overridesJson: string | null,
 ): Promise<void> {
   return invoke<void>("update_case_overrides", { caseId, overridesJson });
+}
+
+/** 保存律师代理的诉讼阵营及其中的具体委托当事人。 */
+export function updateCaseRepresentation(
+  caseId: string,
+  input: RepresentationInput,
+): Promise<CaseRepresentation> {
+  return invoke<CaseRepresentation>("update_case_representation", {
+    caseId,
+    input,
+  });
 }
 
 export function updateCaseCalendarEventOverride(input: {

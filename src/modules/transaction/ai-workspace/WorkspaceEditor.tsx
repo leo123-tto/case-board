@@ -7,19 +7,24 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { desktopDir } from "@tauri-apps/api/path";
 import { History, Loader2, RotateCcw, Save } from "lucide-react";
 
 import { MilkdownEditor } from "@/components/editor/MilkdownEditor";
 import { DiffReview } from "@/components/editor/DiffReview";
 import { EditorExportMenu, type EditorExportFormat } from "@/components/editor/EditorExportMenu";
 import { Button } from "@/components/ui/button";
+import type { WordTemplate } from "@/lib/api";
 import { diffParts } from "@/lib/textDiff";
 
 import {
   createAiWorkspaceArtifactVersion,
+  getAiWorkspaceExportPaths,
   listAiWorkspaceDocumentProposals,
   listAiWorkspaceArtifactVersions,
   readAiWorkspaceArtifact,
+  recordAiWorkspaceExportPath,
+  refreshAiWorkspaceExports,
   restoreAiWorkspaceArtifactVersion,
   resolveAiWorkspaceDocumentProposal,
   saveAiWorkspaceArtifact,
@@ -59,6 +64,7 @@ export const WorkspaceEditor = forwardRef<
   const [versions, setVersions] = useState<AiWorkspaceDocumentVersion[]>([]);
   const [showVersions, setShowVersions] = useState(false);
   const [proposal, setProposal] = useState<AiWorkspaceDocumentProposal | null>(null);
+  const [defaultExportDirectory, setDefaultExportDirectory] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const documentRef = useRef(document);
   const titleRef = useRef(title);
@@ -90,8 +96,11 @@ export const WorkspaceEditor = forwardRef<
     void Promise.all([
       readAiWorkspaceArtifact(workspaceId, document.id),
       listAiWorkspaceDocumentProposals(workspaceId, document.id),
+      getAiWorkspaceExportPaths(workspaceId, document.id)
+        .then(async (paths) => paths.preferred_export_dir ?? await desktopDir())
+        .catch(() => null),
     ])
-      .then(([content, proposals]) => {
+      .then(([content, proposals, exportDirectory]) => {
         if (cancelled) return;
         documentRef.current = content.document;
         loadedRevisionRef.current = {
@@ -103,6 +112,7 @@ export const WorkspaceEditor = forwardRef<
         setMarkdown(content.markdown);
         setDirty(false);
         setProposal(proposals[0] ?? null);
+        setDefaultExportDirectory(exportDirectory);
         setLoaded(true);
       })
       .catch((loadError) => {
@@ -197,10 +207,35 @@ export const WorkspaceEditor = forwardRef<
         trigger: "manual",
         summary: null,
       });
-      setVersions(await listAiWorkspaceArtifactVersions(workspaceId, document.id));
-      setShowVersions(true);
     } catch (versionError) {
       setError(`保存版本失败：${errorText(versionError)}`);
+      return;
+    }
+    try {
+      const refreshed = await refreshAiWorkspaceExports(
+        workspaceId,
+        documentRef.current.id,
+      );
+      if (refreshed.errors.length > 0) {
+        setError(
+          refreshed.errors
+            .map(
+              (item) =>
+                `${item.format === "html" ? "HTML" : "Word"} 更新失败：${item.error}`,
+            )
+            .join("；"),
+        );
+      }
+    } catch (refreshError) {
+      setError(`版本已保存，但更新导出文件失败：${errorText(refreshError)}`);
+    }
+    try {
+      setVersions(await listAiWorkspaceArtifactVersions(workspaceId, document.id));
+      setShowVersions(true);
+    } catch (historyError) {
+      setError((current) =>
+        current ?? `版本已保存，但刷新版本列表失败：${errorText(historyError)}`,
+      );
     }
   };
 
@@ -246,6 +281,20 @@ export const WorkspaceEditor = forwardRef<
       setError(`创建导出前版本失败：${errorText(exportError)}`);
       return false;
     }
+  };
+
+  const rememberExportPath = async (
+    format: EditorExportFormat,
+    path: string,
+    wordTemplate?: WordTemplate,
+  ): Promise<void> => {
+    await recordAiWorkspaceExportPath(
+      workspaceId,
+      documentRef.current.id,
+      format,
+      path,
+      wordTemplate,
+    );
   };
 
   const applyProposal = async (finalMarkdown: string) => {
@@ -335,8 +384,10 @@ export const WorkspaceEditor = forwardRef<
         <EditorExportMenu
           title={title}
           mdPath={documentRef.current.content_path ?? ""}
+          defaultDirectory={defaultExportDirectory}
           beforeExport={prepareExport}
           beforeWrite={createExportVersion}
+          onExported={rememberExportPath}
           onError={(message) => setError(message || null)}
           disabled={saving || !documentRef.current.content_path}
         />

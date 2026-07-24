@@ -38,6 +38,21 @@ pub async fn run_deep_dive(
     case_id: &str,
     api_key: &str,
     llm_config: &LlmConfig,
+) -> Result<DeepDiveReport, String> {
+    // 保持到全部 hints/原始文件/元典/LLM 工作结束，禁止查询中变更精确委托人。
+    let _query_guard = super::orchestrator::acquire_execution_query_read_guard(case_id).await;
+    // 必须先于 hints 目录读取、原始数据落盘、元典与 LLM 调用完成精确委托人守卫。
+    super::orchestrator::exact_representation_for_external_query(pool, case_id).await?;
+    let bound_p1 = super::artifact_binding::load_p1_for_current_owner(pool, case_id).await?;
+    Ok(run_deep_dive_inner(pool, case_id, api_key, llm_config, bound_p1).await)
+}
+
+async fn run_deep_dive_inner(
+    pool: &SqlitePool,
+    case_id: &str,
+    api_key: &str,
+    llm_config: &LlmConfig,
+    bound_p1: Option<super::artifact_binding::P1Artifacts>,
 ) -> DeepDiveReport {
     let start = std::time::Instant::now();
 
@@ -46,7 +61,11 @@ pub async fn run_deep_dive(
         Ok(p) => p,
         Err(e) => return error_report(case_id, &e, start, 0, 0, 0),
     };
-    let hints = match load_latest_hints(&hints_dir) {
+    let hints = match bound_p1.as_ref() {
+        Some(p1) => load_hints_at_path(std::path::Path::new(&p1.dig_hints_path)),
+        None => load_latest_hints(&hints_dir),
+    };
+    let hints = match hints {
         Ok(h) => h,
         Err(e) => return error_report(case_id, &e, start, 0, 0, 0),
     };
@@ -130,7 +149,15 @@ pub async fn run_deep_dive(
     let mut corpus = super::fetch_case_meta_md(pool, case_id).await;
     corpus.push_str("\n# P1 基础查询 (元典对被执行人的查询结果)\n");
     if let Ok(p1_dir) = raw_dir_for_case(case_id) {
-        if let Ok(entries) = std::fs::read_dir(&p1_dir) {
+        if let Some(p1) = &bound_p1 {
+            for name in &p1.raw_files {
+                if let Ok(content) = std::fs::read_to_string(p1_dir.join(name)) {
+                    corpus.push_str(&format!("\n========== P1 / {} ==========\n", name));
+                    corpus.push_str(&content);
+                    corpus.push('\n');
+                }
+            }
+        } else if let Ok(entries) = std::fs::read_dir(&p1_dir) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     if let Ok(content) = std::fs::read_to_string(entry.path()) {
@@ -218,17 +245,29 @@ pub async fn run_deep_dive(
     }
     let report_path_str = report_path.to_string_lossy().to_string();
 
-    // 7. 写 cases.deep_dive_report_path
+    // 7. 新版 P1 原子推进同一 owner 的 P2 绑定；历史粗立场 P1 保留旧路径兼容。
     let now = chrono::Utc::now().to_rfc3339();
-    if let Err(e) =
+    let publish_result = if bound_p1.is_some() {
+        super::artifact_binding::publish_deep(pool, case_id, &report_path_str, &now).await
+    } else {
         sqlx::query("UPDATE cases SET deep_dive_report_path = ?, deep_dive_at = ? WHERE id = ?")
             .bind(&report_path_str)
             .bind(&now)
             .bind(case_id)
             .execute(pool)
             .await
-    {
-        crate::dlog!("[deepdive] 写 cases 失败:{}", e);
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    };
+    if let Err(error) = publish_result {
+        return error_report(
+            case_id,
+            &format!("绑定深挖产物到当前委托人失败:{error}"),
+            start,
+            hints_used,
+            raw_files.len(),
+            corpus_chars,
+        );
     }
 
     DeepDiveReport {
@@ -490,8 +529,12 @@ fn load_latest_hints(reports_dir: &std::path::Path) -> Result<Vec<DigHint>, Stri
         }
     }
     let (_, path) = latest.ok_or_else(|| "reports/ 没找到 dig_hints 文件".to_string())?;
+    load_hints_at_path(&path)
+}
+
+fn load_hints_at_path(path: &std::path::Path) -> Result<Vec<DigHint>, String> {
     let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("读 {} 失败:{}", path.display(), e))?;
+        std::fs::read_to_string(path).map_err(|e| format!("读 {} 失败:{}", path.display(), e))?;
     serde_json::from_str::<Vec<DigHint>>(&text)
         .map_err(|e| format!("dig_hints JSON 解析失败:{}", e))
 }

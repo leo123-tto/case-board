@@ -4,8 +4,11 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Archive,
+  ChevronDown,
   FilePlus2,
   FileText,
+  FolderOpen,
+  FolderSearch,
   Loader2,
   RefreshCw,
   RotateCcw,
@@ -14,6 +17,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { revealInFinder } from "@/lib/api";
 import { confirmDialog } from "@/lib/dialog";
 import { cn } from "@/lib/utils";
 
@@ -69,11 +73,13 @@ export function WorkspaceSidebar({
   headerActions,
 }: Props) {
   const rootRef = useRef<HTMLElement>(null);
+  const materialMenuRef = useRef<HTMLDivElement>(null);
   const [documents, setDocuments] = useState<AiWorkspaceDocument[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [materialMenuOpen, setMaterialMenuOpen] = useState(false);
   const [contextMenu, setContextMenu] = useState<{
     document: AiWorkspaceDocument;
     x: number;
@@ -166,6 +172,24 @@ export function WorkspaceSidebar({
   }, [addPaths]);
 
   useEffect(() => {
+    if (!materialMenuOpen) return;
+    const closeOutside = (event: MouseEvent) => {
+      if (!materialMenuRef.current?.contains(event.target as Node)) {
+        setMaterialMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMaterialMenuOpen(false);
+    };
+    document.addEventListener("mousedown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [materialMenuOpen]);
+
+  useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(null);
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -180,12 +204,24 @@ export function WorkspaceSidebar({
   }, [contextMenu]);
 
   const chooseFiles = async () => {
+    setMaterialMenuOpen(false);
     const picked = await open({
       directory: false,
       multiple: true,
       title: "选择工作区材料",
     });
     const paths = Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
+    await addPaths(paths);
+  };
+
+  const chooseFolder = async () => {
+    setMaterialMenuOpen(false);
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: "选择工作区材料文件夹",
+    });
+    const paths = typeof picked === "string" ? [picked] : [];
     await addPaths(paths);
   };
 
@@ -251,6 +287,17 @@ export function WorkspaceSidebar({
     }
   };
 
+  const revealDocument = async (document: AiWorkspaceDocument) => {
+    const path = document.kind === "source" ? document.source_path : document.content_path;
+    if (!path) return;
+    setError(null);
+    try {
+      await revealInFinder(path);
+    } catch (revealError) {
+      setError(`无法在 Finder 中显示：${errorText(revealError)}`);
+    }
+  };
+
   const sources = documents.filter((document) => document.kind === "source");
   const artifacts = documents.filter((document) => document.kind === "artifact");
 
@@ -258,6 +305,8 @@ export function WorkspaceSidebar({
     items.map((document) => {
       const status = statusText(document);
       const processing = ["queued", "processing"].includes(document.extraction_status);
+      const revealPath =
+        document.kind === "source" ? document.source_path : document.content_path;
       return (
         <div
           key={document.id}
@@ -303,6 +352,20 @@ export function WorkspaceSidebar({
             </span>
           </button>
           <div className="mt-1.5 flex justify-end gap-1 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+            {revealPath ? (
+              <button
+                type="button"
+                aria-label={`在 Finder 中显示${document.title}`}
+                title="在 Finder 中显示"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void revealDocument(document);
+                }}
+                className="rounded p-1 text-muted-foreground hover:bg-background hover:text-foreground"
+              >
+                <FolderSearch className="size-3.5" />
+              </button>
+            ) : null}
             {["failed", "review"].includes(document.extraction_status) ? (
               <button
                 type="button"
@@ -357,10 +420,46 @@ export function WorkspaceSidebar({
             {busyId === "__new_artifact__" ? <Loader2 className="size-3.5 animate-spin" /> : <FilePlus2 className="size-3.5" />}
             新建文稿
           </Button>
-          <Button size="sm" variant="outline" onClick={() => void chooseFiles()} className="w-full px-2">
-            <Upload className="size-3.5" />
-            添加材料
-          </Button>
+          <div ref={materialMenuRef} className="relative">
+            <Button
+              size="sm"
+              variant="outline"
+              aria-haspopup="menu"
+              aria-expanded={materialMenuOpen}
+              onClick={() => setMaterialMenuOpen((value) => !value)}
+              className="w-full px-2"
+            >
+              <Upload className="size-3.5" />
+              添加材料
+              <ChevronDown className="size-3" />
+            </Button>
+            {materialMenuOpen ? (
+              <div
+                role="menu"
+                aria-label="添加材料方式"
+                className="absolute right-0 z-50 mt-1.5 min-w-36 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-lg"
+              >
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => void chooseFiles()}
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-2 text-left text-xs hover:bg-accent focus:bg-accent focus:outline-none"
+                >
+                  <FilePlus2 className="size-3.5" />
+                  选择文件
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => void chooseFolder()}
+                  className="flex w-full items-center gap-2 rounded px-2.5 py-2 text-left text-xs hover:bg-accent focus:bg-accent focus:outline-none"
+                >
+                  <FolderOpen className="size-3.5" />
+                  选择文件夹
+                </button>
+              </div>
+            ) : null}
+          </div>
         </div>
       </div>
 
@@ -386,7 +485,7 @@ export function WorkspaceSidebar({
               </h3>
               {sources.length > 0 ? renderDocuments(sources) : (
                 <p className="px-2 py-3 text-[11px] leading-relaxed text-muted-foreground">
-                  拖入或选择文件，原文件保持不变。
+                  拖入文件或文件夹，原文件保持不变。
                 </p>
               )}
             </section>
@@ -407,7 +506,7 @@ export function WorkspaceSidebar({
       {dragging ? (
         <div className="pointer-events-none absolute inset-1 z-20 flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-brand bg-background/90 text-brand backdrop-blur-sm">
           <FilePlus2 className="size-7" />
-          <span className="text-xs font-medium">松开添加材料</span>
+          <span className="text-xs font-medium">松开添加文件或文件夹</span>
         </div>
       ) : null}
       {contextMenu ? (

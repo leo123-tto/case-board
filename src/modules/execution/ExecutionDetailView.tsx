@@ -54,6 +54,7 @@ import {
   yuandianFullReport,
 } from "@/lib/api";
 import { getFieldOverride, parseOverrides } from "@/lib/userOverrides";
+import { parseCaseRepresentation } from "@/lib/caseRepresentation";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { TodosCard } from "@/components/TodosCard";
 import { useRunningTask } from "@/contexts/RunningTaskContext";
@@ -178,19 +179,28 @@ export function ExecutionDetailView({
 
   // Phase 2:执行立场。我方=被告方 → 债务人模式(查我方客户做暴露面自查,标签转防御)。
   // 用户在详情页确认的立场(user_overrides_json)优先,否则用 LLM 抽的 agg_our_side。
+  const representationState = parseCaseRepresentation(current.user_overrides_json);
+  const exactRepresentation =
+    representationState.status === "valid" ? representationState.representation : undefined;
+  const exactRepresentationError =
+    representationState.status === "invalid"
+      ? `精确委托人数据异常：${representationState.reason}。请先重新分析并核对；若仍存在同名同角色，请勿继续查询并人工核验。`
+      : exactRepresentationContactError(partyContacts, exactRepresentation?.parties);
   const ovOurSide = getFieldOverride(
     parseOverrides(current.user_overrides_json),
     "agg_our_side",
   );
   const effectiveOurSide =
-    ovOurSide !== undefined ? ovOurSide : current.agg_our_side;
+    exactRepresentation?.side ?? (ovOurSide !== undefined ? ovOurSide : current.agg_our_side);
   const isDebtor = effectiveOurSide === "被告方";
 
-  // 查询对象联系人:债权人模式取对方(被执行人);债务人模式取我方客户本人(排代理人)。
-  const targetContacts = partyContacts.filter((p) =>
-    isDebtor
-      ? p.is_our_side === true && !/代理/.test(p.role ?? "")
-      : p.is_our_side === false || /被告|被执行|被申请/.test(p.role ?? ""),
+  // 有精确委托人时，姓名和角色必须同时匹配；旧 is_our_side 不得扩大客户范围。
+  // 数据损坏时不显示候选，且查询动作会被显式阻断，避免视觉与实际付费目标不一致。
+  const targetContacts = selectExecutionTargets(
+    partyContacts,
+    isDebtor,
+    exactRepresentation?.parties,
+    exactRepresentationError !== undefined,
   );
   // 标签随立场切换
   const queryActionLabel = isDebtor ? "执行风险自查" : "查被执行人";
@@ -242,6 +252,10 @@ export function ExecutionDetailView({
   // effectiveOurSide 为空(LLM 没抽出、用户也没确认)→ 后端默认按债权人处理;
   // 若我方其实代理被执行人,会变成"查自己客户财产" → 先弹确认让律师去确认立场。
   async function confirmStanceIfUnknown(): Promise<boolean> {
+    if (exactRepresentationError) {
+      alert(exactRepresentationError);
+      return false;
+    }
     if (effectiveOurSide) return true; // 已知立场(原告方/被告方/...)直接放行
     return confirmDialog(
       "尚未确认「我方代理立场」。执行查询将默认按**债权人(申请执行人)**处理 —— 查对方(被执行人)财产。\n\n" +
@@ -250,10 +264,18 @@ export function ExecutionDetailView({
     );
   }
 
+  function openCurrentExecutionReport(open: () => void): void {
+    if (exactRepresentationError) {
+      alert(exactRepresentationError);
+      return;
+    }
+    open();
+  }
+
   // 「🔍 查被执行人」按钮:跑元典 P1(可能 30-90 秒,聚合优先约 5-8 端点 + LLM 写报告)
   const handleYuandianQuery = async () => {
-    if (!(await ensureYuandianKey())) return;
     if (!(await confirmStanceIfUnknown())) return;
+    if (!(await ensureYuandianKey())) return;
     if (!(await confirmRerunIfRecent(current.risk_assessment_at, "风险报告")))
       return;
     await runWithLock(
@@ -284,6 +306,7 @@ export function ExecutionDetailView({
 
   // P2 深挖按钮
   const handleDeepDive = async () => {
+    if (!(await confirmStanceIfUnknown())) return;
     if (!(await ensureYuandianKey())) return;
     if (!(await confirmRerunIfRecent(current.deep_dive_at, "深挖报告"))) return;
     await runWithLock(
@@ -316,6 +339,7 @@ export function ExecutionDetailView({
 
   // 2026-05-25 V0.1.7 · 完整报告(合并风险报告 + 深挖报告 → 第三份)
   const handleFullReport = async () => {
+    if (!(await confirmStanceIfUnknown())) return;
     // 已有 → 直接弹查看(已生成的报告不需要 key 即可查看)
     if (current.full_report_path) {
       setFullReportOpen(true);
@@ -440,7 +464,7 @@ export function ExecutionDetailView({
                 <Button
                   size="sm"
                   variant="outline"
-                  onClick={() => setRiskOpen(true)}
+                  onClick={() => openCurrentExecutionReport(() => setRiskOpen(true))}
                   title="查看上次生成的风险提示报告(MD)"
                 >
                   <BookOpen className="size-3.5" />
@@ -578,6 +602,12 @@ export function ExecutionDetailView({
             </Card>
           )}
 
+          {exactRepresentationError && (
+            <div role="alert" className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+              {exactRepresentationError}
+            </div>
+          )}
+
           {/* 查询对象详情(债权人=被执行人;债务人=我方客户) */}
           {targetContacts.length > 0 && (
             <Card title={targetCardTitle}>
@@ -674,7 +704,9 @@ export function ExecutionDetailView({
               result={yuandianResult}
               onDeepDive={handleDeepDive}
               isLocked={isLocked}
-              onOpenDeepDive={() => setDeepDiveOpen(true)}
+              onOpenDeepDive={() =>
+                openCurrentExecutionReport(() => setDeepDiveOpen(true))
+              }
               onFullReport={handleFullReport}
             />
           )}
@@ -711,7 +743,7 @@ export function ExecutionDetailView({
         />
       )}
 
-      {riskOpen && current.risk_assessment_path && (
+      {riskOpen && !exactRepresentationError && current.risk_assessment_path && (
         <MarkdownModal
           path={current.risk_assessment_path}
           filename={`${current.name} · 被执行人风险提示报告.md`}
@@ -724,7 +756,7 @@ export function ExecutionDetailView({
         />
       )}
 
-      {deepDiveOpen && current.deep_dive_report_path && (
+      {deepDiveOpen && !exactRepresentationError && current.deep_dive_report_path && (
         <MarkdownModal
           path={current.deep_dive_report_path}
           filename={`${current.name} · 深查报告.md`}
@@ -737,7 +769,7 @@ export function ExecutionDetailView({
         />
       )}
 
-      {fullReportOpen && current.full_report_path && (
+      {fullReportOpen && !exactRepresentationError && current.full_report_path && (
         <MarkdownModal
           path={current.full_report_path}
           filename={`${current.name} · 完整执行追踪报告.md`}
@@ -1102,6 +1134,49 @@ function safeJson<T>(json: string | null, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function selectExecutionTargets(
+  partyContacts: PartyContact[],
+  isDebtor: boolean,
+  representedParties: { name: string; role: string }[] | undefined,
+  representationInvalid: boolean,
+): PartyContact[] {
+  if (representationInvalid) return [];
+  const hasExactRepresentation = representedParties !== undefined && representedParties.length > 0;
+  const isRepresented = (contact: PartyContact) =>
+    representedParties?.some(
+      (party) =>
+        party.name.trim() === contact.name?.trim() && party.role.trim() === contact.role?.trim(),
+    ) ?? false;
+
+  return partyContacts.filter((contact) => {
+    const role = contact.role ?? "";
+    const roleIsExecutee = /被告|被执行|被申请/.test(role);
+    if (hasExactRepresentation) {
+      return isDebtor ? isRepresented(contact) : !isRepresented(contact) && roleIsExecutee;
+    }
+    return isDebtor
+      ? contact.is_our_side === true && !/代理/.test(role)
+      : contact.is_our_side === false || roleIsExecutee;
+  });
+}
+
+function exactRepresentationContactError(
+  partyContacts: PartyContact[],
+  representedParties: { name: string; role: string }[] | undefined,
+): string | undefined {
+  if (!representedParties?.length) return undefined;
+  for (const party of representedParties) {
+    const matched = partyContacts.filter(
+      (contact) =>
+        contact.name?.trim() === party.name && contact.role?.trim() === party.role,
+    ).length;
+    if (matched !== 1) {
+      return `精确委托人“${party.name}”（${party.role}）在当事人联系人中匹配${matched}条，当前版本无法自动区分。请先重新分析并核对；若仍存在同名同角色，请勿继续查询并人工核验。`;
+    }
+  }
+  return undefined;
 }
 
 function Card({

@@ -1,3 +1,5 @@
+import type { WordTemplate } from "@/lib/api";
+
 export interface AiWorkspace {
   id: string;
   title: string;
@@ -78,6 +80,28 @@ export interface SourceAddError {
 export interface AddAiWorkspaceSourcesResult {
   added: AiWorkspaceDocument[];
   errors: SourceAddError[];
+  preferred_export_dir: string | null;
+}
+
+export interface AiWorkspaceExportPaths {
+  preferred_export_dir: string | null;
+  docx_path: string | null;
+  docx_word_template: WordTemplate | null;
+  html_path: string | null;
+}
+
+export interface AiWorkspaceExportWrite {
+  format: "docx" | "html";
+  path: string;
+}
+
+export interface AiWorkspaceExportWriteError extends AiWorkspaceExportWrite {
+  error: string;
+}
+
+export interface AiWorkspaceExportRefreshResult {
+  written: AiWorkspaceExportWrite[];
+  errors: AiWorkspaceExportWriteError[];
 }
 
 export interface AiWorkspaceDocumentProgress {

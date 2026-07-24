@@ -3,8 +3,11 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use uuid::Uuid;
 
-use super::cases::{effective_our_side, Case};
 use super::documents::Document;
+use super::{
+    case_representation::{effective_representation, CaseRepresentation},
+    cases::{effective_our_side, Case},
+};
 
 #[derive(Debug, Clone, Deserialize)]
 struct Party {
@@ -47,7 +50,7 @@ async fn generate_at_base(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("案件不存在:{case_id}"))?;
-    let body = build_markdown(&case);
+    let body = build_markdown(&case)?;
 
     let doc_id = Uuid::new_v4().to_string();
     let dir = base
@@ -96,10 +99,22 @@ async fn generate_at_base(
         .map_err(|e| e.to_string())
 }
 
-fn build_markdown(case: &Case) -> String {
+fn build_markdown(case: &Case) -> Result<String, String> {
     let parties = parse_parties(case.agg_party_contacts.as_deref());
     let dates = parse_dates(case.agg_key_dates.as_deref());
     let fees = parse_fees(case.agg_fees.as_deref());
+    // 精确委托人存在时是唯一权威来源；损坏状态必须中断生成，不能退回到整方代理。
+    let representation = effective_representation(
+        case.user_overrides_json.as_deref(),
+        case.agg_our_side.as_deref(),
+    )
+    .map_err(|error| format!("案件精确委托人状态无效: {error}"))?;
+    let explicit_representation = representation
+        .as_ref()
+        .filter(|representation| !representation.parties.is_empty());
+    if let Some(representation) = explicit_representation {
+        validate_exact_representation_party_contacts(&parties, representation)?;
+    }
     let our_side = effective_our_side(
         case.agg_our_side.as_deref(),
         case.user_overrides_json.as_deref(),
@@ -107,9 +122,13 @@ fn build_markdown(case: &Case) -> String {
     let case_no = first_non_empty([case.agg_case_no.as_deref(), case.case_no.as_deref()]);
     let cause = first_non_empty([case.agg_cause.as_deref(), case.cause.as_deref()]);
     let court = first_non_empty([case.agg_court.as_deref(), case.court.as_deref()]);
-    let client_parties = party_names(&parties, true)
-        .or_else(|| role_party_names(&parties, our_side.as_deref()))
-        .or_else(|| parse_name_list(case.agg_plaintiffs.as_deref()))
+    let client_parties = explicit_representation
+        .map(represented_party_names)
+        .or_else(|| {
+            party_names(&parties, true)
+                .or_else(|| role_party_names(&parties, our_side.as_deref()))
+                .or_else(|| parse_name_list(case.agg_plaintiffs.as_deref()))
+        })
         .unwrap_or_else(pending);
     let opponent_parties = party_names(&parties, false)
         .or_else(|| parse_name_list(case.agg_defendants.as_deref()))
@@ -141,7 +160,10 @@ fn build_markdown(case: &Case) -> String {
     let fee_received = fee_amount_for(&fees, &["实收", "已收"]).unwrap_or_else(pending);
     let fee_advance = fee_amount_for(&fees, &["预收", "预收费"]).unwrap_or_else(pending);
     let fee_note = fee_notes(&fees).unwrap_or_else(pending);
-    let first_client = first_party(&parties, true);
+    let first_client = match explicit_representation {
+        Some(representation) => first_represented_party(&parties, representation),
+        None => first_party(&parties, true),
+    };
     let first_opponent = first_party(&parties, false);
 
     let mut out = String::new();
@@ -259,7 +281,7 @@ fn build_markdown(case: &Case) -> String {
     out.push_str("\n### 处理结果/案件结果\n\n");
     out.push_str(resolution);
     out.push('\n');
-    out
+    Ok(out)
 }
 
 fn parse_parties(raw: Option<&str>) -> Vec<Party> {
@@ -306,6 +328,65 @@ fn party_names(parties: &[Party], is_our_side: bool) -> Option<String> {
         .filter_map(|party| party.name.as_deref().and_then(non_empty))
         .collect::<Vec<_>>();
     (!names.is_empty()).then(|| names.join("、"))
+}
+
+fn represented_party_names(representation: &CaseRepresentation) -> String {
+    representation
+        .parties
+        .iter()
+        .map(|party| party.name.as_str())
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+fn first_represented_party<'a>(
+    parties: &'a [Party],
+    representation: &CaseRepresentation,
+) -> Option<&'a Party> {
+    parties.iter().find(|party| {
+        let (Some(name), Some(role)) = (party.name.as_deref(), party.role.as_deref()) else {
+            return false;
+        };
+        representation
+            .parties
+            .iter()
+            .any(|represented| represented.name == name.trim() && represented.role == role.trim())
+    })
+}
+
+fn validate_exact_representation_party_contacts(
+    parties: &[Party],
+    representation: &CaseRepresentation,
+) -> Result<(), String> {
+    for represented in &representation.parties {
+        let matched = parties
+            .iter()
+            .filter(|party| {
+                party
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.trim() == represented.name)
+                    && party
+                        .role
+                        .as_deref()
+                        .is_some_and(|role| role.trim() == represented.role)
+            })
+            .count();
+        if matched != 1 {
+            return Err(ambiguous_exact_party_contact_error(
+                &represented.name,
+                &represented.role,
+                matched,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ambiguous_exact_party_contact_error(name: &str, role: &str, matched: usize) -> String {
+    format!(
+        "精确委托人“{name}”（{role}）在当事人联系人中匹配{matched}条，当前版本无法自动区分。请先重新分析并核对；若仍存在同名同角色，请勿继续查询并人工核验。"
+    )
 }
 
 fn role_party_names(parties: &[Party], our_side: Option<&str>) -> Option<String> {

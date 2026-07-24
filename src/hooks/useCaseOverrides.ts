@@ -86,13 +86,19 @@ export function useCaseOverrides(
 
   // 写盘 — 把 latestRef 里的最新 overrides 提交到 SQLite
   const writeToDb = useCallback(async (cid: string, o: UserOverrides) => {
+    await updateCaseOverrides(cid, serializeOverrides(o));
+  }, []);
+
+  // debounce / 卸载路径没有等待者，保留原有的日志型失败处理；显式 flush 则必须把错误交还
+  // 给调用方，尤其是“先 flush 再 reset”不能在查询锁拒绝后继续执行专用 reset。
+  const writeToDbQuietly = useCallback(async (cid: string, o: UserOverrides) => {
     try {
-      await updateCaseOverrides(cid, serializeOverrides(o));
+      await writeToDb(cid, o);
     } catch (e) {
       // 写盘失败不阻塞编辑(下一次 mutation 会再触发写盘);只记 console 不弹错
       console.warn("updateCaseOverrides failed", e);
     }
-  }, []);
+  }, [writeToDb]);
 
   // 公共 flush:取消 timer 立刻写
   const flush = useCallback(async () => {
@@ -113,7 +119,7 @@ export function useCaseOverrides(
       // 强制 flush 上一案件的 pending 改动(不 await,避免阻塞 case 切换)
       clearTimeout(timerRef.current);
       timerRef.current = null;
-      void writeToDb(prevCid, latestRef.current);
+      void writeToDbQuietly(prevCid, latestRef.current);
     }
     caseIdRef.current = caseId;
     const seeded = parseOverrides(initialJson);
@@ -140,7 +146,7 @@ export function useCaseOverrides(
     // 故意只依赖 caseId,**不依赖 initialJson** — 防 mid-edit clobber:
     // 外部 setSelectedCase 刷新 caseData 时本 hook 不会重置 local overrides。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [caseId]);
+  }, [caseId, writeToDbQuietly]);
 
   // AI 工具写入同一覆盖层后，只在这一处监听并重读 DB；本地有待保存输入时不抢写。
   useEffect(() => {
@@ -174,10 +180,10 @@ export function useCaseOverrides(
         clearTimeout(timerRef.current);
         timerRef.current = null;
         const cid = caseIdRef.current;
-        if (cid) void writeToDb(cid, latestRef.current);
+        if (cid) void writeToDbQuietly(cid, latestRef.current);
       }
     };
-  }, [writeToDb]);
+  }, [writeToDbQuietly]);
 
   // 公共 mutation 包装:更新 state + ref + 重置 debounce timer
   const mutate = useCallback(
@@ -192,11 +198,11 @@ export function useCaseOverrides(
       if (cid) {
         timerRef.current = setTimeout(() => {
           timerRef.current = null;
-          void writeToDb(cid, latestRef.current);
+          void writeToDbQuietly(cid, latestRef.current);
         }, DEBOUNCE_MS);
       }
     },
-    [writeToDb],
+    [writeToDbQuietly],
   );
 
   const setField = useCallback(

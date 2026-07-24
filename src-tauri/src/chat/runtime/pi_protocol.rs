@@ -141,7 +141,10 @@ impl PiStartRequest {
         };
         let reasoning_model = {
             let model = config.model.to_ascii_lowercase();
-            model.contains("thinking") || model.contains("reason") || model.contains("-pro")
+            model.contains("thinking")
+                || model.contains("reason")
+                || model.contains("-pro")
+                || model == "deepseek-v4-flash"
         };
         let history = request
             .history

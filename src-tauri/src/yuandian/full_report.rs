@@ -106,8 +106,24 @@ pub async fn run_full_report(
     pool: &SqlitePool,
     case_id: &str,
     llm_config: &LlmConfig,
+) -> Result<FullReportResult, String> {
+    // 保持到前置报告读取、文件写入和 LLM 工作结束，禁止查询中变更精确委托人。
+    let _query_guard = super::orchestrator::acquire_execution_query_read_guard(case_id).await;
+    // 必须先于前置报告读取、目录/文件写入及 LLM 调用完成精确委托人守卫。
+    super::orchestrator::exact_representation_for_external_query(pool, case_id).await?;
+    let bound_inputs =
+        super::artifact_binding::load_full_inputs_for_current_owner(pool, case_id).await?;
+    Ok(run_full_report_inner(pool, case_id, llm_config, bound_inputs).await)
+}
+
+async fn run_full_report_inner(
+    pool: &SqlitePool,
+    case_id: &str,
+    llm_config: &LlmConfig,
+    bound_inputs: Option<super::artifact_binding::FullReportInputs>,
 ) -> FullReportResult {
     let start = std::time::Instant::now();
+    let uses_binding = bound_inputs.is_some();
     let err = |msg: String| FullReportResult {
         case_id: case_id.to_string(),
         report_path: None,
@@ -116,25 +132,33 @@ pub async fn run_full_report(
         error: Some(msg),
     };
 
-    // 1) 读 cases 拿两份前置报告的路径
-    let row: (Option<String>, Option<String>) = match sqlx::query_as(
-        "SELECT risk_assessment_path, deep_dive_report_path FROM cases WHERE id = ?",
-    )
-    .bind(case_id)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return err(format!("查 cases 失败:{}", e)),
-    };
-
-    let risk_path = match row.0 {
-        Some(p) if !p.is_empty() => p,
-        _ => return err("尚未生成风险报告(请先点「查被执行人」)".into()),
-    };
-    let dig_path = match row.1 {
-        Some(p) if !p.is_empty() => p,
-        _ => return err("尚未生成深挖报告(请先点「深挖」)".into()),
+    // 1) 新产物使用 DB owner 绑定给出的精确路径；历史粗立场案件兼容旧专用列。
+    let (risk_path, dig_path) = match bound_inputs {
+        Some(inputs) => (
+            inputs.risk_report_path.to_string_lossy().to_string(),
+            inputs.deep_report_path.to_string_lossy().to_string(),
+        ),
+        None => {
+            let row: (Option<String>, Option<String>) = match sqlx::query_as(
+                "SELECT risk_assessment_path, deep_dive_report_path FROM cases WHERE id = ?",
+            )
+            .bind(case_id)
+            .fetch_one(pool)
+            .await
+            {
+                Ok(row) => row,
+                Err(error) => return err(format!("查 cases 失败:{error}")),
+            };
+            let risk_path = match row.0 {
+                Some(path) if !path.is_empty() => path,
+                _ => return err("尚未生成风险报告(请先点「查被执行人」)".into()),
+            };
+            let deep_path = match row.1 {
+                Some(path) if !path.is_empty() => path,
+                _ => return err("尚未生成深挖报告(请先点「深挖」)".into()),
+            };
+            (risk_path, deep_path)
+        }
     };
 
     // 2) 读两份 MD
@@ -192,17 +216,22 @@ pub async fn run_full_report(
     }
     let report_path_str = report_path.to_string_lossy().to_string();
 
-    // 5) 写 cases
+    // 5) 新链路原子推进同一 owner 的完整报告绑定；历史粗立场链路保留旧路径兼容。
     let now = chrono::Utc::now().to_rfc3339();
-    if let Err(e) =
+    let publish_result = if uses_binding {
+        super::artifact_binding::publish_full(pool, case_id, &report_path_str, &now).await
+    } else {
         sqlx::query("UPDATE cases SET full_report_path = ?, full_report_at = ? WHERE id = ?")
             .bind(&report_path_str)
             .bind(&now)
             .bind(case_id)
             .execute(pool)
             .await
-    {
-        crate::dlog!("[full_report] 写 cases 失败:{}", e);
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    };
+    if let Err(error) = publish_result {
+        return err(format!("绑定完整报告到当前委托人失败:{error}"));
     }
 
     FullReportResult {

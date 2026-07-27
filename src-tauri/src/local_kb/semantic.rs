@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use walkdir::WalkDir;
 
+use crate::credentials_bridge::PendingCredentialSource;
 use crate::embedding::index::{chunk_text, Chunk};
 
 /// 普通材料的目标切片长度。法规仍严格逐条切，不受这个下限影响。
@@ -1006,7 +1007,7 @@ pub async fn build_or_update_index(
     kb_root: &Path,
     endpoint: &str,
     model: &str,
-    key: &str,
+    credential: &PendingCredentialSource,
     app: Option<&tauri::AppHandle>,
 ) -> Result<KbIndex, String> {
     use tauri::Emitter;
@@ -1099,7 +1100,7 @@ pub async fn build_or_update_index(
         let file_chunk_count = pieces.len();
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(pieces.len());
         for batch in pieces.chunks(EMBED_BATCH) {
-            let v = match crate::embedding::embed(endpoint, model, key, batch).await {
+            let v = match crate::embedding::embed(endpoint, model, credential, batch).await {
                 Ok(v) => v,
                 Err(e) => {
                     // 已完成但尚未达到常规 checkpoint 阈值的文件也要在报错前保住。
@@ -1182,7 +1183,7 @@ pub async fn semantic_search(
     top_n: usize,
     endpoint: &str,
     model: &str,
-    key: &str,
+    credential: &PendingCredentialSource,
 ) -> Result<Vec<KbHit>, String> {
     let mut index = load_index_cached().await;
     let current_root = canonical_root(kb_root);
@@ -1204,7 +1205,7 @@ pub async fn semantic_search(
         // 没建索引 / 换了 embedding 模型(向量维度/语义变了)→ 当未命中,提示重建
         return Ok(vec![]);
     }
-    let qv = crate::embedding::embed(endpoint, model, key, &[query.to_string()]).await?;
+    let qv = crate::embedding::embed(endpoint, model, credential, &[query.to_string()]).await?;
     let qv = qv.into_iter().next().ok_or("query embedding 返回空")?;
     let overfetch = top_n.saturating_mul(4).max(top_n);
     Ok(filter_inactive_semantic_hits(
@@ -1237,7 +1238,7 @@ pub async fn auto_update_index(
     kb_root: &Path,
     endpoint: &str,
     model: &str,
-    key: &str,
+    credential: &PendingCredentialSource,
     app: tauri::AppHandle,
 ) {
     use std::sync::atomic::Ordering;
@@ -1275,7 +1276,7 @@ pub async fn auto_update_index(
         AUTO_RUNNING.store(false, Ordering::SeqCst);
         return;
     }
-    if let Err(e) = build_or_update_index(kb_root, endpoint, model, key, Some(&app)).await {
+    if let Err(e) = build_or_update_index(kb_root, endpoint, model, credential, Some(&app)).await {
         crate::dlog!("[kb-semantic] 自动索引失败: {}", e);
     }
     AUTO_RUNNING.store(false, Ordering::SeqCst);

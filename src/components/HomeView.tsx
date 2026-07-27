@@ -86,6 +86,7 @@ import { HomeFeatureCard, HomeFeatureCardScrollArea } from "./HomeFeatureCard";
 import { buildDashboardAssistantContext } from "./dashboardAssistantContext";
 import { countOpenCaseRows, isOpenCaseStatus } from "./homeCaseCounts";
 import {
+  clearHomeListFilters,
   loadHomeListPreferences,
   saveHomeListPreferences,
   type HomeSortDir,
@@ -188,8 +189,10 @@ export function HomeView({
   const [viewMode, setViewMode] = useState<ViewMode>(initialListPreferences.viewMode);
   const [sortKey, setSortKey] = useState<SortKey>(initialListPreferences.sortKey);
   const [sortDir, setSortDir] = useState<SortDir>(initialListPreferences.sortDir);
-  const [statusFilters, setStatusFilters] = useState<Set<StatusId>>(new Set());
-  const [courtFilter, setCourtFilter] = useState("");
+  const [statusFilters, setStatusFilters] = useState<Set<StatusId>>(
+    () => new Set(initialListPreferences.statusFilters),
+  );
+  const [courtFilter, setCourtFilter] = useState(initialListPreferences.courtFilter);
   // 2026-06-16 · 首页模糊搜索(原告/被告名,公司或人名都可子串匹配)
   const [search, setSearch] = useState("");
   // 带日期的待办 → 汇入日程日历(2026-06-14:手动日程 = 带日期的待办)
@@ -215,8 +218,14 @@ export function HomeView({
   const [ticktickOn] = useFeatureFlag("home_ticktick");
 
   useEffect(() => {
-    saveHomeListPreferences({ viewMode, sortKey, sortDir });
-  }, [sortDir, sortKey, viewMode]);
+    saveHomeListPreferences({
+      viewMode,
+      sortKey,
+      sortDir,
+      statusFilters: [...statusFilters],
+      courtFilter,
+    });
+  }, [courtFilter, sortDir, sortKey, statusFilters, viewMode]);
 
   const reloadManualEvents = () => {
     listCalendarEvents()
@@ -641,8 +650,16 @@ export function HomeView({
   };
 
   const clearFilters = () => {
-    setStatusFilters(new Set());
-    setCourtFilter("");
+    const clearedPreferences = clearHomeListFilters({
+      viewMode,
+      sortKey,
+      sortDir,
+      statusFilters: [...statusFilters],
+      courtFilter,
+    });
+    setStatusFilters(new Set(clearedPreferences.statusFilters));
+    setCourtFilter(clearedPreferences.courtFilter);
+    saveHomeListPreferences(clearedPreferences);
     setSearch("");
   };
 

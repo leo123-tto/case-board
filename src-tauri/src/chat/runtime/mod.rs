@@ -399,7 +399,16 @@ pub fn uses_cloud_model_config(settings: &Settings) -> bool {
 
 /// 在创建用户消息、启动 Agent Loop 之前校验 AI 助手真正会走的模型配置。
 /// Native / Pi 兼容模式检查“材料处理模型”；Pi 独立 Provider 检查 provider+model 和凭据库。
-pub fn validate_ai_assistant_ready(settings: &Settings) -> Result<(), String> {
+pub async fn validate_ai_assistant_ready(settings: &Settings) -> Result<(), String> {
+    if uses_cloud_model_config(settings) {
+        settings
+            .validate_material_llm_non_secret_config()
+            .map_err(|error| format!("AI 助手当前使用材料处理模型，但{error}"))?;
+        return LlmConfig::from_settings(settings)
+            .ensure_material_ready()
+            .await
+            .map_err(|error| format!("AI 助手当前使用材料处理模型，但{error}"));
+    }
     validate_ai_assistant_ready_with_vault(settings, &pi_credentials::OsPiCredentialVault)
 }
 
@@ -407,12 +416,6 @@ fn validate_ai_assistant_ready_with_vault(
     settings: &Settings,
     vault: &dyn pi_credentials::PiCredentialVault,
 ) -> Result<(), String> {
-    if uses_cloud_model_config(settings) {
-        return settings
-            .validate_material_llm_ready()
-            .map_err(|error| format!("AI 助手当前使用材料处理模型，但{error}"));
-    }
-
     const SETTINGS_HINT: &str = "请前往「设置 → 大脑 → Pi Provider」完成配置后重试。";
     let provider_id = settings
         .pi_provider_id

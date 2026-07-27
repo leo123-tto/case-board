@@ -20,6 +20,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::chat::mcp_bridge::McpServerConfig;
 use crate::db::app_data_dir;
@@ -293,6 +294,123 @@ pub struct Settings {
 }
 
 impl Settings {
+    pub(crate) fn clear_bridge_authoritative_plaintext(&mut self) {
+        for secret in [
+            &mut self.mineru_api_key,
+            &mut self.paddle_vl_api_key,
+            &mut self.cloud_llm_api_key,
+            &mut self.minimax_api_key,
+            &mut self.compat_llm_api_key,
+            &mut self.glm_llm_api_key,
+            &mut self.mimo_llm_api_key,
+            &mut self.kimi_llm_api_key,
+            &mut self.custom_llm_api_key,
+            &mut self.yuandian_api_key,
+            &mut self.kuaidi100_key,
+            &mut self.embedding_api_key,
+            &mut self.feishu_webhook_url,
+        ] {
+            clear_optional_secret(secret);
+        }
+        for server in &mut self.mcp_servers {
+            match &mut server.transport {
+                crate::chat::mcp_bridge::McpTransport::Stdio { env, .. } => {
+                    env.values_mut().for_each(Zeroize::zeroize);
+                    env.clear();
+                }
+                crate::chat::mcp_bridge::McpTransport::Http { headers, .. } => {
+                    headers.values_mut().for_each(Zeroize::zeroize);
+                    headers.clear();
+                }
+            }
+        }
+    }
+
+    pub fn frontend_safe_view(mut self) -> serde_json::Value {
+        self.clear_bridge_authoritative_plaintext();
+        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        let Some(object) = value.as_object_mut() else {
+            return serde_json::json!({});
+        };
+        for field in [
+            "mineru_api_key",
+            "paddle_vl_api_key",
+            "cloud_llm_api_key",
+            "minimax_api_key",
+            "compat_llm_api_key",
+            "glm_llm_api_key",
+            "mimo_llm_api_key",
+            "kimi_llm_api_key",
+            "custom_llm_api_key",
+            "yuandian_api_key",
+            "kuaidi100_key",
+            "embedding_api_key",
+            "feishu_webhook_url",
+        ] {
+            object.remove(field);
+        }
+        value
+    }
+
+    fn restore_bridge_plaintext_from(&mut self, source: &mut Self) {
+        macro_rules! move_secret {
+            ($field:ident) => {{
+                clear_optional_secret(&mut self.$field);
+                self.$field = source.$field.take();
+            }};
+        }
+        move_secret!(mineru_api_key);
+        move_secret!(paddle_vl_api_key);
+        move_secret!(cloud_llm_api_key);
+        move_secret!(minimax_api_key);
+        move_secret!(compat_llm_api_key);
+        move_secret!(glm_llm_api_key);
+        move_secret!(mimo_llm_api_key);
+        move_secret!(kimi_llm_api_key);
+        move_secret!(custom_llm_api_key);
+        move_secret!(yuandian_api_key);
+        move_secret!(kuaidi100_key);
+        move_secret!(embedding_api_key);
+        move_secret!(feishu_webhook_url);
+
+        for target in &mut self.mcp_servers {
+            match &mut target.transport {
+                crate::chat::mcp_bridge::McpTransport::Stdio { env, .. } => {
+                    env.values_mut().for_each(Zeroize::zeroize);
+                    env.clear();
+                }
+                crate::chat::mcp_bridge::McpTransport::Http { headers, .. } => {
+                    headers.values_mut().for_each(Zeroize::zeroize);
+                    headers.clear();
+                }
+            }
+            let Some(legacy) = source
+                .mcp_servers
+                .iter_mut()
+                .find(|candidate| candidate.instance_id == target.instance_id)
+            else {
+                continue;
+            };
+            match (&mut target.transport, &mut legacy.transport) {
+                (
+                    crate::chat::mcp_bridge::McpTransport::Stdio { env: target, .. },
+                    crate::chat::mcp_bridge::McpTransport::Stdio { env: legacy, .. },
+                )
+                | (
+                    crate::chat::mcp_bridge::McpTransport::Http {
+                        headers: target, ..
+                    },
+                    crate::chat::mcp_bridge::McpTransport::Http {
+                        headers: legacy, ..
+                    },
+                ) => {
+                    *target = std::mem::take(legacy);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 获取**真实生效**的 OCR provider。
     ///
     /// **V0.3(2026-05-31)暂时隐藏本地模型 → 强制云端(MinerU)。** 本地分支代码
@@ -383,61 +501,24 @@ impl Settings {
         current.or_else(|| Self::clean_string(&self.compat_llm_verified_at))
     }
 
-    /// 案件材料处理（文档字段抽取、全案分析、报告生成）启动前的统一配置门禁。
+    /// 案件材料处理启动前的非秘密配置门禁。
     ///
-    /// 不能只检查 key 非空：用户切换服务商或改过 key 后，必须重新验证成功，才能避免
-    /// 后台批量任务启动后才逐份失败。错误文本直接给出 UI 中的准确入口。
-    pub fn validate_material_llm_ready(&self) -> Result<(), String> {
+    /// 凭据可用性必须由 `LlmConfig::ensure_material_ready` 读取 bridge metadata 判断；
+    /// 这里仅校验自定义 Provider 的 endpoint/model，不读取 legacy API key 或 verified_at。
+    pub fn validate_material_llm_non_secret_config(&self) -> Result<(), String> {
         const SETTINGS_HINT: &str = "请前往「设置 → 大脑 → 材料处理模型」填写并验证后重试。";
         let backend = self.effective_cloud_llm_backend();
-        let (label, api_key, verified_at) = if backend == "minimax" {
-            (
-                "MiniMax",
-                Self::clean_string(&self.minimax_api_key),
-                Self::clean_string(&self.minimax_verified_at),
-            )
-        } else if self.cloud_llm_is_compat() {
-            let label = match backend {
-                "glm" => "智谱 GLM",
-                "mimo" => "小米 MiMo",
-                "kimi" => "Kimi",
-                "custom" => "自定义模型",
-                _ => "云端模型",
-            };
-            if backend == "custom" {
-                if self.effective_compat_llm_endpoint().is_none() {
-                    return Err(format!(
-                        "材料处理模型未配置完整：尚未填写自定义模型接口地址。{SETTINGS_HINT}"
-                    ));
-                }
-                if self.effective_compat_llm_model().is_none() {
-                    return Err(format!(
-                        "材料处理模型未配置完整：尚未填写自定义模型名称。{SETTINGS_HINT}"
-                    ));
-                }
+        if backend == "custom" {
+            if self.effective_compat_llm_endpoint().is_none() {
+                return Err(format!(
+                    "材料处理模型未配置完整：尚未填写自定义模型接口地址。{SETTINGS_HINT}"
+                ));
             }
-            (
-                label,
-                self.effective_compat_llm_api_key(),
-                self.effective_compat_llm_verified_at(),
-            )
-        } else {
-            (
-                "DeepSeek",
-                Self::clean_string(&self.cloud_llm_api_key),
-                Self::clean_string(&self.deepseek_verified_at),
-            )
-        };
-
-        if api_key.is_none() {
-            return Err(format!(
-                "材料处理模型未配置完整：尚未填写 {label} API Key。{SETTINGS_HINT}"
-            ));
-        }
-        if verified_at.is_none() {
-            return Err(format!(
-                "材料处理模型未配置完整：{label} API Key 尚未验证成功。{SETTINGS_HINT}"
-            ));
+            if self.effective_compat_llm_model().is_none() {
+                return Err(format!(
+                    "材料处理模型未配置完整：尚未填写自定义模型名称。{SETTINGS_HINT}"
+                ));
+            }
         }
         Ok(())
     }
@@ -513,15 +594,11 @@ impl Settings {
         true
     }
 
-    /// 云端 OCR 主力(2026-06-12)。`"paddle-vl"` 仅当用户显式选择**且** key 已填才生效,
-    /// 否则一律 `"mineru"`(老用户 / key 被清掉后零感知回到原行为)。
+    /// 云端 OCR 主力(2026-06-12)。这里只读取非秘密的用户选择；凭据 readiness
+    /// 由 typed bridge metadata/lease 在真实操作前判定。
     pub fn effective_ocr_cloud_primary(&self) -> &str {
-        let paddle_key_set = self
-            .paddle_vl_api_key
-            .as_deref()
-            .is_some_and(|k| !k.trim().is_empty());
         match self.ocr_cloud_primary.as_deref() {
-            Some("paddle-vl") if paddle_key_set => "paddle-vl",
+            Some("paddle-vl") => "paddle-vl",
             _ => "mineru",
         }
     }
@@ -537,6 +614,13 @@ impl Settings {
     pub fn needs_local_server(&self) -> bool {
         self.effective_ocr_provider() == "local" || self.effective_llm_provider() == "local"
     }
+}
+
+fn clear_optional_secret(secret: &mut Option<String>) {
+    if let Some(value) = secret {
+        value.zeroize();
+    }
+    *secret = None;
 }
 
 impl Settings {
@@ -615,12 +699,49 @@ pub fn read_settings() -> Result<Settings, String> {
 }
 
 /// 写入设置(覆盖)。会自动创建父目录。
+pub fn serialize_for_persistence(settings: &Settings) -> Result<String, String> {
+    let safe = settings_for_persistence(settings, None, true);
+    serde_json::to_string_pretty(&safe).map_err(|e| format!("序列化失败: {}", e))
+}
+
+fn settings_for_persistence(
+    settings: &Settings,
+    mut legacy: Option<Settings>,
+    sanitization_active: bool,
+) -> Settings {
+    let mut safe = settings.clone();
+    if sanitization_active {
+        safe.clear_bridge_authoritative_plaintext();
+    } else if let Some(legacy) = &mut legacy {
+        safe.restore_bridge_plaintext_from(legacy);
+    } else {
+        safe.clear_bridge_authoritative_plaintext();
+    }
+    safe
+}
+
+/// 写入设置(覆盖)。已切入 credential bridge 的字段永远不会重新落回明文 settings。
 pub fn write_settings(settings: &Settings) -> Result<(), String> {
     let path = settings_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("建目录失败: {}", e))?;
     }
-    let text = serde_json::to_string_pretty(settings).map_err(|e| format!("序列化失败: {}", e))?;
+    let app_data_root = path.parent().ok_or("settings.json 缺少父目录")?;
+    let sanitization_active =
+        crate::credentials_bridge::settings_sanitization_is_active(app_data_root)
+            .map_err(|error| format!("无法确认凭据净化状态: {error}"))?;
+    let legacy = if !sanitization_active && path.exists() {
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("读 settings.json 失败: {}", e))?;
+        Some(
+            serde_json::from_str::<Settings>(&text)
+                .map_err(|e| format!("settings.json 格式错误: {}", e))?,
+        )
+    } else {
+        None
+    };
+    let safe = settings_for_persistence(settings, legacy, sanitization_active);
+    let text = serde_json::to_string_pretty(&safe).map_err(|e| format!("序列化失败: {}", e))?;
     std::fs::write(&path, text).map_err(|e| format!("写 settings.json 失败: {}", e))?;
     Ok(())
 }

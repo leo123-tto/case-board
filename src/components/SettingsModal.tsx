@@ -38,6 +38,8 @@ import { KbSemanticIndexCard } from "@/components/KbSemanticIndexCard";
 import { KbGuideCard } from "@/components/KbGuideCard";
 import { DeviceSyncCard } from "@/components/DeviceSyncCard";
 import { NetworkResearchSettingsCard } from "@/components/NetworkResearchSettingsCard";
+import { CredentialField } from "@/components/settings/CredentialField";
+import { LegacyCredentialMigrationCard } from "@/components/settings/LegacyCredentialMigrationCard";
 import {
   createLocalKb,
   checkPiRuntimeUpdate,
@@ -49,6 +51,7 @@ import {
   getPiRuntimeStatus,
   getPiProviderCatalog,
   getPiCredentialStatus,
+  getLegacyCredentialMigrationStatus,
   getYuandianBalance,
   getYuandianCreditsOverview,
   importKbFromZip,
@@ -65,17 +68,15 @@ import {
   openInDefaultApp,
   openUrl,
   listLegalSkills,
+  listCredentialMetadata,
   parseMcpPaste,
   saveSettings,
+  saveCredential,
+  startLegacyCredentialMigration,
   testMcpServer,
-  verifyDeepSeekKey,
-  verifyMiniMaxKey,
-  verifyOpenAICompatKey,
-  verifyMinerUKey,
-  verifyPaddleVlKey,
+  verifyCredential,
   verifyPiProvider,
-  verifyEmbeddingKey,
-  verifyYuandianKey,
+  revokeCredential,
   type KbConflictStrategy,
   type KbImportResult,
   type KbStatus,
@@ -90,7 +91,15 @@ import {
   type PiProviderAuthEvent,
   type LegalSkillSummary,
 } from "@/lib/api";
-import type { Settings, McpServerConfig, PiThinkingLevel } from "@/lib/types";
+import type {
+  Settings,
+  McpServerConfig,
+  PiThinkingLevel,
+  CredentialKind,
+  CredentialMetadata,
+  LegacyCredentialMigrationStatus,
+} from "@/lib/types";
+import { sanitizeSettingsForFrontend } from "@/lib/credentials";
 import { cn } from "@/lib/utils";
 import { effectiveAgentRuntime } from "@/lib/piRuntime";
 import {
@@ -116,21 +125,13 @@ type CompatBackend = "glm" | "mimo" | "kimi" | "custom";
 type CompatSettingKey =
   | "glm_llm_endpoint"
   | "glm_llm_model"
-  | "glm_llm_api_key"
-  | "glm_llm_verified_at"
   | "mimo_llm_endpoint"
   | "mimo_llm_model"
-  | "mimo_llm_api_key"
-  | "mimo_llm_verified_at"
   | "kimi_llm_endpoint"
   | "kimi_llm_model"
-  | "kimi_llm_api_key"
-  | "kimi_llm_verified_at"
   | "custom_llm_endpoint"
-  | "custom_llm_model"
-  | "custom_llm_api_key"
-  | "custom_llm_verified_at";
-type CompatFieldKind = "endpoint" | "model" | "apiKey" | "verifiedAt";
+  | "custom_llm_model";
+type CompatFieldKind = "endpoint" | "model";
 
 const PI_THINKING_LEVELS: PiThinkingLevel[] = [
   "off",
@@ -214,33 +215,23 @@ const COMPAT_FIELD_KEYS: Record<
   {
     endpoint: CompatSettingKey;
     model: CompatSettingKey;
-    apiKey: CompatSettingKey;
-    verifiedAt: CompatSettingKey;
   }
 > = {
   glm: {
     endpoint: "glm_llm_endpoint",
     model: "glm_llm_model",
-    apiKey: "glm_llm_api_key",
-    verifiedAt: "glm_llm_verified_at",
   },
   mimo: {
     endpoint: "mimo_llm_endpoint",
     model: "mimo_llm_model",
-    apiKey: "mimo_llm_api_key",
-    verifiedAt: "mimo_llm_verified_at",
   },
   kimi: {
     endpoint: "kimi_llm_endpoint",
     model: "kimi_llm_model",
-    apiKey: "kimi_llm_api_key",
-    verifiedAt: "kimi_llm_verified_at",
   },
   custom: {
     endpoint: "custom_llm_endpoint",
     model: "custom_llm_model",
-    apiKey: "custom_llm_api_key",
-    verifiedAt: "custom_llm_verified_at",
   },
 };
 
@@ -262,14 +253,7 @@ function legacyCompatValue(
   settings: Settings,
   kind: CompatFieldKind,
 ): string | null {
-  const key =
-    kind === "apiKey"
-      ? "compat_llm_api_key"
-      : kind === "verifiedAt"
-        ? "compat_llm_verified_at"
-        : kind === "model"
-          ? "compat_llm_model"
-          : "compat_llm_endpoint";
+  const key = kind === "model" ? "compat_llm_model" : "compat_llm_endpoint";
   const value = settings[key];
   return typeof value === "string" && value.trim() ? value : null;
 }
@@ -368,11 +352,72 @@ export function SettingsModal({
     [],
   );
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [credentialMetadata, setCredentialMetadata] = useState<CredentialMetadata[]>([]);
+  const [legacyMigrationStatus, setLegacyMigrationStatus] =
+    useState<LegacyCredentialMigrationStatus | null>(null);
   const savedWeatherCityRef = useRef<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false); // page 模式下保存成功显示 toast(modal 模式直接关闭)
+
+  const credentialFor = useCallback(
+    (providerOrConnectorId: string, kind?: CredentialKind) =>
+      credentialMetadata.find(
+        (item) =>
+          item.provider_or_connector_id === providerOrConnectorId
+          && (kind === undefined || item.kind === kind),
+      ) ?? null,
+    [credentialMetadata],
+  );
+
+  const replaceCredentialMetadata = useCallback((next: CredentialMetadata) => {
+    setCredentialMetadata((previous) => [
+      ...previous.filter((item) => item.handle !== next.handle),
+      next,
+    ]);
+  }, []);
+
+  const saveBridgeCredential = useCallback(
+    async (
+      providerOrConnectorId: string,
+      kind: CredentialKind,
+      secretInput: string,
+      stableInventoryId?: string,
+    ) => {
+      const current = credentialFor(providerOrConnectorId, kind);
+      const next = await saveCredential({
+        handle: current?.handle ?? null,
+        providerOrConnectorId,
+        kind,
+        secretInput,
+        stableInventoryId,
+      });
+      replaceCredentialMetadata(next);
+      return next;
+    },
+    [credentialFor, replaceCredentialMetadata],
+  );
+
+  const verifyBridgeCredential = useCallback(
+    async (providerOrConnectorId: string, kind: CredentialKind) => {
+      const current = credentialFor(providerOrConnectorId, kind);
+      if (!current) throw new Error("凭据尚未配置");
+      const next = await verifyCredential(current.handle, current.revision);
+      replaceCredentialMetadata(next);
+      return next;
+    },
+    [credentialFor, replaceCredentialMetadata],
+  );
+
+  const revokeBridgeCredential = useCallback(
+    async (handle: string, revision: number) => {
+      const next = await revokeCredential(handle, revision);
+      replaceCredentialMetadata(next);
+      return next;
+    },
+    [replaceCredentialMetadata],
+  );
   // 2026-05-25 V0.1.8 · 是否有未保存改动(page 模式上报给父组件做切 tab 防呆)
   const [dirty, setDirty] = useState(false);
   // 设置页里的界面开关先暂存，跟后端设置一起在「保存」时落盘。
@@ -391,25 +436,6 @@ export function SettingsModal({
   // 导入缺 LLM key 跳设置时父组件传 initialTab="brain" 深链到大脑(a92ae91 校验的是 LLM key)。
   const [tab, setTab] = useState<SettingsTab>(initialTab ?? "general");
 
-  // 2026-05-25 V0.1.6 · token 在线验证状态
-  const [mineruStatus, setMineruStatus] = useState<VerifyStatus>("idle");
-  const [mineruMsg, setMineruMsg] = useState<string>("");
-  // 2026-06-12 · PaddleOCR VL(AI Studio)访问令牌验证状态
-  const [paddleStatus, setPaddleStatus] = useState<VerifyStatus>("idle");
-  const [paddleMsg, setPaddleMsg] = useState<string>("");
-  const [deepseekStatus, setDeepseekStatus] = useState<VerifyStatus>("idle");
-  const [deepseekMsg, setDeepseekMsg] = useState<string>("");
-  // 2026-06-15 · MiniMax API key 在线验证状态
-  const [minimaxStatus, setMinimaxStatus] = useState<VerifyStatus>("idle");
-  const [minimaxMsg, setMinimaxMsg] = useState<string>("");
-  // 2026-06-16 · 通用 OpenAI 兼容后端(GLM/MiMo/自定义)在线验证状态
-  const [compatStatus, setCompatStatus] = useState<VerifyStatus>("idle");
-  const [compatMsg, setCompatMsg] = useState<string>("");
-  // 2026-05-25 V0.1.8 · 元典 API key 在线验证状态
-  const [yuandianStatus, setYuandianStatus] = useState<VerifyStatus>("idle");
-  const [yuandianMsg, setYuandianMsg] = useState<string>("");
-  const [embeddingStatus, setEmbeddingStatus] = useState<VerifyStatus>("idle");
-  const [embeddingMsg, setEmbeddingMsg] = useState<string>("");
   const [piRuntimeStatus, setPiRuntimeStatus] = useState<PiRuntimeStatus | null>(null);
   const [checkingPiRuntime, setCheckingPiRuntime] = useState(false);
   const [piUpdateInfo, setPiUpdateInfo] = useState<PiRuntimeUpdateInfo | null>(null);
@@ -620,197 +646,6 @@ export function SettingsModal({
     }
   }, [checkPiRuntime]);
 
-  // settings 加载完后,如果 verified_at 非空,初始化为 "ok"(从 DB 读出来的已验证状态)
-  useEffect(() => {
-    if (!settings) return;
-    if (settings.mineru_verified_at && mineruStatus === "idle") {
-      setMineruStatus("ok");
-    }
-    if (settings.paddle_vl_verified_at && paddleStatus === "idle") {
-      setPaddleStatus("ok");
-    }
-    if (settings.deepseek_verified_at && deepseekStatus === "idle") {
-      setDeepseekStatus("ok");
-    }
-    if (settings.minimax_verified_at && minimaxStatus === "idle") {
-      setMinimaxStatus("ok");
-    }
-    const backend = isCompatBackend(settings.cloud_llm_backend)
-      ? settings.cloud_llm_backend
-      : null;
-    const compatVerifiedAt = backend
-      ? effectiveCompatValue(settings, backend, "verifiedAt")
-      : null;
-    if (compatVerifiedAt && compatStatus === "idle") {
-      setCompatStatus("ok");
-    }
-    if (settings.yuandian_verified_at && yuandianStatus === "idle") {
-      setYuandianStatus("ok");
-    }
-    if (settings.embedding_verified_at && embeddingStatus === "idle") {
-      setEmbeddingStatus("ok");
-    }
-    // 只在初次加载时设
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    settings?.mineru_verified_at,
-    settings?.paddle_vl_verified_at,
-    settings?.deepseek_verified_at,
-    settings?.minimax_verified_at,
-    settings?.cloud_llm_backend,
-    settings?.compat_llm_verified_at,
-    settings?.glm_llm_verified_at,
-    settings?.mimo_llm_verified_at,
-    settings?.kimi_llm_verified_at,
-    settings?.custom_llm_verified_at,
-    settings?.yuandian_verified_at,
-  ]);
-
-  async function handleVerifyMineru() {
-    if (!settings?.mineru_api_key?.trim()) {
-      setMineruStatus("fail");
-      setMineruMsg("请先填入 Token");
-      return;
-    }
-    setMineruStatus("verifying");
-    setMineruMsg("");
-    try {
-      const r = await verifyMinerUKey(settings.mineru_api_key);
-      if (r.ok) {
-        setMineruStatus("ok");
-        setMineruMsg("");
-        updateField("mineru_verified_at", new Date().toISOString());
-      } else {
-        setMineruStatus("fail");
-        setMineruMsg(r.message);
-        updateField("mineru_verified_at", null);
-      }
-    } catch (e) {
-      setMineruStatus("fail");
-      setMineruMsg(String(e));
-      updateField("mineru_verified_at", null);
-    }
-  }
-
-  async function handleVerifyPaddle() {
-    if (!settings?.paddle_vl_api_key?.trim()) {
-      setPaddleStatus("fail");
-      setPaddleMsg("请先填入访问令牌");
-      return;
-    }
-    setPaddleStatus("verifying");
-    setPaddleMsg("");
-    try {
-      const r = await verifyPaddleVlKey(settings.paddle_vl_api_key);
-      if (r.ok) {
-        setPaddleStatus("ok");
-        setPaddleMsg("");
-        updateField("paddle_vl_verified_at", new Date().toISOString());
-      } else {
-        setPaddleStatus("fail");
-        setPaddleMsg(r.message);
-        updateField("paddle_vl_verified_at", null);
-      }
-    } catch (e) {
-      setPaddleStatus("fail");
-      setPaddleMsg(String(e));
-      updateField("paddle_vl_verified_at", null);
-    }
-  }
-
-  async function handleVerifyDeepSeek() {
-    if (!settings?.cloud_llm_api_key?.trim()) {
-      setDeepseekStatus("fail");
-      setDeepseekMsg("请先填入 API Key");
-      return;
-    }
-    setDeepseekStatus("verifying");
-    setDeepseekMsg("");
-    try {
-      const r = await verifyDeepSeekKey(
-        settings.cloud_llm_api_key,
-        settings.cloud_llm_endpoint ?? undefined,
-      );
-      if (r.ok) {
-        setDeepseekStatus("ok");
-        setDeepseekMsg("");
-        updateField("deepseek_verified_at", new Date().toISOString());
-      } else {
-        setDeepseekStatus("fail");
-        setDeepseekMsg(r.message);
-        updateField("deepseek_verified_at", null);
-      }
-    } catch (e) {
-      setDeepseekStatus("fail");
-      setDeepseekMsg(String(e));
-      updateField("deepseek_verified_at", null);
-    }
-  }
-
-  async function handleVerifyMiniMax() {
-    if (!settings?.minimax_api_key?.trim()) {
-      setMinimaxStatus("fail");
-      setMinimaxMsg("请先填入 API Key");
-      return;
-    }
-    setMinimaxStatus("verifying");
-    setMinimaxMsg("");
-    try {
-      const r = await verifyMiniMaxKey(
-        settings.minimax_api_key,
-        settings.minimax_endpoint ?? undefined,
-      );
-      if (r.ok) {
-        setMinimaxStatus("ok");
-        setMinimaxMsg("");
-        updateField("minimax_verified_at", new Date().toISOString());
-      } else {
-        setMinimaxStatus("fail");
-        setMinimaxMsg(r.message);
-        updateField("minimax_verified_at", null);
-      }
-    } catch (e) {
-      setMinimaxStatus("fail");
-      setMinimaxMsg(String(e));
-      updateField("minimax_verified_at", null);
-    }
-  }
-
-  async function handleVerifyCompat() {
-    if (!settings || !isCompatBackend(settings.cloud_llm_backend)) return;
-    const keys = COMPAT_FIELD_KEYS[settings.cloud_llm_backend];
-    const apiKey = effectiveCompatValue(settings, settings.cloud_llm_backend, "apiKey") || "";
-    const endpoint = effectiveCompatValue(settings, settings.cloud_llm_backend, "endpoint") || "";
-    const model = effectiveCompatValue(settings, settings.cloud_llm_backend, "model") || "";
-    if (!apiKey.trim()) {
-      setCompatStatus("fail");
-      setCompatMsg("请先填入 API Key");
-      return;
-    }
-    setCompatStatus("verifying");
-    setCompatMsg("");
-    try {
-      const r = await verifyOpenAICompatKey(
-        apiKey,
-        endpoint,
-        model,
-      );
-      if (r.ok) {
-        setCompatStatus("ok");
-        setCompatMsg("");
-        updateField(keys.verifiedAt, new Date().toISOString());
-      } else {
-        setCompatStatus("fail");
-        setCompatMsg(r.message);
-        updateField(keys.verifiedAt, null);
-      }
-    } catch (e) {
-      setCompatStatus("fail");
-      setCompatMsg(String(e));
-      updateField(keys.verifiedAt, null);
-    }
-  }
-
   // 切换云端 AI 后端。deepseek→存 null(默认);minimax→"minimax";glm/mimo/custom→预填兼容配置。
   function handleChangeBackend(value: string) {
     if (value === "minimax") {
@@ -828,69 +663,23 @@ export function SettingsModal({
         setStringSetting(patch, keys.model, preset.model || null);
       }
       updateFields(patch);
-      setCompatStatus("idle");
-      setCompatMsg("");
       return;
     }
     updateField("cloud_llm_backend", null); // deepseek / 默认
   }
 
-  async function handleVerifyYuandian() {
-    if (!settings?.yuandian_api_key?.trim()) {
-      setYuandianStatus("fail");
-      setYuandianMsg("请先填入 API Key");
-      return;
-    }
-    setYuandianStatus("verifying");
-    setYuandianMsg("");
-    try {
-      const r = await verifyYuandianKey(settings.yuandian_api_key);
-      if (r.ok) {
-        setYuandianStatus("ok");
-        setYuandianMsg("");
-        updateField("yuandian_verified_at", new Date().toISOString());
-      } else {
-        setYuandianStatus("fail");
-        setYuandianMsg(r.message);
-        updateField("yuandian_verified_at", null);
-      }
-    } catch (e) {
-      setYuandianStatus("fail");
-      setYuandianMsg(String(e));
-      updateField("yuandian_verified_at", null);
-    }
-  }
-
-  async function handleVerifyEmbedding() {
-    if (!settings?.embedding_api_key?.trim()) {
-      setEmbeddingStatus("fail");
-      setEmbeddingMsg("请先填入 API Key");
-      return;
-    }
-    setEmbeddingStatus("verifying");
-    setEmbeddingMsg("");
-    try {
-      const dim = await verifyEmbeddingKey(
-        settings.embedding_endpoint ?? "",
-        settings.embedding_model ?? "",
-        settings.embedding_api_key,
-      );
-      setEmbeddingStatus("ok");
-      setEmbeddingMsg(`✓ 已验证 · 向量维度 ${dim}`);
-      updateField("embedding_verified_at", new Date().toISOString());
-    } catch (e) {
-      setEmbeddingStatus("fail");
-      setEmbeddingMsg(String(e));
-      updateField("embedding_verified_at", null);
-    }
-  }
-
   useEffect(() => {
     let cancelled = false;
-    getSettings()
-      .then((s) => {
+    Promise.all([
+      getSettings(),
+      listCredentialMetadata().catch(() => []),
+      getLegacyCredentialMigrationStatus().catch(() => null),
+    ])
+      .then(([s, metadata, migrationStatus]) => {
         if (!cancelled) {
-          setSettings(s);
+          setSettings(sanitizeSettingsForFrontend(s));
+          setCredentialMetadata(metadata);
+          setLegacyMigrationStatus(migrationStatus);
           savedWeatherCityRef.current = normalizeWeatherCity(s.weather_city);
         }
       })
@@ -1113,7 +902,7 @@ export function SettingsModal({
     setDirty(true);
   }
 
-  // 一次更新多个字段(切换云端服务商时:backend + 预填 endpoint/model + 清 key/verified 要原子改)
+  // 一次更新多个非敏感字段（例如切换服务商时预填 endpoint/model）。
   function updateFields(patch: Partial<Settings>) {
     setSettings((prev) => (prev ? { ...prev, ...patch } : prev));
     setDirty(true);
@@ -1137,12 +926,6 @@ export function SettingsModal({
         keys.model,
         legacyCompatValue(current, "model") || COMPAT_PRESETS[backend].model || null,
       );
-    }
-    if (!compatValue(next, backend, "apiKey")) {
-      setStringSetting(next, keys.apiKey, legacyCompatValue(current, "apiKey"));
-    }
-    if (!compatValue(next, backend, "verifiedAt")) {
-      setStringSetting(next, keys.verifiedAt, legacyCompatValue(current, "verifiedAt"));
     }
     return next;
   }
@@ -1184,6 +967,18 @@ export function SettingsModal({
           )}
           {!loading && settings && (
             <>
+            {legacyMigrationStatus && (
+              <div className="mb-5">
+                <LegacyCredentialMigrationCard
+                  status={legacyMigrationStatus}
+                  onMigrate={async (confirmed) => {
+                    const next = await startLegacyCredentialMigration(confirmed);
+                    setLegacyMigrationStatus(next);
+                    setCredentialMetadata(await listCredentialMetadata());
+                  }}
+                />
+              </div>
+            )}
             {/* 2026-06-16 · 标签页导航:按类型归拢散乱配置 */}
             <div
               className="mb-6 flex items-start gap-3 border-b border-border pb-3"
@@ -1333,63 +1128,16 @@ export function SettingsModal({
                       href: "https://aistudio.baidu.com/account/accessToken",
                     }}
                   >
-                    <Field
-                      label="访问令牌"
+                    <CredentialField
+                      label="PaddleOCR Token"
+                      status={credentialFor("ocr.paddle_vl", "api_key")}
+                      onSave={(secretInput) =>
+                        saveBridgeCredential("ocr.paddle_vl", "api_key", secretInput)
+                      }
+                      onVerify={() => verifyBridgeCredential("ocr.paddle_vl", "api_key")}
+                      onRevoke={revokeBridgeCredential}
                       hint="选为主力时必填；作为备用时选填。免费额度 2 万页/天"
-                    >
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="password"
-                          value={settings.paddle_vl_api_key ?? ""}
-                          onChange={(e) => {
-                            updateField(
-                              "paddle_vl_api_key",
-                              e.target.value || null,
-                            );
-                            // 改 token 就重置验证状态;清空 token 时主力退回 MinerU
-                            if (paddleStatus !== "idle") {
-                              setPaddleStatus("idle");
-                              setPaddleMsg("");
-                              updateField("paddle_vl_verified_at", null);
-                            }
-                            if (!e.target.value) {
-                              updateField("ocr_cloud_primary", null);
-                            }
-                          }}
-                          placeholder="AI Studio 访问令牌"
-                          className={cn(inputCls, "flex-1")}
-                          autoComplete="off"
-                        />
-                        <VerifyStatusIcon status={paddleStatus} />
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="disabled:cursor-not-allowed"
-                          onClick={handleVerifyPaddle}
-                          disabled={
-                            paddleStatus === "verifying" ||
-                            !settings.paddle_vl_api_key?.trim()
-                          }
-                        >
-                          {paddleStatus === "verifying" ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            "验证"
-                          )}
-                        </Button>
-                      </div>
-                      {paddleStatus === "fail" && paddleMsg && (
-                        <p className="mt-1.5 text-xs text-red-600">
-                          ✗ {paddleMsg}
-                        </p>
-                      )}
-                      {paddleStatus === "ok" && (
-                        <p className="mt-1.5 text-xs text-green-700">
-                          ✓ 已验证通过,可以使用
-                        </p>
-                      )}
-                    </Field>
+                    />
                   </Section>
               )}
 
@@ -1399,57 +1147,16 @@ export function SettingsModal({
                     title="MinerU"
                     link={{ label: "点这里申请 token", href: "https://mineru.net/apiManage/token" }}
                   >
-                    <Field
-                      label="API Token"
+                    <CredentialField
+                      label="MinerU Token"
+                      status={credentialFor("ocr.mineru", "api_key")}
+                      onSave={(secretInput) =>
+                        saveBridgeCredential("ocr.mineru", "api_key", secretInput)
+                      }
+                      onVerify={() => verifyBridgeCredential("ocr.mineru", "api_key")}
+                      onRevoke={revokeBridgeCredential}
                       hint="选为主力时必填；作为备用时选填"
-                    >
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="password"
-                          value={settings.mineru_api_key ?? ""}
-                          onChange={(e) => {
-                            updateField("mineru_api_key", e.target.value || null);
-                            // 改 token 就重置验证状态
-                            if (mineruStatus !== "idle") {
-                              setMineruStatus("idle");
-                              setMineruMsg("");
-                              updateField("mineru_verified_at", null);
-                            }
-                          }}
-                          placeholder="eyJ0eXBl... 或 sk-..."
-                          className={cn(inputCls, "flex-1")}
-                          autoComplete="off"
-                        />
-                        <VerifyStatusIcon status={mineruStatus} />
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="disabled:cursor-not-allowed"
-                          onClick={handleVerifyMineru}
-                          disabled={
-                            mineruStatus === "verifying" ||
-                            !settings.mineru_api_key?.trim()
-                          }
-                        >
-                          {mineruStatus === "verifying" ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            "验证"
-                          )}
-                        </Button>
-                      </div>
-                      {mineruStatus === "fail" && mineruMsg && (
-                        <p className="mt-1.5 text-xs text-red-600">
-                          ✗ {mineruMsg}
-                        </p>
-                      )}
-                      {mineruStatus === "ok" && (
-                        <p className="mt-1.5 text-xs text-green-700">
-                          ✓ 已验证通过,可以使用
-                        </p>
-                      )}
-                    </Field>
+                    />
                   </Section>
               )}
 
@@ -1485,7 +1192,7 @@ export function SettingsModal({
                         建议用 <strong>PaddleOCR 为主、MinerU 备用</strong> ——
                         PaddleOCR 速度更快、免费额度更高(2 万页/天 vs MinerU 1 千页/天),
                         批量导入更不容易卡。
-                        {!settings.paddle_vl_api_key?.trim() &&
+                        {!credentialFor("ocr.paddle_vl", "api_key")?.secret_present &&
                           "(需先在上方「PaddleOCR」卡填访问令牌)"}
                       </p>
                     </Field>
@@ -1502,57 +1209,16 @@ export function SettingsModal({
                   href: "https://open.chineselaw.com/profile",
                 }}
               >
-                <Field label="API Key">
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="password"
-                      value={settings.yuandian_api_key ?? ""}
-                      onChange={(e) => {
-                        updateField(
-                          "yuandian_api_key",
-                          e.target.value || null,
-                        );
-                        // 改 key 就重置验证状态
-                        if (yuandianStatus !== "idle") {
-                          setYuandianStatus("idle");
-                          setYuandianMsg("");
-                          updateField("yuandian_verified_at", null);
-                        }
-                      }}
-                      placeholder="sk_..."
-                      className={cn(inputCls, "flex-1")}
-                      autoComplete="off"
-                    />
-                    <VerifyStatusIcon status={yuandianStatus} />
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="disabled:cursor-not-allowed"
-                      onClick={handleVerifyYuandian}
-                      disabled={
-                        yuandianStatus === "verifying" ||
-                        !settings.yuandian_api_key?.trim()
-                      }
-                    >
-                      {yuandianStatus === "verifying" ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        "验证"
-                      )}
-                    </Button>
-                  </div>
-                  {yuandianStatus === "fail" && yuandianMsg && (
-                    <p className="mt-1.5 text-xs text-red-600">
-                      ✗ {yuandianMsg}
-                    </p>
-                  )}
-                  {yuandianStatus === "ok" && (
-                    <p className="mt-1.5 text-xs text-green-700">
-                      ✓ 已验证通过,可以使用「查被执行人」等元典功能
-                    </p>
-                  )}
-                </Field>
+                <CredentialField
+                  label="元典 API Key"
+                  status={credentialFor("connector.yuandian", "api_key")}
+                  onSave={(secretInput) =>
+                    saveBridgeCredential("connector.yuandian", "api_key", secretInput)
+                  }
+                  onVerify={() => verifyBridgeCredential("connector.yuandian", "api_key")}
+                  onRevoke={revokeBridgeCredential}
+                  placeholder="输入新的元典 API Key"
+                />
               </Section>
               )}
 
@@ -1958,56 +1624,16 @@ export function SettingsModal({
                       href: "https://platform.deepseek.com/api_keys",
                     }}
                   >
-                    <Field label="API Key">
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="password"
-                          value={settings.cloud_llm_api_key ?? ""}
-                          onChange={(e) => {
-                            updateField(
-                              "cloud_llm_api_key",
-                              e.target.value || null,
-                            );
-                            if (deepseekStatus !== "idle") {
-                              setDeepseekStatus("idle");
-                              setDeepseekMsg("");
-                              updateField("deepseek_verified_at", null);
-                            }
-                          }}
-                          placeholder="sk-..."
-                          className={cn(inputCls, "flex-1")}
-                          autoComplete="off"
-                        />
-                        <VerifyStatusIcon status={deepseekStatus} />
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="disabled:cursor-not-allowed"
-                          onClick={handleVerifyDeepSeek}
-                          disabled={
-                            deepseekStatus === "verifying" ||
-                            !settings.cloud_llm_api_key?.trim()
-                          }
-                        >
-                          {deepseekStatus === "verifying" ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            "验证"
-                          )}
-                        </Button>
-                      </div>
-                      {deepseekStatus === "fail" && deepseekMsg && (
-                        <p className="mt-1.5 text-xs text-red-600">
-                          ✗ {deepseekMsg}
-                        </p>
-                      )}
-                      {deepseekStatus === "ok" && (
-                        <p className="mt-1.5 text-xs text-green-700">
-                          ✓ 已验证通过,可以使用
-                        </p>
-                      )}
-                    </Field>
+                    <CredentialField
+                      label="DeepSeek API Key"
+                      status={credentialFor("llm.deepseek", "api_key")}
+                      onSave={(secretInput) =>
+                        saveBridgeCredential("llm.deepseek", "api_key", secretInput)
+                      }
+                      onVerify={() => verifyBridgeCredential("llm.deepseek", "api_key")}
+                      onRevoke={revokeBridgeCredential}
+                      placeholder="输入新的 DeepSeek API Key"
+                    />
                     <Field label="模型档位">
                       <select
                         value={settings.cloud_llm_model ?? "deepseek-v4-flash"}
@@ -2043,56 +1669,16 @@ export function SettingsModal({
                       href: "https://platform.minimaxi.com/user-center/payment/token-plan",
                     }}
                   >
-                    <Field label="API Key">
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="password"
-                          value={settings.minimax_api_key ?? ""}
-                          onChange={(e) => {
-                            updateField(
-                              "minimax_api_key",
-                              e.target.value || null,
-                            );
-                            if (minimaxStatus !== "idle") {
-                              setMinimaxStatus("idle");
-                              setMinimaxMsg("");
-                              updateField("minimax_verified_at", null);
-                            }
-                          }}
-                          placeholder="填入 MiniMax 平台的 API Key"
-                          className={cn(inputCls, "flex-1")}
-                          autoComplete="off"
-                        />
-                        <VerifyStatusIcon status={minimaxStatus} />
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="disabled:cursor-not-allowed"
-                          onClick={handleVerifyMiniMax}
-                          disabled={
-                            minimaxStatus === "verifying" ||
-                            !settings.minimax_api_key?.trim()
-                          }
-                        >
-                          {minimaxStatus === "verifying" ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            "验证"
-                          )}
-                        </Button>
-                      </div>
-                      {minimaxStatus === "fail" && minimaxMsg && (
-                        <p className="mt-1.5 text-xs text-red-600">
-                          ✗ {minimaxMsg}
-                        </p>
-                      )}
-                      {minimaxStatus === "ok" && (
-                        <p className="mt-1.5 text-xs text-green-700">
-                          ✓ 已验证通过,可以使用
-                        </p>
-                      )}
-                    </Field>
+                    <CredentialField
+                      label="MiniMax API Key"
+                      status={credentialFor("llm.minimax", "api_key")}
+                      onSave={(secretInput) =>
+                        saveBridgeCredential("llm.minimax", "api_key", secretInput)
+                      }
+                      onVerify={() => verifyBridgeCredential("llm.minimax", "api_key")}
+                      onRevoke={revokeBridgeCredential}
+                      placeholder="输入新的 MiniMax API Key"
+                    />
                     <Field
                       label="模型档位"
                       hint="按需选择:M2.7 轻量便宜,M2.7-highspeed 速度加倍,M3 强推理(1M 上下文)"
@@ -2130,22 +1716,10 @@ export function SettingsModal({
                         : "custom";
                       const preset = COMPAT_PRESETS[cur];
                       const keys = COMPAT_FIELD_KEYS[cur];
-                      const apiKey = effectiveCompatValue(settings, cur, "apiKey") ?? "";
                       const model = effectiveCompatValue(settings, cur, "model") ?? "";
                       const endpoint =
                         effectiveCompatValue(settings, cur, "endpoint") ??
                         preset.endpoint;
-                      // 改 key/模型/地址 → 清验证态(坑#11:改了要重验)
-                      const onConfigChange = () => {
-                        if (compatStatus !== "idle") {
-                          setCompatStatus("idle");
-                          setCompatMsg("");
-                          updateField(
-                            keys.verifiedAt,
-                            null,
-                          );
-                        }
-                      };
                       return (
                         <Section
                           title={preset.label}
@@ -2159,52 +1733,16 @@ export function SettingsModal({
                               : undefined
                           }
                         >
-                          <Field label="API Key">
-                            <div className="flex items-center gap-2">
-                              <input
-                                type="password"
-                                value={apiKey}
-                                onChange={(e) => {
-                                  updateField(
-                                    keys.apiKey,
-                                    e.target.value || null,
-                                  );
-                                  onConfigChange();
-                                }}
-                                placeholder="填入服务商平台的 API Key"
-                                className={cn(inputCls, "flex-1")}
-                                autoComplete="off"
-                              />
-                              <VerifyStatusIcon status={compatStatus} />
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant="outline"
-                                className="disabled:cursor-not-allowed"
-                                onClick={handleVerifyCompat}
-                                disabled={
-                                  compatStatus === "verifying" ||
-                                  !apiKey.trim()
-                                }
-                              >
-                                {compatStatus === "verifying" ? (
-                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                ) : (
-                                  "验证"
-                                )}
-                              </Button>
-                            </div>
-                            {compatStatus === "fail" && compatMsg && (
-                              <p className="mt-1.5 text-xs text-red-600">
-                                ✗ {compatMsg}
-                              </p>
-                            )}
-                            {compatStatus === "ok" && (
-                              <p className="mt-1.5 text-xs text-green-700">
-                                ✓ 已验证通过,可以使用
-                              </p>
-                            )}
-                          </Field>
+                          <CredentialField
+                            label={`${preset.label} API Key`}
+                            status={credentialFor(`llm.${cur}`, "api_key")}
+                            onSave={(secretInput) =>
+                              saveBridgeCredential(`llm.${cur}`, "api_key", secretInput)
+                            }
+                            onVerify={() => verifyBridgeCredential(`llm.${cur}`, "api_key")}
+                            onRevoke={revokeBridgeCredential}
+                            placeholder="输入新的服务商 API Key"
+                          />
                           <Field
                             label="模型名"
                             hint={
@@ -2218,7 +1756,6 @@ export function SettingsModal({
                                 value={model || preset.model}
                                 onChange={(e) => {
                                   updateField(keys.model, e.target.value);
-                                  onConfigChange();
                                 }}
                                 className={inputCls}
                               >
@@ -2233,7 +1770,6 @@ export function SettingsModal({
                                 value={model}
                                 onChange={(e) => {
                                   updateField(keys.model, e.target.value || null);
-                                  onConfigChange();
                                 }}
                                 placeholder="如 glm-4.6"
                                 className={inputCls}
@@ -2253,7 +1789,6 @@ export function SettingsModal({
                                   keys.endpoint,
                                   e.target.value || null,
                                 );
-                                onConfigChange();
                               }}
                               placeholder="https://.../v1/chat/completions"
                               className={inputCls}
@@ -2304,51 +1839,16 @@ export function SettingsModal({
                   href: "https://cloud.siliconflow.cn/me/account/ak",
                 }}
               >
-                <Field label="API Key">
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="password"
-                      value={settings.embedding_api_key ?? ""}
-                      onChange={(e) => {
-                        updateField("embedding_api_key", e.target.value || null);
-                        if (embeddingStatus !== "idle") {
-                          setEmbeddingStatus("idle");
-                          setEmbeddingMsg("");
-                          updateField("embedding_verified_at", null);
-                        }
-                      }}
-                      placeholder="sk-..."
-                      className={cn(inputCls, "flex-1")}
-                      autoComplete="off"
-                    />
-                    <VerifyStatusIcon status={embeddingStatus} />
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="disabled:cursor-not-allowed"
-                      onClick={handleVerifyEmbedding}
-                      disabled={
-                        embeddingStatus === "verifying" ||
-                        !settings.embedding_api_key?.trim()
-                      }
-                    >
-                      {embeddingStatus === "verifying" ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        "验证"
-                      )}
-                    </Button>
-                  </div>
-                  {embeddingStatus === "fail" && embeddingMsg && (
-                    <p className="mt-1.5 text-xs text-red-600">✗ {embeddingMsg}</p>
-                  )}
-                  {embeddingStatus === "ok" && (
-                    <p className="mt-1.5 text-xs text-green-700">
-                      {embeddingMsg || "✓ 已验证通过"}
-                    </p>
-                  )}
-                </Field>
+                <CredentialField
+                  label="硅基流动 API Key"
+                  status={credentialFor("embedding", "api_key")}
+                  onSave={(secretInput) =>
+                    saveBridgeCredential("embedding", "api_key", secretInput)
+                  }
+                  onVerify={() => verifyBridgeCredential("embedding", "api_key")}
+                  onRevoke={revokeBridgeCredential}
+                  placeholder="输入新的硅基流动 API Key"
+                />
               </Section>
               )}
 
@@ -2362,7 +1862,9 @@ export function SettingsModal({
               {/* ── 知识库:raw 正文向量检索维护 ── */}
               {tab === "kb" && (
               <KbSemanticIndexCard
-                embeddingConfigured={!!settings.embedding_api_key?.trim()}
+                embeddingConfigured={
+                  credentialFor("embedding", "api_key")?.secret_present === true
+                }
                 autoIndex={settings.kb_semantic_auto_index !== false}
                 onAutoChange={(v) => updateField("kb_semantic_auto_index", v)}
               />
@@ -2373,7 +1875,9 @@ export function SettingsModal({
               {/* ── 数据源:元典积分账(本月统计)── */}
               {tab === "datasource" && (
               <YuandianCreditsCard
-                hasApiKey={!!settings.yuandian_api_key?.trim()}
+                hasApiKey={
+                  credentialFor("connector.yuandian", "api_key")?.secret_present === true
+                }
                 monthlyLimit={settings.yuandian_monthly_credit_limit ?? null}
                 onLimitChange={(n) =>
                   updateField("yuandian_monthly_credit_limit", n)
@@ -2413,7 +1917,20 @@ export function SettingsModal({
               {tab === "datasource" && (
               <McpServersCard
                 servers={settings.mcp_servers ?? []}
+                credentials={credentialMetadata}
                 onChange={(next) => updateField("mcp_servers", next)}
+                onSaveCredential={(instanceId, slot, secretInput) =>
+                  saveBridgeCredential(
+                    `mcp:${instanceId}`,
+                    "mcp_secret",
+                    secretInput,
+                    `settings:mcp:${instanceId}:${slot}`,
+                  )
+                }
+                onVerifyCredential={(instanceId) =>
+                  verifyBridgeCredential(`mcp:${instanceId}`, "mcp_secret")
+                }
+                onRevokeCredential={revokeBridgeCredential}
               />
               )}
 
@@ -2532,17 +2049,6 @@ function normalizeMinimaxModel(raw: string | null | undefined): string {
   if (lower === "minimax-m2.7-highspeed") return "MiniMax-M2.7-highspeed";
   if (lower === "minimax-m3") return "MiniMax-M3";
   return raw;
-}
-
-/** 验证状态图标:ok=绿勾 / fail=红叉 / 其他=不显示 */
-function VerifyStatusIcon({ status }: { status: VerifyStatus }) {
-  if (status === "ok") {
-    return <CheckCircle2 className="h-5 w-5 shrink-0 text-green-600" aria-label="已验证" />;
-  }
-  if (status === "fail") {
-    return <XCircle className="h-5 w-5 shrink-0 text-red-500" aria-label="验证失败" />;
-  }
-  return null;
 }
 
 function LegalSkillsCard() {
@@ -3134,11 +2640,6 @@ function textToArgs(t: string): string[] {
     .filter((s) => s.length > 0);
 }
 /** env: 一行 `KEY=VALUE`,首个 `=` 为分隔;无 `=` / 空 key 的行丢弃。 */
-function envToText(env: Record<string, string>): string {
-  return Object.entries(env)
-    .map(([k, v]) => `${k}=${v}`)
-    .join("\n");
-}
 function textToEnv(t: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const line of t.split("\n")) {
@@ -3159,12 +2660,28 @@ function nextMcpRowId(): string {
   return `mcp-row-${mcpRowSeq}`;
 }
 
+function newMcpInstanceId(): string {
+  return crypto.randomUUID();
+}
+
 function McpServersCard({
   servers,
+  credentials,
   onChange,
+  onSaveCredential,
+  onVerifyCredential,
+  onRevokeCredential,
 }: {
   servers: McpServerConfig[];
+  credentials: CredentialMetadata[];
   onChange: (next: McpServerConfig[]) => void;
+  onSaveCredential: (
+    instanceId: string,
+    slot: "env" | "headers",
+    secretInput: string,
+  ) => Promise<CredentialMetadata>;
+  onVerifyCredential: (instanceId: string) => Promise<CredentialMetadata>;
+  onRevokeCredential: (handle: string, revision: number) => Promise<CredentialMetadata>;
 }) {
   // 内部维护 {id, cfg}:id 只为稳定 key。挂载时 seed 一次自 props(本卡在 settings 加载后才
   // 渲染,props 即加载值);此后本卡是 mcp_servers 的唯一改动源,无需 reactive 同步回 props。
@@ -3184,6 +2701,7 @@ function McpServersCard({
       {
         id: nextMcpRowId(),
         cfg: {
+          instance_id: newMcpInstanceId(),
           name: "",
           transport: { type: "http", url: "", headers: {} },
           enabled: true,
@@ -3197,6 +2715,7 @@ function McpServersCard({
       {
         id: nextMcpRowId(),
         cfg: {
+          instance_id: newMcpInstanceId(),
           name: "",
           transport: { type: "stdio", command: "npx", args: [], env: {} },
           enabled: true,
@@ -3223,7 +2742,33 @@ function McpServersCard({
       const existing = new Set(rows.map((x) => x.cfg.name));
       const fresh = r.servers.filter((s) => !existing.has(s.name));
       const skipped = r.servers.length - fresh.length;
-      commit([...rows, ...fresh.map((cfg) => ({ id: nextMcpRowId(), cfg }))]);
+      const safeFresh = await Promise.all(
+        fresh.map(async (cfg) => {
+          const bundle =
+            cfg.transport.type === "stdio"
+              ? cfg.transport.env
+              : cfg.transport.headers ?? {};
+          if (Object.keys(bundle).length > 0) {
+            await onSaveCredential(
+              cfg.instance_id,
+              cfg.transport.type === "stdio" ? "env" : "headers",
+              JSON.stringify(bundle),
+            );
+          }
+          const safeCfg: McpServerConfig =
+            cfg.transport.type === "stdio"
+              ? {
+                  ...cfg,
+                  transport: { ...cfg.transport, env: {} },
+                }
+              : {
+                  ...cfg,
+                  transport: { ...cfg.transport, headers: {} },
+                };
+          return safeCfg;
+        }),
+      );
+      commit([...rows, ...safeFresh.map((cfg) => ({ id: nextMcpRowId(), cfg }))]);
       setPasteText("");
       const lines = [
         `已识别 ${r.servers.length} 个 server${skipped > 0 ? `(${skipped} 个同名已存在,跳过)` : ""}，请逐个点「测试连接」确认能用。`,
@@ -3323,8 +2868,24 @@ function McpServersCard({
             <McpServerRow
               key={r.id}
               cfg={r.cfg}
+              credential={
+                credentials.find(
+                  (item) =>
+                    item.provider_or_connector_id === `mcp:${r.cfg.instance_id}`
+                    && item.kind === "mcp_secret",
+                ) ?? null
+              }
               onChange={(c) => patchRow(r.id, c)}
               onRemove={() => removeRow(r.id)}
+              onSaveCredential={(secretInput) =>
+                onSaveCredential(
+                  r.cfg.instance_id,
+                  r.cfg.transport.type === "stdio" ? "env" : "headers",
+                  secretInput,
+                )
+              }
+              onVerifyCredential={() => onVerifyCredential(r.cfg.instance_id)}
+              onRevokeCredential={onRevokeCredential}
             />
           ))}
 
@@ -3352,29 +2913,28 @@ function McpServersCard({
   );
 }
 
-/** 单个 MCP server 行。**关键**:args/env 用本行 local state 当「自由文本编辑缓冲」——
- *  直接拿派生 parse(argsToText/envToText)当受控 `value` 会吃键盘(env 里 `KEY` 还没敲到 `=`
- *  就被 textToEnv 丢掉、args 回车空行被 textToArgs 滤掉→光标弹回)。display 用原始字符串,
- *  只在 onChange 时 parse 进保存模型。buffer 仅挂载时 seed 一次(本行后续变化都源自 buffer 自身)。 */
+/** 单个 MCP server 行。args 保留本行自由文本缓冲；env/headers 改走 write-only
+ * CredentialField，保存前才解析成 bundle 并直接写入 bridge，不进入 server 配置 state。 */
 function McpServerRow({
   cfg,
+  credential,
   onChange,
   onRemove,
+  onSaveCredential,
+  onVerifyCredential,
+  onRevokeCredential,
 }: {
   cfg: McpServerConfig;
+  credential: CredentialMetadata | null;
   onChange: (c: McpServerConfig) => void;
   onRemove: () => void;
+  onSaveCredential: (secretInput: string) => Promise<CredentialMetadata>;
+  onVerifyCredential: () => Promise<CredentialMetadata>;
+  onRevokeCredential: (handle: string, revision: number) => Promise<CredentialMetadata>;
 }) {
   const isStdio = cfg.transport.type === "stdio";
   const [argsText, setArgsText] = useState(() =>
     cfg.transport.type === "stdio" ? argsToText(cfg.transport.args) : "",
-  );
-  const [envText, setEnvText] = useState(() =>
-    cfg.transport.type === "stdio" ? envToText(cfg.transport.env) : "",
-  );
-  // http 的 headers 跟 env 同形(KEY=VALUE),同样需要本行编辑缓冲(见组件 doc)
-  const [headersText, setHeadersText] = useState(() =>
-    cfg.transport.type === "http" ? envToText(cfg.transport.headers ?? {}) : "",
   );
 
   // ---- 连接测试:真连一次(握手+列工具),结果就地显示;配置一改就归零 ----
@@ -3489,26 +3049,22 @@ function McpServerRow({
               spellCheck={false}
             />
           </Field>
-          <Field
-            label="环境变量（选填，一行一个 KEY=VALUE）"
-            hint="放 token 等；只存本机，不进 git / 日志"
-          >
-            <textarea
-              rows={2}
-              value={envText}
-              onChange={(e) => {
-                const t = e.target.value;
-                setEnvText(t);
-                if (cfg.transport.type === "stdio") {
-                  onChange({ ...cfg, transport: { ...cfg.transport, env: textToEnv(t) } });
-                }
-              }}
-              placeholder={"API_KEY=sk-xxxx"}
-              className={mcpTextareaCls}
-              spellCheck={false}
-              autoComplete="off"
-            />
-          </Field>
+          <CredentialField
+            label="环境变量（一行一个 KEY=VALUE）"
+            status={credential}
+            multiline
+            onSave={(text) => {
+              const bundle = textToEnv(text);
+              if (Object.keys(bundle).length === 0) {
+                throw new Error("请至少输入一行有效的 KEY=VALUE");
+              }
+              return onSaveCredential(JSON.stringify(bundle));
+            }}
+            onVerify={onVerifyCredential}
+            onRevoke={onRevokeCredential}
+            placeholder={"API_KEY=新凭据\n保存后不会回填"}
+            hint="只写入 bridge；旧值不会进入 React state"
+          />
         </div>
       ) : (
         <div className="space-y-2.5">
@@ -3529,26 +3085,22 @@ function McpServerRow({
               spellCheck={false}
             />
           </Field>
-          <Field
+          <CredentialField
             label="请求头（一行一个 KEY=VALUE）"
-            hint="放访问令牌，例：Authorization=Bearer 你的密钥；只存本机，不进 git / 日志"
-          >
-            <textarea
-              rows={2}
-              value={headersText}
-              onChange={(e) => {
-                const t = e.target.value;
-                setHeadersText(t);
-                if (cfg.transport.type === "http") {
-                  onChange({ ...cfg, transport: { ...cfg.transport, headers: textToEnv(t) } });
-                }
-              }}
-              placeholder={"Authorization=Bearer sk-xxxx"}
-              className={mcpTextareaCls}
-              spellCheck={false}
-              autoComplete="off"
-            />
-          </Field>
+            status={credential}
+            multiline
+            onSave={(text) => {
+              const bundle = textToEnv(text);
+              if (Object.keys(bundle).length === 0) {
+                throw new Error("请至少输入一行有效的 KEY=VALUE");
+              }
+              return onSaveCredential(JSON.stringify(bundle));
+            }}
+            onVerify={onVerifyCredential}
+            onRevoke={onRevokeCredential}
+            placeholder={"Authorization=Bearer 新凭据\n保存后不会回填"}
+            hint="只写入 bridge；旧值不会进入 React state"
+          />
         </div>
       )}
 

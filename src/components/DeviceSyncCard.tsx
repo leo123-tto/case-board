@@ -32,6 +32,7 @@ export function DeviceSyncCard() {
   const [groups, setGroups] = useState<DiscoveredDeviceGroup[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [code, setCode] = useState("");
+  const [oneTimePairingCode, setOneTimePairingCode] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -139,7 +140,10 @@ export function DeviceSyncCard() {
                 className="mt-2 w-full"
                 disabled={busy !== null || !deviceName.trim() || !groupName.trim()}
                 onClick={() =>
-                  void run("create", () => deviceSyncCreate(groupName, deviceName))
+                  void run("create", async () => {
+                    await deviceSyncCreate(groupName, deviceName);
+                    setOneTimePairingCode(await deviceSyncRefreshCode());
+                  })
                 }
               >
                 {busy === "create" && <Loader2 className="mr-1 size-3.5 animate-spin" />}
@@ -198,9 +202,10 @@ export function DeviceSyncCard() {
                 className="mt-2 w-full"
                 disabled={busy !== null || !selected || !deviceName.trim() || !code.trim()}
                 onClick={() =>
-                  void run("join", () =>
-                    deviceSyncJoin(selected!, code.trim(), deviceName.trim()),
-                  )
+                  void run("join", async () => {
+                    await deviceSyncJoin(selected!, code.trim(), deviceName.trim());
+                    setCode("");
+                  })
                 }
               >
                 {busy === "join" && <Loader2 className="mr-1 size-3.5 animate-spin" />}
@@ -229,20 +234,20 @@ export function DeviceSyncCard() {
             </div>
           </div>
 
-          {identity.pairing_code && status.enabled && (
+          {oneTimePairingCode && status.enabled && (
             <div className="rounded-md border border-brand/20 bg-brand-soft/40 p-3">
               <div className="flex items-center justify-between gap-2">
                 <div>
                   <p className="text-xs font-medium">另一台电脑的配对口令</p>
                   <code className="mt-1 block select-all break-all text-xs font-semibold tracking-wide">
-                    {identity.pairing_code}
+                    {oneTimePairingCode}
                   </code>
                 </div>
                 <Button
                   variant="ghost"
                   size="sm"
                   onClick={() => {
-                    void navigator.clipboard.writeText(identity.pairing_code ?? "");
+                    void navigator.clipboard.writeText(oneTimePairingCode);
                     setCopied(true);
                     window.setTimeout(() => setCopied(false), 1500);
                   }}
@@ -287,9 +292,9 @@ export function DeviceSyncCard() {
               size="sm"
               disabled={!status.enabled || busy !== null}
               onClick={() =>
-                void run("code", async () => {
-                  await deviceSyncRefreshCode();
-                })
+                 void run("code", async () => {
+                   setOneTimePairingCode(await deviceSyncRefreshCode());
+                 })
               }
             >
               刷新配对口令
@@ -309,7 +314,12 @@ export function DeviceSyncCard() {
                       danger: true,
                     },
                   );
-                  if (ok) await run("forget", deviceSyncForget);
+                  if (ok) {
+                    await run("forget", async () => {
+                      await deviceSyncForget();
+                      setOneTimePairingCode(null);
+                    });
+                  }
                 })()
               }
             >

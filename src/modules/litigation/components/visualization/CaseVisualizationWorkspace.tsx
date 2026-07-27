@@ -39,6 +39,7 @@ import {
   saveCaseVisualUserRevision,
   writeCaseVisualExport,
 } from "@/lib/api";
+import { confirmDialog } from "@/lib/dialog";
 import { cn } from "@/lib/utils";
 
 import type { CanvasPositions } from "./CaseGraphCanvas";
@@ -392,9 +393,9 @@ export default function CaseVisualizationWorkspace({
     setSaveState("idle");
   }
 
-  function deleteCurrentView() {
+  async function deleteCurrentView() {
     if (!currentView) return;
-    if (!window.confirm(`确定删除《${currentView.title}》吗？删除后可在保存前撤销。`)) return;
+    if (!(await confirmDialog(`确定删除《${currentView.title}》吗？删除后可在保存前撤销。`, { danger: true, okLabel: "删除" }))) return;
     const currentIndex = graph.views.findIndex((view) => view.id === currentView.id);
     const nextGraph = removeGraphView(graph, currentView.id);
     const nextView = nextGraph.views[Math.min(currentIndex, nextGraph.views.length - 1)] ?? null;
@@ -428,8 +429,8 @@ export default function CaseVisualizationWorkspace({
     setSemanticDirty(true);
   }
 
-  function requestClose() {
-    if ((semanticDirty || layoutDirty) && !window.confirm("还有未保存的可视化修改，确定关闭吗？")) {
+  async function requestClose() {
+    if ((semanticDirty || layoutDirty) && !(await confirmDialog("还有未保存的可视化修改，确定关闭吗？", { okLabel: "关闭" }))) {
       return;
     }
     onClose();

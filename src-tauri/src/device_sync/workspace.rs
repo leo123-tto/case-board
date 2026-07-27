@@ -260,18 +260,32 @@ const TABLES: &[TableSpec] = &[
     },
 ];
 
-// 与 OS、路径、设备身份或本机登录态绑定的字段不跨设备。其余设置（含各云 API 配置）
-// 拆成逐字段记录，以免两台设备同时改不同 API 时互相覆盖整个 settings.json。
+// 与 OS、路径、设备身份、本机凭据或本机登录态绑定的字段不跨设备。其余非秘密设置
+// 拆成逐字段记录，以免两台设备同时改不同配置时互相覆盖整个 settings.json。
 const LOCAL_SETTING_KEYS: &[&str] = &[
     "ocr_provider",
     "llm_provider",
     "local_model_dir",
     "local_server_auto_start",
     "cloud_enabled",
+    "mineru_api_key",
+    "paddle_vl_api_key",
+    "cloud_llm_api_key",
+    "minimax_api_key",
+    "compat_llm_api_key",
+    "glm_llm_api_key",
+    "mimo_llm_api_key",
+    "kimi_llm_api_key",
+    "custom_llm_api_key",
+    "yuandian_api_key",
+    "embedding_api_key",
+    "kuaidi100_key",
+    "feishu_webhook_url",
     "ollama_endpoint",
     "ollama_model",
     "kb_semantic_auto_index",
     "client_id",
+    "feishu_app_token",
     "feishu_lark_cli_path",
     "court_filing_cli_path",
     "court_filing_python",
@@ -622,10 +636,12 @@ async fn track_payload(
     })
 }
 
-fn shared_settings_from(
+pub fn portable_settings_projection(
     settings: &crate::settings::Settings,
 ) -> Result<Map<String, Value>, String> {
-    let value = serde_json::to_value(settings).map_err(|e| format!("序列化同步设置失败：{e}"))?;
+    let mut sanitized = settings.clone();
+    sanitized.clear_bridge_authoritative_plaintext();
+    let value = serde_json::to_value(sanitized).map_err(|e| format!("序列化同步设置失败：{e}"))?;
     let mut object = value.as_object().cloned().ok_or("设置格式错误")?;
     for key in LOCAL_SETTING_KEYS {
         object.remove(*key);
@@ -634,7 +650,7 @@ fn shared_settings_from(
 }
 
 fn shared_settings() -> Result<Map<String, Value>, String> {
-    shared_settings_from(&crate::settings::read_settings()?)
+    portable_settings_projection(&crate::settings::read_settings()?)
 }
 
 fn ticktick_state_path() -> Result<PathBuf, String> {

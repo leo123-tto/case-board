@@ -463,9 +463,9 @@ function DiagnosticPreview({ diag }: { diag: FeedbackDiagnostic }) {
       {/* Settings 脱敏快照(三态:已验证 ✓ / 未验证 ⚠ / 未填)
           2026-05-26 V0.1.11:老板补强反馈通道——key 状态要一眼能看出,
           避免出现"key 填了但没验证通过却以为没问题"的盲区 */}
-      <KeyRow label="MinerU key" filled={s.mineru_api_key} verified={s.mineru_verified} />
-      <KeyRow label="DeepSeek key" filled={s.deepseek_api_key} verified={s.deepseek_verified} />
-      <KeyRow label="元典 key" filled={s.yuandian_api_key} verified={s.yuandian_verified} />
+      <KeyRow label="MinerU key" status={s.credential_statuses["ocr.mineru"]} />
+      <KeyRow label="DeepSeek key" status={s.credential_statuses["llm.deepseek"]} />
+      <KeyRow label="元典 key" status={s.credential_statuses["connector.yuandian"]} />
       <div className="my-1 h-px bg-border/50" />
       {/* 系统级 */}
       <Row
@@ -589,15 +589,12 @@ function Row({ k, v }: { k: string; v: string }) {
 /** 三态展示 key:已填 + 已验证 ✓ / 已填 + 未验证 ⚠(明显警告) / 未填 */
 function KeyRow({
   label,
-  filled,
-  verified,
+  status,
 }: {
   label: string;
-  filled: string; // "[SET]" | "[EMPTY]"
-  verified: boolean;
+  status: import("@/lib/types").CredentialStatusView | null | undefined;
 }) {
-  const isSet = filled === "[SET]";
-  if (!isSet) {
+  if (!status?.secret_present) {
     return (
       <div className="flex justify-between gap-2">
         <span className="shrink-0 text-muted-foreground">{label}</span>
@@ -605,7 +602,7 @@ function KeyRow({
       </div>
     );
   }
-  if (verified) {
+  if (status.state === "valid") {
     return (
       <div className="flex justify-between gap-2">
         <span className="shrink-0 text-muted-foreground">{label}</span>

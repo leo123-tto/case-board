@@ -461,7 +461,7 @@ pub async fn ai_workspace_chat_impl(
     let citation_paths = citation_paths(pool, &input.workspace_id).await?;
 
     let settings = crate::settings::read_settings().unwrap_or_default();
-    validate_ai_assistant_ready(&settings)?;
+    validate_ai_assistant_ready(&settings).await?;
     let runtime = AgentRuntimeKind::from_settings(&settings);
     let allow_new_workspace_file = allows_runtime_managed_workspace_files(runtime, user_message);
     let mut llm_config = LlmConfig::from_settings(&settings);

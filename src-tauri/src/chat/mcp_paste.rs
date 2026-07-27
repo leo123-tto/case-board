@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::mcp_bridge::{McpServerConfig, McpTransport};
+use super::mcp_bridge::{new_mcp_instance_id, McpServerConfig, McpTransport};
 
 /// 解析结果:server 列表 + 人读警告(占位符令牌等,前端原样展示)。
 #[derive(Debug, Serialize, PartialEq)]
@@ -164,6 +164,7 @@ fn server_from_def(name: &str, def: &Value) -> Option<McpServerConfig> {
         name.trim().to_string()
     };
     Some(McpServerConfig {
+        instance_id: new_mcp_instance_id(),
         name,
         transport,
         enabled: true,
@@ -293,6 +294,7 @@ fn parse_one_add_command(rest: &str) -> Option<McpServerConfig> {
         McpTransport::Stdio { command, args, env }
     };
     Some(McpServerConfig {
+        instance_id: new_mcp_instance_id(),
         name,
         transport,
         enabled: true,

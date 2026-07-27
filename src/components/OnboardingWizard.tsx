@@ -13,29 +13,26 @@
  * setup_completed 置 true 后不再弹(App.tsx 据此触发)。重测需在 settings.json 把它改回 false。
  */
 import { useEffect, useState } from "react";
-import {
-  ArrowRight,
-  ArrowLeft,
-  ExternalLink,
-  Loader2,
-  CheckCircle2,
-  XCircle,
-} from "lucide-react";
+import { ArrowRight, ArrowLeft, ExternalLink, Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { CredentialField } from "@/components/settings/CredentialField";
 import { cn } from "@/lib/utils";
 import {
   getSettings,
+  listCredentialMetadata,
+  revokeCredential,
+  saveCredential,
   saveSettings,
   openUrl,
-  verifyMinerUKey,
-  verifyDeepSeekKey,
-  verifyYuandianKey,
   seedDemoCaseIfEmpty,
+  verifyCredential,
 } from "@/lib/api";
-import type { Settings } from "@/lib/types";
-
-type VerifyStatus = "idle" | "verifying" | "ok" | "fail";
+import type {
+  CredentialKind,
+  CredentialMetadata,
+  Settings,
+} from "@/lib/types";
 
 /* ============ 功能介绍页内容(0-4) ============ */
 type FeaturePage = {
@@ -186,28 +183,15 @@ export function OnboardingWizard({ open, onComplete }: OnboardingWizardProps) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [saving, setSaving] = useState(false);
 
-  const [minerKey, setMinerKey] = useState("");
-  const [dsKey, setDsKey] = useState("");
-  const [dsEndpoint, setDsEndpoint] = useState("https://api.deepseek.com");
-  const [yuandianKey, setYuandianKey] = useState("");
-
-  const [mineruStatus, setMineruStatus] = useState<VerifyStatus>("idle");
-  const [mineruMsg, setMineruMsg] = useState("");
-  const [deepseekStatus, setDeepseekStatus] = useState<VerifyStatus>("idle");
-  const [deepseekMsg, setDeepseekMsg] = useState("");
-  const [yuandianStatus, setYuandianStatus] = useState<VerifyStatus>("idle");
-  const [yuandianMsg, setYuandianMsg] = useState("");
+  const [credentialMetadata, setCredentialMetadata] = useState<CredentialMetadata[]>([]);
 
   useEffect(() => {
     if (!open) return;
-    getSettings()
-      .then((s) => {
+    Promise.all([getSettings(), listCredentialMetadata().catch(() => [])])
+      .then(([s, metadata]) => {
         setSettings(s);
+        setCredentialMetadata(metadata);
         if (s.user_display_name) setDisplayName(s.user_display_name);
-        if (s.mineru_api_key) setMinerKey(s.mineru_api_key);
-        if (s.cloud_llm_api_key) setDsKey(s.cloud_llm_api_key);
-        if (s.cloud_llm_endpoint) setDsEndpoint(s.cloud_llm_endpoint);
-        if (s.yuandian_api_key) setYuandianKey(s.yuandian_api_key);
       })
       .catch(console.error);
   }, [open]);
@@ -215,46 +199,43 @@ export function OnboardingWizard({ open, onComplete }: OnboardingWizardProps) {
   if (!open) return null;
 
   // DeepSeek key 是核心,必填才能「开始使用」;MinerU / 元典 推荐填但可「稍后」。
-  const canFinish = dsKey.trim().length > 0;
-
-  async function handleVerifyMineru() {
-    setMineruStatus("verifying");
-    setMineruMsg("");
-    try {
-      const r = await verifyMinerUKey(minerKey);
-      setMineruStatus(r.ok ? "ok" : "fail");
-      setMineruMsg(r.message);
-    } catch (e) {
-      setMineruStatus("fail");
-      setMineruMsg(String(e));
-    }
-  }
-
-  async function handleVerifyDeepSeek() {
-    setDeepseekStatus("verifying");
-    setDeepseekMsg("");
-    try {
-      const r = await verifyDeepSeekKey(dsKey, dsEndpoint);
-      setDeepseekStatus(r.ok ? "ok" : "fail");
-      setDeepseekMsg(r.message);
-    } catch (e) {
-      setDeepseekStatus("fail");
-      setDeepseekMsg(String(e));
-    }
-  }
-
-  async function handleVerifyYuandian() {
-    setYuandianStatus("verifying");
-    setYuandianMsg("");
-    try {
-      const r = await verifyYuandianKey(yuandianKey);
-      setYuandianStatus(r.ok ? "ok" : "fail");
-      setYuandianMsg(r.message);
-    } catch (e) {
-      setYuandianStatus("fail");
-      setYuandianMsg(String(e));
-    }
-  }
+  const credentialFor = (provider: string) =>
+    credentialMetadata.find(
+      (item) => item.provider_or_connector_id === provider && item.kind === "api_key",
+    ) ?? null;
+  const replaceCredential = (next: CredentialMetadata) =>
+    setCredentialMetadata((previous) => [
+      ...previous.filter((item) => item.handle !== next.handle),
+      next,
+    ]);
+  const saveBridgeCredential = async (
+    provider: string,
+    kind: CredentialKind,
+    secretInput: string,
+  ) => {
+    const current = credentialFor(provider);
+    const next = await saveCredential({
+      handle: current?.handle ?? null,
+      providerOrConnectorId: provider,
+      kind,
+      secretInput,
+    });
+    replaceCredential(next);
+    return next;
+  };
+  const verifyBridgeCredential = async (provider: string) => {
+    const current = credentialFor(provider);
+    if (!current) throw new Error("凭据尚未配置");
+    const next = await verifyCredential(current.handle, current.revision);
+    replaceCredential(next);
+    return next;
+  };
+  const revokeBridgeCredential = async (handle: string, revision: number) => {
+    const next = await revokeCredential(handle, revision);
+    replaceCredential(next);
+    return next;
+  };
+  const canFinish = credentialFor("llm.deepseek")?.secret_present === true;
 
   async function finish() {
     if (!settings) return;
@@ -268,16 +249,6 @@ export function OnboardingWizard({ open, onComplete }: OnboardingWizardProps) {
         ocr_provider: "cloud",
         llm_provider: "cloud",
         cloud_enabled: true,
-        mineru_api_key: minerKey.trim() || null,
-        cloud_llm_api_key: dsKey.trim() || null,
-        cloud_llm_endpoint: dsEndpoint.trim() || null,
-        yuandian_api_key: yuandianKey.trim() || null,
-        mineru_verified_at:
-          mineruStatus === "ok" ? new Date().toISOString() : null,
-        deepseek_verified_at:
-          deepseekStatus === "ok" ? new Date().toISOString() : null,
-        yuandian_verified_at:
-          yuandianStatus === "ok" ? new Date().toISOString() : null,
       });
       // 首次完成 onboarding,若 cases 表空,seed 示例案件(非致命)
       try {
@@ -320,33 +291,10 @@ export function OnboardingWizard({ open, onComplete }: OnboardingWizardProps) {
             <ConfigPage
               displayName={displayName}
               setDisplayName={setDisplayName}
-              dsKey={dsKey}
-              setDsKey={setDsKey}
-              deepseekStatus={deepseekStatus}
-              deepseekMsg={deepseekMsg}
-              onVerifyDeepSeek={handleVerifyDeepSeek}
-              resetDeepSeek={() => {
-                setDeepseekStatus("idle");
-                setDeepseekMsg("");
-              }}
-              minerKey={minerKey}
-              setMinerKey={setMinerKey}
-              mineruStatus={mineruStatus}
-              mineruMsg={mineruMsg}
-              onVerifyMineru={handleVerifyMineru}
-              resetMineru={() => {
-                setMineruStatus("idle");
-                setMineruMsg("");
-              }}
-              yuandianKey={yuandianKey}
-              setYuandianKey={setYuandianKey}
-              yuandianStatus={yuandianStatus}
-              yuandianMsg={yuandianMsg}
-              onVerifyYuandian={handleVerifyYuandian}
-              resetYuandian={() => {
-                setYuandianStatus("idle");
-                setYuandianMsg("");
-              }}
+              credentialFor={credentialFor}
+              onSaveCredential={saveBridgeCredential}
+              onVerifyCredential={verifyBridgeCredential}
+              onRevokeCredential={revokeBridgeCredential}
             />
           )}
         </div>
@@ -448,24 +396,14 @@ function IntroPage({ page, first }: { page: FeaturePage; first: boolean }) {
 function ConfigPage(props: {
   displayName: string;
   setDisplayName: (v: string) => void;
-  dsKey: string;
-  setDsKey: (v: string) => void;
-  deepseekStatus: VerifyStatus;
-  deepseekMsg: string;
-  onVerifyDeepSeek: () => void;
-  resetDeepSeek: () => void;
-  minerKey: string;
-  setMinerKey: (v: string) => void;
-  mineruStatus: VerifyStatus;
-  mineruMsg: string;
-  onVerifyMineru: () => void;
-  resetMineru: () => void;
-  yuandianKey: string;
-  setYuandianKey: (v: string) => void;
-  yuandianStatus: VerifyStatus;
-  yuandianMsg: string;
-  onVerifyYuandian: () => void;
-  resetYuandian: () => void;
+  credentialFor: (provider: string) => CredentialMetadata | null;
+  onSaveCredential: (
+    provider: string,
+    kind: CredentialKind,
+    secretInput: string,
+  ) => Promise<CredentialMetadata>;
+  onVerifyCredential: (provider: string) => Promise<CredentialMetadata>;
+  onRevokeCredential: (handle: string, revision: number) => Promise<CredentialMetadata>;
 }) {
   return (
     <div className="animate-in fade-in-0 slide-in-from-right-2 duration-300">
@@ -510,22 +448,13 @@ function ConfigPage(props: {
             </>
           }
         >
-          <LabeledInput
-            label="API Key"
-            value={props.dsKey}
-            onChange={(v) => {
-              props.setDsKey(v);
-              if (props.deepseekStatus !== "idle") props.resetDeepSeek();
-            }}
-            password
-            placeholder="sk-..."
-          />
-          <VerifyRow
-            label="验证 API Key"
-            status={props.deepseekStatus}
-            msg={props.deepseekMsg}
-            onClick={props.onVerifyDeepSeek}
-            disabled={!props.dsKey.trim()}
+          <CredentialField
+            label="DeepSeek API Key"
+            status={props.credentialFor("llm.deepseek")}
+            onSave={(secret) => props.onSaveCredential("llm.deepseek", "api_key", secret)}
+            onVerify={() => props.onVerifyCredential("llm.deepseek")}
+            onRevoke={props.onRevokeCredential}
+            placeholder="输入新的 DeepSeek API Key"
           />
         </SetupSection>
 
@@ -542,22 +471,13 @@ function ConfigPage(props: {
             </>
           }
         >
-          <LabeledInput
-            label="API Token"
-            value={props.minerKey}
-            onChange={(v) => {
-              props.setMinerKey(v);
-              if (props.mineruStatus !== "idle") props.resetMineru();
-            }}
-            password
-            placeholder="eyJ0eXBl... 或 sk-..."
-          />
-          <VerifyRow
-            label="验证 Token"
-            status={props.mineruStatus}
-            msg={props.mineruMsg}
-            onClick={props.onVerifyMineru}
-            disabled={!props.minerKey.trim()}
+          <CredentialField
+            label="MinerU API Token"
+            status={props.credentialFor("ocr.mineru")}
+            onSave={(secret) => props.onSaveCredential("ocr.mineru", "api_key", secret)}
+            onVerify={() => props.onVerifyCredential("ocr.mineru")}
+            onRevoke={props.onRevokeCredential}
+            placeholder="输入新的 MinerU Token"
           />
         </SetupSection>
 
@@ -574,22 +494,15 @@ function ConfigPage(props: {
             </>
           }
         >
-          <LabeledInput
-            label="API Key"
-            value={props.yuandianKey}
-            onChange={(v) => {
-              props.setYuandianKey(v);
-              if (props.yuandianStatus !== "idle") props.resetYuandian();
-            }}
-            password
-            placeholder="sk_..."
-          />
-          <VerifyRow
-            label="验证 API Key"
-            status={props.yuandianStatus}
-            msg={props.yuandianMsg}
-            onClick={props.onVerifyYuandian}
-            disabled={!props.yuandianKey.trim()}
+          <CredentialField
+            label="元典 API Key"
+            status={props.credentialFor("connector.yuandian")}
+            onSave={(secret) =>
+              props.onSaveCredential("connector.yuandian", "api_key", secret)
+            }
+            onVerify={() => props.onVerifyCredential("connector.yuandian")}
+            onRevoke={props.onRevokeCredential}
+            placeholder="输入新的元典 API Key"
           />
         </SetupSection>
       </div>
@@ -639,48 +552,6 @@ function ApplyLink({ url, label }: { url: string; label: string }) {
   );
 }
 
-function VerifyRow({
-  label,
-  status,
-  msg,
-  onClick,
-  disabled,
-}: {
-  label: string;
-  status: VerifyStatus;
-  msg: string;
-  onClick: () => void;
-  disabled: boolean;
-}) {
-  return (
-    <div className="mt-2 flex min-h-[20px] items-center gap-2">
-      <Button
-        type="button"
-        size="sm"
-        variant="outline"
-        onClick={onClick}
-        disabled={status === "verifying" || disabled}
-        className={cn(status === "verifying" && "bg-primary/5")}
-      >
-        {status === "verifying" ? (
-          <Loader2 className="mr-1 h-4 w-4 animate-spin" />
-        ) : null}
-        {label}
-      </Button>
-      {status === "ok" && (
-        <span className="inline-flex items-center gap-1 text-xs text-green-700">
-          <CheckCircle2 className="h-4 w-4" /> 已验证
-        </span>
-      )}
-      {status === "fail" && (
-        <span className="inline-flex items-center gap-1 text-xs text-red-600">
-          <XCircle className="h-4 w-4" /> {msg || "验证失败"}
-        </span>
-      )}
-    </div>
-  );
-}
-
 function SetupSection({
   title,
   help,
@@ -696,32 +567,5 @@ function SetupSection({
       <div className="mt-1 text-xs text-muted-foreground">{help}</div>
       <div className="mt-3">{children}</div>
     </div>
-  );
-}
-
-function LabeledInput({
-  label,
-  value,
-  onChange,
-  placeholder,
-  password = false,
-}: {
-  label: string;
-  value: string;
-  onChange: (v: string) => void;
-  placeholder?: string;
-  password?: boolean;
-}) {
-  return (
-    <label className="block">
-      <span className="text-xs font-medium text-muted-foreground">{label}</span>
-      <input
-        type={password ? "password" : "text"}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        className="mt-1 block w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm focus:outline-none focus:border-foreground focus:ring-1 focus:ring-foreground/20"
-      />
-    </label>
   );
 }

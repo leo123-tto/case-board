@@ -168,6 +168,7 @@ pub fn estimate_credits_for(tool: &str) -> u32 {
         | "enterprise_base_info"            // 企业基本信息
         | "enterprise_writ_list"            // 企业涉诉文书列表
         | "enterprise_annual_report"
+        | "search_listed_announcements"     // 上市公司公告关键词检索
         | "search_laws" => 10, // 法条关键词检索 2026-07 已从旧表 1 调整为 10
         // 5 积分:法规详情 / 案例详情 / 企业变更记录
         "get_regulation_detail"             // 法规详情
@@ -195,7 +196,8 @@ pub fn credits_for_query_type(query_type: &str) -> u32 {
         | "rh_enterpriseAggregationSummary"
         | "rh_enterpriseBaseInfo"
         | "rh_enterpriseWritList"
-        | "rh_enterpriseAnnualReport" => 10,
+        | "rh_enterpriseAnnualReport"
+        | "rh_ssgsgg_search" => 10,
         // 5 积分:法规详情 / 案例详情 / 企业变更
         "rh_fg_detail" | "rh_case_details" | "rh_enterpriseChangeInfo" => 5,
         // 1 积分:法条详情 / 企业模糊检索；法条关键词现为 10
@@ -227,7 +229,10 @@ pub fn credits_for_raw_file(filename: &str) -> u32 {
     {
         return 10;
     }
-    // 1 分:企业模糊检索
+    // 1 分:企业模糊检索。
+    // ⚠️ 这条是后缀兜底,不是白名单:任何以 `_search` 结尾的端点名都会被算成 1 分。
+    // 目前只有 orchestrator/deep_dive 会走到这里,它们不调 `rh_ssgsgg_search`(10 分)——
+    // 真要把公告检索接进执行模块流水线,必须先在这条之前加显式分支,否则 10 分记成 1 分。
     if stem.ends_with("_search") {
         return 1;
     }

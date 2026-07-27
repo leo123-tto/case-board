@@ -206,27 +206,27 @@ pub async fn retrieve_local(
         return Ok(report);
     }
 
-    let key = settings
-        .embedding_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
+    let credential = crate::embedding::credential_source();
+    let credential_ready = match credential.is_ready().await {
+        Ok(ready) => ready,
+        Err(error) => {
+            crate::dlog!(
+                "本地 embedding metadata 不可读，已保留词法结果并允许后续补检: {}",
+                error
+            );
+            false
+        }
+    };
     let endpoint = settings.embedding_endpoint.as_deref().unwrap_or("");
     let model = settings.embedding_model.as_deref().unwrap_or("");
     if domain != RetrievalDomain::Enterprise
-        && key.is_some()
+        && credential_ready
         && !endpoint.is_empty()
         && !model.is_empty()
     {
-        let semantic = super::semantic::semantic_search(
-            &kb.root,
-            query,
-            12,
-            endpoint,
-            model,
-            key.unwrap_or_default(),
-        )
-        .await;
+        let semantic =
+            super::semantic::semantic_search(&kb.root, query, 12, endpoint, model, &credential)
+                .await;
         apply_semantic_result(&mut report, domain, semantic);
     }
     Ok(report)

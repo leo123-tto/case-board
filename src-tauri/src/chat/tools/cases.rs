@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::{
-    opt_u32, require_str, save_and_wrap, try_kb_hit, yuandian_key, Tool, ToolContext, ToolError,
-    ToolResult,
+    opt_u32, require_str, save_and_wrap, try_kb_hit, yuandian_credential, Tool, ToolContext,
+    ToolError, ToolResult,
 };
 use crate::yuandian;
 
@@ -189,7 +189,7 @@ impl Tool for SearchCasesNormal {
         {
             return Ok(result);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::search_ptal_with_params(api_key, &params).await?;
         Ok(save_and_wrap(
             ctx,
@@ -234,7 +234,7 @@ impl Tool for SearchCasesAuthority {
         {
             return Ok(result);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::search_qwal_with_params(api_key, &params).await?;
         Ok(save_and_wrap(
             ctx,
@@ -278,7 +278,7 @@ impl Tool for GetCaseDetail {
         {
             return Ok(result);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         // 直接走官方 rh_case_details(5 分)，不再用 10 分关键词检索冒充详情。
         // 取详情是**尽力而为**:某些案号(尤其外地/冷门库)元典会返回 404/无结果。
         // 这不是致命错误 —— LLM 手上已有 search 列表里的摘要,应据此继续,不该让整个
@@ -346,7 +346,7 @@ impl Tool for CaseVectorSearch {
         {
             return Ok(result);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::case_vector_search(api_key, &params).await?;
         Ok(save_and_wrap(
             ctx,

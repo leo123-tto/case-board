@@ -129,13 +129,7 @@ pub async fn chat_dashboard_assistant(
     if config.endpoint.trim().is_empty() {
         return with_error(fallback, "LLM endpoint 未配置");
     }
-    if is_remote_endpoint(&config.endpoint)
-        && config
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .is_none()
+    if is_remote_endpoint(&config.endpoint) && !config.credential_is_ready().await.unwrap_or(false)
     {
         return with_error(fallback, "云端 LLM API Key 未配置");
     }

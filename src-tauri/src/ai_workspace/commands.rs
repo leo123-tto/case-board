@@ -203,15 +203,7 @@ pub(crate) async fn rename_ai_workspace_conversation_impl(
 
 fn workspace_ocr_context() -> OcrContext {
     let settings = crate::settings::read_settings().unwrap_or_default();
-    let cloud = settings.effective_ocr_provider() == "cloud";
-    OcrContext {
-        cloud_enabled: cloud,
-        mineru_token: cloud.then(|| settings.mineru_api_key.clone()).flatten(),
-        paddle_vl_token: cloud.then(|| settings.paddle_vl_api_key.clone()).flatten(),
-        cloud_primary: settings.effective_ocr_cloud_primary().to_string(),
-        force_backend: None,
-        poll_tx: None,
-    }
+    OcrContext::from_settings(&settings)
 }
 
 fn emit_document_progress(

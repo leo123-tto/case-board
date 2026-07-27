@@ -19,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::credentials_bridge::PendingCredentialSource;
 use crate::db::documents::Document;
 
 /// 单个切片目标字数。bge-m3 等上限远大于此,500 字兼顾召回粒度与 embed 次数。
@@ -251,12 +252,12 @@ async fn save_index(case_id: &str, index: &CaseIndex) -> Result<(), String> {
 async fn embed_batched(
     endpoint: &str,
     model: &str,
-    key: &str,
+    credential: &PendingCredentialSource,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, String> {
     let mut out = Vec::with_capacity(texts.len());
     for batch in texts.chunks(EMBED_BATCH) {
-        let v = crate::embedding::embed(endpoint, model, key, batch).await?;
+        let v = crate::embedding::embed(endpoint, model, credential, batch).await?;
         if v.len() != batch.len() {
             return Err(format!(
                 "embedding 返回数量不符:期望 {} 得到 {}",
@@ -276,7 +277,7 @@ pub async fn build_or_update_index(
     docs: &[Document],
     endpoint: &str,
     model: &str,
-    key: &str,
+    credential: &PendingCredentialSource,
 ) -> Result<CaseIndex, String> {
     let indexable: Vec<&Document> = docs.iter().filter(|d| is_indexable(d)).collect();
     let sig = signature(endpoint, model);
@@ -307,7 +308,7 @@ pub async fn build_or_update_index(
         if pieces.is_empty() {
             continue;
         }
-        let vectors = embed_batched(endpoint, model, key, &pieces).await?;
+        let vectors = embed_batched(endpoint, model, credential, &pieces).await?;
         let chunks = pieces
             .into_iter()
             .zip(vectors)
@@ -347,13 +348,13 @@ pub async fn semantic_search(
     top_n: usize,
     endpoint: &str,
     model: &str,
-    key: &str,
+    credential: &PendingCredentialSource,
 ) -> Result<Vec<Hit>, String> {
-    let index = build_or_update_index(case_id, docs, endpoint, model, key).await?;
+    let index = build_or_update_index(case_id, docs, endpoint, model, credential).await?;
     if index.docs.is_empty() {
         return Ok(vec![]);
     }
-    let qv = crate::embedding::embed(endpoint, model, key, &[query.to_string()]).await?;
+    let qv = crate::embedding::embed(endpoint, model, credential, &[query.to_string()]).await?;
     let qv = qv.into_iter().next().ok_or("query embedding 返回空")?;
     Ok(rank_hits(&index, &qv, top_n))
 }

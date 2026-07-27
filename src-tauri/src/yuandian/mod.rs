@@ -21,6 +21,20 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 const BASE_URL: &str = "https://open.chineselaw.com/open";
+const YUANDIAN_STABLE_INVENTORY_ID: &str = "settings:yuandian_api_key";
+const YUANDIAN_CONNECTOR_ID: &str = "connector.yuandian";
+
+pub type YuandianCredentialSource = crate::credentials_bridge::PendingCredentialSource;
+
+/// 元典生产调用只长期保存 3A journal 的非秘密定位信息；每个实际 HTTP request
+/// 在低层 `yd_get` / `yd_post` 内签发并消费一张 fresh lease。
+pub fn credential_source() -> YuandianCredentialSource {
+    YuandianCredentialSource::pending(
+        crate::credentials_bridge::BridgeCredentialConsumer::YuandianConnector,
+        YUANDIAN_STABLE_INVENTORY_ID,
+        YUANDIAN_CONNECTOR_ID,
+    )
+}
 
 // ───── 报告落盘的共享 helper(原本在 deep_dive / full_report / risk_assessment /
 //        orchestrator 各抄一份,2026-06-03 收口到此,行为不变)─────
@@ -146,17 +160,22 @@ pub(crate) async fn call_llm(
         ))
         .build()
         .map_err(|e| format!("HTTP client 创建失败:{}", e))?;
-    let mut req = client.post(&cfg.endpoint).json(&body);
-    if let Some(k) = &cfg.api_key {
-        req = req.bearer_auth(k);
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("LLM 调用失败:{}", e))?;
+    let (req, credential) = cfg
+        .authorize_request(client.post(&cfg.endpoint).json(&body))
+        .await?;
+    let resp = req.send().await.map_err(|e| {
+        let message = credential
+            .as_ref()
+            .map_or_else(|| e.to_string(), |value| value.redact(&e.to_string()));
+        format!("LLM 调用失败:{message}")
+    })?;
     if !resp.status().is_success() {
         let code = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
+        let text = match credential.as_ref() {
+            Some(value) => value.redact(&text),
+            None => text,
+        };
         return Err(format!("LLM HTTP {}: {}", code, text));
     }
     let json: Value = resp
@@ -168,7 +187,11 @@ pub(crate) async fn call_llm(
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .map(|s| s.to_string())
+        .map(|s| {
+            credential
+                .as_ref()
+                .map_or_else(|| s.to_string(), |value| value.redact(s))
+        })
         .ok_or_else(|| "LLM 响应无 content".to_string())
 }
 
@@ -184,6 +207,8 @@ pub enum YuandianError {
     Json(String),
     #[error("元典业务错误 code={0}:{1}")]
     BusinessStatus(i64, String),
+    #[error("{0}")]
+    Credential(String),
 }
 
 impl serde::Serialize for YuandianError {
@@ -215,55 +240,71 @@ fn build_client(path: &str) -> Result<reqwest::Client, YuandianError> {
 
 /// 通用 GET 请求(元典大部分接口都是 GET + query params)。
 async fn yd_get(
-    api_key: &str,
+    credential: &YuandianCredentialSource,
     path: &str,
     params: &[(&str, String)],
 ) -> Result<Value, YuandianError> {
+    let material = credential
+        .issue_material()
+        .await
+        .map_err(YuandianError::Credential)?;
     let client = build_client(path)?;
     let resp = client
         .get(format!("{}{}", BASE_URL, path))
-        .header("X-Api-Key", api_key)
+        .header("X-Api-Key", material.expose())
         .header("accept", "application/json;charset=UTF-8")
         .query(params)
         .send()
         .await
-        .map_err(|e| YuandianError::Network(e.to_string()))?;
+        .map_err(|e| YuandianError::Network(material.redact(&e.to_string())))?;
 
     let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| YuandianError::Network(material.redact(&e.to_string())))?;
+    let body = material.redact(&body);
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
         return Err(YuandianError::HttpStatus(status.as_u16(), body));
     }
 
-    let value = resp
-        .json::<Value>()
-        .await
-        .map_err(|e| YuandianError::Json(e.to_string()))?;
+    let value =
+        serde_json::from_str::<Value>(&body).map_err(|e| YuandianError::Json(e.to_string()))?;
     validate_business_response(value)
 }
 
 /// 通用 POST 请求(裁判文书 / 法规等检索是 POST + JSON body)。
-async fn yd_post(api_key: &str, path: &str, body: &Value) -> Result<Value, YuandianError> {
+async fn yd_post(
+    credential: &YuandianCredentialSource,
+    path: &str,
+    body: &Value,
+) -> Result<Value, YuandianError> {
+    let material = credential
+        .issue_material()
+        .await
+        .map_err(YuandianError::Credential)?;
     let client = build_client(path)?;
     let resp = client
         .post(format!("{}{}", BASE_URL, path))
-        .header("X-Api-Key", api_key)
+        .header("X-Api-Key", material.expose())
         .header("accept", "application/json;charset=UTF-8")
         .header("Content-Type", "application/json")
         .json(body)
         .send()
         .await
-        .map_err(|e| YuandianError::Network(e.to_string()))?;
+        .map_err(|e| YuandianError::Network(material.redact(&e.to_string())))?;
 
     let status = resp.status();
+    let response_body = resp
+        .text()
+        .await
+        .map_err(|e| YuandianError::Network(material.redact(&e.to_string())))?;
+    let response_body = material.redact(&response_body);
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(YuandianError::HttpStatus(status.as_u16(), body));
+        return Err(YuandianError::HttpStatus(status.as_u16(), response_body));
     }
 
-    let value = resp
-        .json::<Value>()
-        .await
+    let value = serde_json::from_str::<Value>(&response_body)
         .map_err(|e| YuandianError::Json(e.to_string()))?;
     validate_business_response(value)
 }
@@ -301,7 +342,7 @@ fn enterprise_search_query(name: &str, top_k: u32) -> Vec<(&'static str, String)
 }
 
 pub async fn enterprise_search_with_limit(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     name: &str,
     top_k: u32,
 ) -> Result<Value, YuandianError> {
@@ -313,13 +354,16 @@ pub async fn enterprise_search_with_limit(
     .await
 }
 
-pub async fn enterprise_search(api_key: &str, name: &str) -> Result<Value, YuandianError> {
+pub async fn enterprise_search(
+    api_key: &YuandianCredentialSource,
+    name: &str,
+) -> Result<Value, YuandianError> {
     enterprise_search_with_limit(api_key, name, 10).await
 }
 
 /// 企业聚合摘要 — 一次拿所有维度(主体 / 风险 / 涉诉 / 财产线索摘要)
 pub async fn enterprise_aggregation_summary(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
 ) -> Result<Value, YuandianError> {
     yd_get(
@@ -332,7 +376,7 @@ pub async fn enterprise_aggregation_summary(
 
 /// 失信被执行人(老赖名单)
 pub async fn enterprise_executions(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -343,7 +387,7 @@ pub async fn enterprise_executions(
 
 /// 被执行人(普通执行,不一定老赖)
 pub async fn enterprise_executed_person(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -354,7 +398,7 @@ pub async fn enterprise_executed_person(
 
 /// 法律文书列表(判决/裁定/调解/...)
 pub async fn enterprise_writ_list(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -365,7 +409,7 @@ pub async fn enterprise_writ_list(
 
 /// 法院公告(含限消)
 pub async fn enterprise_court_notice(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -376,7 +420,7 @@ pub async fn enterprise_court_notice(
 
 /// 开庭公告
 pub async fn enterprise_court_session_notice(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -387,7 +431,7 @@ pub async fn enterprise_court_session_notice(
 
 /// 股权出质
 pub async fn enterprise_pledge(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -398,7 +442,7 @@ pub async fn enterprise_pledge(
 
 /// 股权冻结(执行能查到的财产线索 ⭐)
 pub async fn enterprise_frozen_equity(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -409,7 +453,7 @@ pub async fn enterprise_frozen_equity(
 
 /// 对外投资(关联公司 → 财产线索 ⭐)
 pub async fn enterprise_out_invest(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -420,7 +464,7 @@ pub async fn enterprise_out_invest(
 
 /// 工商变更
 pub async fn enterprise_change_info(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -431,7 +475,7 @@ pub async fn enterprise_change_info(
 
 /// 担保
 pub async fn enterprise_guaranty(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -442,7 +486,7 @@ pub async fn enterprise_guaranty(
 
 /// 行政处罚
 pub async fn enterprise_punishment(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -453,7 +497,7 @@ pub async fn enterprise_punishment(
 
 /// 经营异常
 pub async fn enterprise_abnormal_operation(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -464,7 +508,7 @@ pub async fn enterprise_abnormal_operation(
 
 /// 严重违法
 pub async fn enterprise_serious_illegal(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -475,7 +519,7 @@ pub async fn enterprise_serious_illegal(
 
 /// 2026-05-25 V0.1.9 加 · 欠税公告(可作为财产线索)
 pub async fn enterprise_corporate_tax(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     page: u32,
 ) -> Result<Value, YuandianError> {
@@ -495,7 +539,7 @@ fn enterprise_annual_report_query(id_or_uscc: &EntityId, year: u32) -> Vec<(&'st
 /// 2026-05-25 V0.1.9 加 · 企业年报详情(GET,按年份)
 /// 拒执判断要拿"立案前一年 + 当年"两份年报,对比股东出资 / 总资产变化
 pub async fn enterprise_annual_report(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
     year: u32,
 ) -> Result<Value, YuandianError> {
@@ -506,6 +550,57 @@ pub async fn enterprise_annual_report(
         &enterprise_annual_report_query(id_or_uscc, year),
     )
     .await
+}
+
+/* ============ 上市公司公告检索 ============ */
+
+/// 上市公司公告关键词检索(`rh_ssgsgg_search`,10 积分)。
+///
+/// 官方约定:全部字段可选,但**请求体不能为空**(`top_k` 不计入),空会返回失败;
+/// `fbrq_start` 不得晚于 `fbrq_end`。
+///
+/// 真机实测(2026-07-26,`cargo run --example yuandian_ssgsgg_probe`):
+/// - `search_mode` 网关**大小写不敏感**,`AND` 与 `and` 都返回 code=200。
+///   schema 按官方文档锁大写即可,不必像 rh_ptal_search 那样担心大小写判失败。
+/// - 只带 `top_k` 的 body(`{"top_k":3}`)被官方判 code=501 参数异常 —— 印证
+///   `ssgsgg_params_from_args` 提前拦截是必要的,否则白发一次请求。
+#[derive(Serialize, Default, Debug, Clone)]
+pub struct SsgsggSearchParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fbrq_start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fbrq_end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zsx_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+}
+
+fn build_ssgsgg_search_body(params: &SsgsggSearchParams) -> Result<Value, YuandianError> {
+    serde_json::to_value(params).map_err(|error| YuandianError::Json(error.to_string()))
+}
+
+/// 上市公司公告关键词检索 — 尽调时查目标公司的公开披露。
+pub async fn search_ssgsgg_with_params(
+    api_key: &YuandianCredentialSource,
+    params: &SsgsggSearchParams,
+) -> Result<Value, YuandianError> {
+    let body = build_ssgsgg_search_body(params)?;
+    yd_post(api_key, "/rh_ssgsgg_search", &body).await
 }
 
 /* ============ 案例 / 文书检索(对自然人有用)============ */
@@ -552,7 +647,7 @@ fn build_ptal_search_body(params: &PtalSearchParams) -> Result<Value, YuandianEr
 
 /// 普通案例库关键词检索 — 给自然人被执行人查涉诉文书。
 pub async fn search_ptal_with_params(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     params: &PtalSearchParams,
 ) -> Result<Value, YuandianError> {
     let body = build_ptal_search_body(params)?;
@@ -560,7 +655,11 @@ pub async fn search_ptal_with_params(
 }
 
 /// 兼容旧调用；高级工具路径使用 `search_ptal_with_params`。
-pub async fn search_ptal(api_key: &str, keyword: &str, top_k: u32) -> Result<Value, YuandianError> {
+pub async fn search_ptal(
+    api_key: &YuandianCredentialSource,
+    keyword: &str,
+    top_k: u32,
+) -> Result<Value, YuandianError> {
     let body = serde_json::json!({
         "qw": keyword,
         "top_k": top_k,
@@ -603,7 +702,7 @@ fn build_qwal_search_body(params: &QwalSearchParams) -> Result<Value, YuandianEr
 }
 
 pub async fn search_qwal_with_params(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     params: &QwalSearchParams,
 ) -> Result<Value, YuandianError> {
     let body = build_qwal_search_body(params)?;
@@ -611,7 +710,11 @@ pub async fn search_qwal_with_params(
 }
 
 /// 权威案例库检索(指导性 / 典型 / 公报案例)
-pub async fn search_qwal(api_key: &str, keyword: &str, top_k: u32) -> Result<Value, YuandianError> {
+pub async fn search_qwal(
+    api_key: &YuandianCredentialSource,
+    keyword: &str,
+    top_k: u32,
+) -> Result<Value, YuandianError> {
     let body = serde_json::json!({
         "qw": keyword,
         "top_k": top_k,
@@ -621,7 +724,7 @@ pub async fn search_qwal(api_key: &str, keyword: &str, top_k: u32) -> Result<Val
 
 /// 案例详情(GET)。官方接口支持按案例库类型 + 案号/ID 查询，返回 `data` 列表（最多 10 条）。
 pub async fn case_details(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     case_type: Option<&str>,
     id: Option<&str>,
     case_no: Option<&str>,
@@ -694,7 +797,10 @@ pub struct FtSearchParams {
     pub implement_date_end: Option<String>,
 }
 
-pub async fn ft_search(api_key: &str, params: &FtSearchParams) -> Result<Value, YuandianError> {
+pub async fn ft_search(
+    api_key: &YuandianCredentialSource,
+    params: &FtSearchParams,
+) -> Result<Value, YuandianError> {
     let body = build_law_keyword_body(params)?;
     yd_post(api_key, "/rh_ft_search", &body).await
 }
@@ -712,7 +818,10 @@ pub struct FtDetailParams {
     pub refer_date: Option<String>,
 }
 
-pub async fn ft_detail(api_key: &str, params: &FtDetailParams) -> Result<Value, YuandianError> {
+pub async fn ft_detail(
+    api_key: &YuandianCredentialSource,
+    params: &FtDetailParams,
+) -> Result<Value, YuandianError> {
     let body = serde_json::to_value(params).map_err(|e| YuandianError::Json(e.to_string()))?;
     yd_post(api_key, "/rh_ft_detail", &body).await
 }
@@ -748,7 +857,10 @@ pub struct FgSearchParams {
     pub implement_date_end: Option<String>,
 }
 
-pub async fn fg_search(api_key: &str, params: &FgSearchParams) -> Result<Value, YuandianError> {
+pub async fn fg_search(
+    api_key: &YuandianCredentialSource,
+    params: &FgSearchParams,
+) -> Result<Value, YuandianError> {
     let body = build_regulation_keyword_body(params)?;
     yd_post(api_key, "/rh_fg_search", &body).await
 }
@@ -764,7 +876,10 @@ pub struct FgDetailParams {
     pub refer_date: Option<String>,
 }
 
-pub async fn fg_detail(api_key: &str, params: &FgDetailParams) -> Result<Value, YuandianError> {
+pub async fn fg_detail(
+    api_key: &YuandianCredentialSource,
+    params: &FgDetailParams,
+) -> Result<Value, YuandianError> {
     let body = serde_json::to_value(params).map_err(|e| YuandianError::Json(e.to_string()))?;
     yd_post(api_key, "/rh_fg_detail", &body).await
 }
@@ -794,7 +909,7 @@ pub struct LawVectorSearchParams {
 }
 
 pub async fn law_vector_search(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     params: &LawVectorSearchParams,
 ) -> Result<Value, YuandianError> {
     let body = build_law_vector_body(params);
@@ -842,7 +957,7 @@ pub struct CaseVectorSearchParams {
 }
 
 pub async fn case_vector_search(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     params: &CaseVectorSearchParams,
 ) -> Result<Value, YuandianError> {
     let body = build_case_vector_body(params);
@@ -961,7 +1076,10 @@ fn normalize_region(region: &str) -> String {
 
 /// § 17.7 · hall_detect 法律幻觉校验(核心)。把 LLM final answer 塞进 text,
 /// 拿 citations 列表(每条带 verdict:一致/不一致/未命中 + 正确写法)。
-pub async fn hall_detect(api_key: &str, text: &str) -> Result<Value, YuandianError> {
+pub async fn hall_detect(
+    api_key: &YuandianCredentialSource,
+    text: &str,
+) -> Result<Value, YuandianError> {
     let body = serde_json::json!({ "text": text });
     yd_post(api_key, "/hall_detect", &body).await
 }
@@ -969,7 +1087,7 @@ pub async fn hall_detect(api_key: &str, text: &str) -> Result<Value, YuandianErr
 /// § 17.8 · rh_enterpriseBaseInfo 详细工商(GET)。返回 basic / partner /
 /// top10holder / top10circulate / members / branches。
 pub async fn enterprise_base_info(
-    api_key: &str,
+    api_key: &YuandianCredentialSource,
     id_or_uscc: &EntityId,
 ) -> Result<Value, YuandianError> {
     yd_get(api_key, "/rh_enterpriseBaseInfo", &id_or_uscc.to_params()).await

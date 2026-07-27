@@ -369,7 +369,10 @@ pub async fn trigger_reextract(
 ) -> Result<String, String> {
     let settings = settings::read_settings()
         .map_err(|error| format!("无法读取 AI 配置：{error}。请前往「设置 → 大脑」检查配置。"))?;
-    settings.validate_material_llm_ready()?;
+    settings.validate_material_llm_non_secret_config()?;
+    llm::LlmConfig::from_settings(&settings)
+        .ensure_material_ready()
+        .await?;
     crate::db::documents::reset_for_reextract(pool, doc_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -460,7 +463,8 @@ async fn run_extraction(
 
     // 2026-05-23 晚六:OCR 和 LLM 独立维度 — 先读 settings 再 emit Started(便于前端显示后端)
     let user_settings = settings::read_settings().unwrap_or_default();
-    if let Err(error) = user_settings.validate_material_llm_ready() {
+    let llm_config = llm::LlmConfig::from_settings(&user_settings);
+    if let Err(error) = user_settings.validate_material_llm_non_secret_config() {
         let _ = app.emit(
             "extraction_progress",
             ProgressEvent::Error {
@@ -470,23 +474,17 @@ async fn run_extraction(
         );
         return Ok(());
     }
-    let llm_config = llm::LlmConfig::from_settings(&user_settings);
-    let cloud_ocr = user_settings.effective_ocr_provider() == "cloud";
-    let ocr_ctx = OcrContext {
-        cloud_enabled: cloud_ocr,
-        // 云端模式带两家 token(2026-06-12 主/备动态切换,见 ocr.rs)。本地模式 None。
-        mineru_token: cloud_ocr
-            .then(|| user_settings.mineru_api_key.clone())
-            .flatten(),
-        paddle_vl_token: cloud_ocr
-            .then(|| user_settings.paddle_vl_api_key.clone())
-            .flatten(),
-        cloud_primary: user_settings.effective_ocr_cloud_primary().to_string(),
-        // 默认无强制后端;去水印重识别时由 process_one_doc 从 doc.ocr_backend_override 逐文档注入。
-        force_backend: None,
-        // 轮询进度通道由 process_one_doc 逐文档注入(带 doc 上下文);批级模板这里留空。
-        poll_tx: None,
-    };
+    if let Err(error) = llm_config.ensure_material_ready().await {
+        let _ = app.emit(
+            "extraction_progress",
+            ProgressEvent::Error {
+                case_id: case_id.to_string(),
+                error,
+            },
+        );
+        return Ok(());
+    }
+    let ocr_ctx = OcrContext::from_settings(&user_settings);
     let ocr_provider = user_settings.effective_ocr_provider().to_string();
     let llm_provider = user_settings.effective_llm_provider().to_string();
 
@@ -502,12 +500,12 @@ async fn run_extraction(
     );
 
     crate::dlog!(
-        "[pipeline] OCR={}, LLM={} (endpoint={}, key={})",
+        "[pipeline] OCR={}, LLM={} (endpoint={}, credential_locator={})",
         user_settings.effective_ocr_provider(),
         user_settings.effective_llm_provider(),
         llm_config.endpoint,
-        if llm_config.api_key.is_some() {
-            "set"
+        if llm_config.has_credential_locator() {
+            "present"
         } else {
             "—"
         },

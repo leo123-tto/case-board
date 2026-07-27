@@ -527,6 +527,19 @@ impl StreamingToolCall {
         }
     }
 
+    fn redact(&mut self, secret: &str) {
+        if secret.is_empty() {
+            return;
+        }
+        if let Some(id) = self.id.as_mut() {
+            *id = id.replace(secret, "[REDACTED]");
+        }
+        if let Some(name) = self.name.as_mut() {
+            *name = name.replace(secret, "[REDACTED]");
+        }
+        self.arguments_buf = self.arguments_buf.replace(secret, "[REDACTED]");
+    }
+
     fn build(self) -> Result<FinishedToolCall, AgentLoopError> {
         let id = self
             .id
@@ -1289,10 +1302,12 @@ async fn stream_one_request(
     let mut last_err: Option<AgentLoopError> = None;
     let mut stream_retries_used = 0usize;
     for attempt in 0..MAX_REQUEST_RETRIES {
-        let mut request = client.post(endpoint).json(&body);
-        if let Some(key) = &config.api_key {
-            request = request.bearer_auth(key);
-        }
+        let (request, credential) = config
+            .authorize_request(client.post(endpoint).json(&body))
+            .await
+            .map_err(|error| {
+                AgentLoopError::RuntimeUnavailable(format!("LLM 凭据不可用:{error}"))
+            })?;
         let send_res = tokio::select! {
             biased;
             _ = &mut *cancel => return Err(AgentLoopError::Cancelled),
@@ -1301,13 +1316,16 @@ async fn stream_one_request(
         let response = match send_res {
             Ok(r) => r,
             Err(e) => {
+                let safe_error = credential
+                    .as_ref()
+                    .map_or_else(|| e.to_string(), |value| value.redact(&e.to_string()));
                 crate::dlog!(
                     "agent_loop: 请求发送失败(attempt {}/{}):{} — 重试",
                     attempt + 1,
                     MAX_REQUEST_RETRIES,
-                    e
+                    safe_error
                 );
-                last_err = Some(AgentLoopError::Network(e.to_string()));
+                last_err = Some(AgentLoopError::Network(safe_error));
                 tokio::time::sleep(Duration::from_millis(300 * (1 << attempt))).await;
                 continue;
             }
@@ -1315,7 +1333,11 @@ async fn stream_one_request(
         let status = response.status();
         if !status.is_success() {
             let raw = response.text().await.unwrap_or_default();
-            let snippet: String = raw.chars().take(800).collect();
+            let safe_raw = match credential.as_ref() {
+                Some(value) => value.redact(&raw),
+                None => raw,
+            };
+            let snippet: String = safe_raw.chars().take(800).collect();
             if status.as_u16() == 401 || status.as_u16() == 403 {
                 return Err(AgentLoopError::HttpStatus(status.as_u16(), snippet));
             }
@@ -1337,7 +1359,7 @@ async fn stream_one_request(
         // HTTP 200 后仍可能在 body 流中途断开。只有尚未收到任何有效 SSE payload 时才能
         // 原样重放一次；已有正文/推理/tool delta 时重放会造成重复输出或重复调用。
         guard.begin_stream_attempt();
-        match parse_stream(response, tx, cancel, guard).await {
+        match parse_stream(response, tx, cancel, guard, credential.as_ref()).await {
             Ok(output) => return Ok(output),
             Err(failure)
                 if attempt + 1 < MAX_REQUEST_RETRIES
@@ -1371,6 +1393,7 @@ async fn parse_stream(
     tx: &UnboundedSender<ChatStreamEvent>,
     cancel: &mut oneshot::Receiver<()>,
     guard: &mut LoopGuard,
+    credential: Option<&crate::llm::LlmCredentialMaterial>,
 ) -> Result<OneStreamPass, StreamAttemptFailure> {
     use futures::StreamExt;
     let mut stream = response.bytes_stream();
@@ -1382,6 +1405,9 @@ async fn parse_stream(
     let mut usage_chunk = ChunkUsage::default();
     let mut had_meaningful_output = false;
     let mut saw_done = false;
+    let mut redaction = SseSecretRedactionState::new(
+        credential.map(crate::llm::LlmCredentialMaterial::stream_redaction_secret),
+    );
 
     loop {
         let idle_remaining = guard.idle_remaining();
@@ -1407,8 +1433,13 @@ async fn parse_stream(
             chunk = stream.next() => match chunk {
                 None => break,
                 Some(Err(e)) => {
+                    let message = format_reqwest_error(&e);
+                    let message = match credential {
+                        Some(value) => value.redact(&message),
+                        None => message,
+                    };
                     return Err(StreamAttemptFailure::new(
-                        AgentLoopError::Network(format_reqwest_error(&e)),
+                        AgentLoopError::Network(message),
                         had_meaningful_output,
                     ));
                 }
@@ -1427,7 +1458,7 @@ async fn parse_stream(
                     while let Some(idx) = buf.find("\n\n") {
                         let raw_event = buf[..idx].to_string();
                         buf = buf[idx + 2..].to_string();
-                        let outcome = handle_sse_event(
+                        let outcome = handle_sse_event_redacted(
                             &raw_event,
                             tx,
                             &mut content,
@@ -1435,6 +1466,7 @@ async fn parse_stream(
                             &mut tool_calls_map,
                             &mut finish_reason,
                             &mut usage_chunk,
+                            &mut redaction,
                         );
                         if outcome.meaningful {
                             had_meaningful_output = true;
@@ -1459,6 +1491,14 @@ async fn parse_stream(
             had_meaningful_output,
         ));
     }
+    redaction.finish(
+        tx,
+        &mut content,
+        &mut reasoning,
+        &mut tool_calls_map,
+        &mut finish_reason,
+        &mut usage_chunk,
+    );
 
     // 思考模型单轮可能纯推理几分钟,落日志方便诊断「是否真卡死」(连不上会先报 Network 错)。
     if !reasoning.is_empty() {
@@ -1514,9 +1554,112 @@ struct SseEventOutcome {
     meaningful: bool,
 }
 
-/// 处理一条 SSE 事件，分别返回“是否结束”和“是否包含真实模型进展”。
-/// `: keep-alive`、空行和无法解析的 payload 都不算真实进展。
-fn handle_sse_event(
+#[derive(Debug, Default)]
+struct StreamingSecretRedactionBuffer {
+    pending: String,
+}
+
+impl StreamingSecretRedactionBuffer {
+    fn push(&mut self, secret: Option<&str>, chunk: &str) -> String {
+        let Some(secret) = secret.filter(|value| !value.is_empty()) else {
+            return chunk.to_owned();
+        };
+        self.pending.push_str(chunk);
+        let mut safe = String::new();
+        while let Some(index) = self.pending.find(secret) {
+            safe.push_str(&self.pending[..index]);
+            safe.push_str("[REDACTED]");
+            self.pending.drain(..index + secret.len());
+        }
+        let held_bytes = longest_secret_prefix_suffix(&self.pending, secret);
+        let emit_bytes = self.pending.len().saturating_sub(held_bytes);
+        safe.push_str(&self.pending[..emit_bytes]);
+        self.pending.drain(..emit_bytes);
+        safe
+    }
+
+    fn finish(&mut self, secret: Option<&str>) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        match secret.filter(|value| !value.is_empty()) {
+            Some(secret) => pending.replace(secret, "[REDACTED]"),
+            None => pending,
+        }
+    }
+}
+
+fn longest_secret_prefix_suffix(value: &str, secret: &str) -> usize {
+    let max = value.len().min(secret.len().saturating_sub(1));
+    (1..=max)
+        .rev()
+        .find(|&length| {
+            value.is_char_boundary(value.len() - length)
+                && secret.is_char_boundary(length)
+                && value[value.len() - length..] == secret[..length]
+        })
+        .unwrap_or(0)
+}
+
+struct SseSecretRedactionState<'a> {
+    secret: Option<&'a str>,
+    content: StreamingSecretRedactionBuffer,
+    reasoning: StreamingSecretRedactionBuffer,
+}
+
+impl<'a> SseSecretRedactionState<'a> {
+    fn new(secret: Option<&'a str>) -> Self {
+        Self {
+            secret: secret.filter(|value| !value.is_empty()),
+            content: StreamingSecretRedactionBuffer::default(),
+            reasoning: StreamingSecretRedactionBuffer::default(),
+        }
+    }
+
+    fn redact_complete(&self, value: &str) -> String {
+        match self.secret {
+            Some(secret) => value.replace(secret, "[REDACTED]"),
+            None => value.to_owned(),
+        }
+    }
+
+    fn finish(
+        &mut self,
+        tx: &UnboundedSender<ChatStreamEvent>,
+        content_acc: &mut String,
+        reasoning_acc: &mut String,
+        tool_calls: &mut HashMap<u32, StreamingToolCall>,
+        finish_reason: &mut Option<String>,
+        usage_chunk: &mut ChunkUsage,
+    ) {
+        let content_tail = self.content.finish(self.secret);
+        if !content_tail.is_empty() {
+            content_acc.push_str(&content_tail);
+            let _ = tx.send(ChatStreamEvent::Delta { text: content_tail });
+        }
+        let reasoning_tail = self.reasoning.finish(self.secret);
+        if !reasoning_tail.is_empty() {
+            reasoning_acc.push_str(&reasoning_tail);
+            let _ = tx.send(ChatStreamEvent::Reasoning {
+                text: reasoning_tail,
+            });
+        }
+        if let Some(secret) = self.secret {
+            *content_acc = content_acc.replace(secret, "[REDACTED]");
+            *reasoning_acc = reasoning_acc.replace(secret, "[REDACTED]");
+            for tool_call in tool_calls.values_mut() {
+                tool_call.redact(secret);
+            }
+            if let Some(reason) = finish_reason.as_mut() {
+                *reason = reason.replace(secret, "[REDACTED]");
+            }
+            if let Some(model) = usage_chunk.model.as_mut() {
+                *model = model.replace(secret, "[REDACTED]");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_sse_event_redacted(
     raw: &str,
     tx: &UnboundedSender<ChatStreamEvent>,
     content_acc: &mut String,
@@ -1524,6 +1667,7 @@ fn handle_sse_event(
     tool_calls: &mut HashMap<u32, StreamingToolCall>,
     finish_reason: &mut Option<String>,
     usage_chunk: &mut ChunkUsage,
+    redaction: &mut SseSecretRedactionState<'_>,
 ) -> SseEventOutcome {
     let mut outcome = SseEventOutcome::default();
     for line in raw.lines() {
@@ -1543,7 +1687,7 @@ fn handle_sse_event(
             continue;
         };
         if let Some(m) = chunk.model {
-            usage_chunk.model = Some(m);
+            usage_chunk.model = Some(redaction.redact_complete(&m));
         }
         if let Some(u) = chunk.usage {
             if u.prompt_tokens.is_some() {
@@ -1568,14 +1712,17 @@ fn handle_sse_event(
                 // 只取首个非空 finish_reason:正常一次请求只出现一次;若服务端异常发多个
                 //(如先 tool_calls 后 stop),保留首个,避免工具调用信息被后续覆盖丢失 → 400。
                 if finish_reason.is_none() {
-                    *finish_reason = Some(fr);
+                    *finish_reason = Some(redaction.redact_complete(&fr));
                 }
             }
             if let Some(text) = choice.delta.content {
                 if !text.is_empty() {
                     outcome.meaningful = true;
-                    content_acc.push_str(&text);
-                    let _ = tx.send(ChatStreamEvent::Delta { text });
+                    let safe_text = redaction.content.push(redaction.secret, &text);
+                    if !safe_text.is_empty() {
+                        content_acc.push_str(&safe_text);
+                        let _ = tx.send(ChatStreamEvent::Delta { text: safe_text });
+                    }
                 }
             }
             if let Some(deltas) = choice.delta.tool_calls {
@@ -1594,8 +1741,13 @@ fn handle_sse_event(
             // 调用，LoopGuard 会中断该次流并走一次安全重试，而不是等网关数分钟后断开。
             if let Some(rc) = choice.delta.reasoning_content {
                 if !rc.is_empty() {
-                    reasoning_acc.push_str(&rc);
-                    let _ = tx.send(ChatStreamEvent::Reasoning { text: rc });
+                    let safe_reasoning = redaction.reasoning.push(redaction.secret, &rc);
+                    if !safe_reasoning.is_empty() {
+                        reasoning_acc.push_str(&safe_reasoning);
+                        let _ = tx.send(ChatStreamEvent::Reasoning {
+                            text: safe_reasoning,
+                        });
+                    }
                 }
             }
         }

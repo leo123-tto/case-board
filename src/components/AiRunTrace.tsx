@@ -33,6 +33,7 @@ const TOOL_LABELS: Record<string, string> = {
   enterprise_change_info: "元典：查询企业变更记录",
   enterprise_writ_list: "元典：查询企业涉诉信息",
   enterprise_annual_report: "元典：查询企业年报",
+  search_listed_announcements: "元典：检索上市公司公告",
   web_search: "联网搜索",
   web_fetch: "读取网页资料",
   exa_search: "Exa 联网搜索",

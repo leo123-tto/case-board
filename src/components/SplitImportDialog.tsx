@@ -19,6 +19,12 @@ import {
 } from "lucide-react";
 import type { ImportPlan } from "../lib/types";
 
+/** 一次拆分导入的案件数上限(对齐后端 `MAX_SPLIT_IMPORT_CASES`)。 */
+const MAX_CASES = 8;
+
+/** 勾选材料总数超过这个数就提醒免费 OCR 额度风险(经验值:几百份起就容易额度不够)。 */
+const DOC_WARN_THRESHOLD = 300;
+
 function basename(p: string): string {
   const parts = p.split(/[/\\]/).filter(Boolean);
   return parts[parts.length - 1] ?? p;
@@ -102,10 +108,14 @@ export function SplitImportDialog({
       return next;
     });
 
-  // 已选 = 勾选的候选案件 + 勾回的杂项目录(共同受"最多 3 个"约束)。
+  // 已选 = 勾选的候选案件 + 勾回的杂项目录(共同受 MAX_CASES 约束)。
   const selectedCases = rows.filter((r) => r.include);
   const selectedMisc = misc.filter((m) => m.include);
   const selectedTotal = selectedCases.length + selectedMisc.length;
+  // 免费 OCR 额度是按量计的总量,真正决定跑不跑得完的是材料份数,不是案件个数。
+  const selectedDocTotal =
+    selectedCases.reduce((sum, r) => sum + r.docCount, 0) +
+    selectedMisc.reduce((sum, m) => sum + m.docCount, 0);
 
   const setName = (i: number, name: string) =>
     setRows((rs) => rs.map((r, j) => (j === i ? { ...r, name } : r)));
@@ -135,16 +145,18 @@ export function SplitImportDialog({
 
         {/* 体 */}
         <div className="flex-1 overflow-y-auto px-6 py-4">
-          {/* 防呆:案件过多(>3)→ 免费 OCR 批量易被限流卡死,建议逐个导入 */}
-          {selectedTotal > 3 && (
+          {/* 案件多 / 材料多 → 提醒免费 OCR 额度(总量)与全案分析花费,建议分批或先合并 */}
+          {(selectedTotal > 3 || selectedDocTotal > DOC_WARN_THRESHOLD) && (
             <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-sm text-amber-800">
               <AlertTriangle className="mt-0.5 size-4 shrink-0" />
               <span>
-                <strong>案件过多(已选 {selectedTotal} 个)。</strong>
-                一次批量导入超过 3 个案件,免费 OCR
-                批量识别很容易因限流卡死、大量文档识别失败。
-                <strong>建议一个一个案件导入</strong>
-                ,或在下方取消勾选、本次只留 1~3 个。
+                <strong>
+                  已选 {selectedTotal} 个案件、共 {selectedDocTotal} 份材料。
+                </strong>
+                案件会排队逐个处理(不会并发打爆识别服务),但<strong>云端 OCR
+                免费额度是按量算的</strong>:材料一多,额度当天就可能用光,后面的材料会大批识别失败。
+                每个案件还会各跑一次全案 AI 分析(约 1-3 分钟,消耗 DeepSeek 余额)。
+                建议分批导入,或点「合并成 1 个案件」先入库、之后按需重识别。
               </span>
             </div>
           )}
@@ -341,18 +353,18 @@ export function SplitImportDialog({
                   plan.shared_dirs,
                 )
               }
-              disabled={busy || selectedTotal === 0 || selectedTotal > 3}
+              disabled={busy || selectedTotal === 0 || selectedTotal > MAX_CASES}
               title={
-                selectedTotal > 3
-                  ? "一次最多导入 3 个案件,请取消勾选到 3 个以内(或点「合并成 1 个案件」)"
+                selectedTotal > MAX_CASES
+                  ? `一次最多导入 ${MAX_CASES} 个案件,请取消勾选到 ${MAX_CASES} 个以内(或点「合并成 1 个案件」)`
                   : undefined
               }
               className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-medium text-white hover:bg-sky-600 disabled:opacity-50"
             >
               {busy
                 ? "导入中…"
-                : selectedTotal > 3
-                  ? `最多 3 个(已选 ${selectedTotal})`
+                : selectedTotal > MAX_CASES
+                  ? `最多 ${MAX_CASES} 个(已选 ${selectedTotal})`
                   : `拆成 ${selectedTotal} 个案件导入`}
             </button>
           </div>

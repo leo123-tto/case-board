@@ -37,8 +37,41 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::tools::{Tool, ToolContext, ToolError, ToolResult};
+use crate::credentials_bridge::{
+    BridgeCredentialConsumer, CredentialBroker, PendingSecretLeaseRequest,
+};
+
+pub(crate) struct McpCredentialMaterial(BTreeMap<String, String>);
+
+impl McpCredentialMaterial {
+    pub(crate) fn new(values: BTreeMap<String, String>) -> Self {
+        Self(values)
+    }
+}
+
+impl std::ops::Deref for McpCredentialMaterial {
+    type Target = BTreeMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for McpCredentialMaterial {
+    fn drop(&mut self) {
+        self.0.values_mut().for_each(Zeroize::zeroize);
+        self.0.clear();
+    }
+}
+
+impl std::fmt::Debug for McpCredentialMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("McpCredentialMaterial(<redacted>)")
+    }
+}
 
 /// 外部 MCP server 的传输方式。两种传输共用此配置形状,与「rmcp 还是手搓」的实现决策无关。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,12 +98,19 @@ pub enum McpTransport {
 /// 一个外部 MCP server 的配置项(存 settings.json 或表,**存储无关**:从任意 JSON 反序列化)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerConfig {
+    /// 持久、不可变的随机 UUID。人读名称和 transport 变化都不得更换此 identity。
+    #[serde(default = "new_mcp_instance_id")]
+    pub instance_id: String,
     /// 人读名,也用作工具命名空间前缀(见 [`DiscoveredTool::namespaced_name`])。
     pub name: String,
     pub transport: McpTransport,
     /// 是否启用。白名单语义:只连 `enabled=true` 的;整个列表默认空 = 桥接关闭、行为不变。
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+pub fn new_mcp_instance_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn default_true() -> bool {
@@ -80,6 +120,9 @@ fn default_true() -> bool {
 impl McpServerConfig {
     /// 校验配置可用:name 非空;stdio 的 command 非空 / http 的 url 非空。
     pub fn validate(&self) -> Result<(), String> {
+        if !is_uuid_v4(&self.instance_id) {
+            return Err(format!("MCP server「{}」的 instance_id 无效", self.name));
+        }
         if self.name.trim().is_empty() {
             return Err("MCP server name 不能为空".into());
         }
@@ -94,6 +137,10 @@ impl McpServerConfig {
             _ => Ok(()),
         }
     }
+}
+
+fn is_uuid_v4(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id| id.get_version() == Some(uuid::Version::Random))
 }
 
 /// 从一段 JSON(期望是 server 配置数组,如 `settings.mcp_servers`)防御式解析出配置列表。
@@ -191,6 +238,7 @@ struct McpIo {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     _child: Child,
+    redaction_values: Zeroizing<Vec<String>>,
 }
 
 /// 已完成 initialize 握手的外部 MCP server 连接(stdio 或 http,调用方无感)。
@@ -204,16 +252,50 @@ pub struct McpClient {
 }
 
 enum ClientInner {
-    Stdio(Mutex<McpIo>),
-    Http(HttpConn),
+    Stdio(Box<Mutex<McpIo>>),
+    Http(Box<HttpConn>),
+}
+
+#[derive(Clone)]
+struct McpLeaseSource {
+    broker: CredentialBroker,
+    stable_inventory_id: String,
+    provider_or_connector_id: String,
+    credential_ref: crate::credentials_bridge::CredentialRefV1,
+}
+
+impl McpLeaseSource {
+    async fn issue_material(&self) -> Result<McpCredentialMaterial, String> {
+        let request = PendingSecretLeaseRequest::new(
+            BridgeCredentialConsumer::McpTransport,
+            &self.stable_inventory_id,
+            &self.provider_or_connector_id,
+            self.credential_ref.clone(),
+            std::time::Instant::now() + Duration::from_secs(90),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut lease = self
+            .broker
+            .issue_pending_lease(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        lease
+            .with_secret(decode_mcp_credential_bundle)
+            .map_err(|error| error.to_string())?
+    }
 }
 
 /// Streamable HTTP 连接(connect 完成握手后字段全只读,天然可并发)。
 struct HttpConn {
     http: reqwest::Client,
     url: String,
-    /// 用户配置的额外请求头(典型:`Authorization: Bearer xxx`)。
-    extra_headers: BTreeMap<String, String>,
+    /// Bridge 路径只保留非秘密 locator；每个 HTTP request 签发并消费一张新 lease。
+    lease_source: Option<McpLeaseSource>,
+    /// 尚未切换的内部兼容调用使用；不从 `McpServerConfig.headers` 复制。
+    compatibility_headers: Option<McpCredentialMaterial>,
+    /// 元典余额等内置 MCP compatibility 调用复用其自身 typed consumer；
+    /// 每条 HTTP request fresh lease，不冒充 `McpTransport`。
+    bearer_credential_source: Option<crate::credentials_bridge::PendingCredentialSource>,
     /// initialize 响应头里的 `Mcp-Session-Id`(server 可选下发;有则后续请求必须带)。
     session_id: Option<String>,
     /// initialize 协商出的协议版本(spec 要求后续请求放 `MCP-Protocol-Version` 头)。
@@ -225,18 +307,66 @@ impl McpClient {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// 建立连接 + 完成 initialize 握手。失败返回可读原因(http 鉴权失败透传真实状态码)。
-    pub async fn connect(cfg: &McpServerConfig) -> Result<Self, String> {
+    /// 通过 0.4 credential bridge 的 typed lease 建立连接。旧 settings 中的
+    /// `env` / `headers` 只保留给 3B 净化，不再是运行时凭据源。
+    pub async fn connect_with_bridge(
+        cfg: &McpServerConfig,
+        broker: &CredentialBroker,
+    ) -> Result<Self, String> {
+        let source = resolve_mcp_credential_source(cfg, broker).await?;
         let inner = match &cfg.transport {
-            McpTransport::Stdio { command, args, env } => {
-                ClientInner::Stdio(Mutex::new(connect_stdio(command, args, env).await?))
+            McpTransport::Stdio { command, args, .. } => {
+                let credentials = match source {
+                    Some(source) => source.issue_material().await?,
+                    None => McpCredentialMaterial::new(BTreeMap::new()),
+                };
+                let connected = connect_stdio(command, args, &credentials)
+                    .await
+                    .map_err(|error| redact_mcp_error(&error, &credentials))?;
+                ClientInner::Stdio(Box::new(Mutex::new(connected)))
             }
-            McpTransport::Http { url, headers } => {
-                ClientInner::Http(HttpConn::connect(url, headers).await?)
+            McpTransport::Http { url, .. } => {
+                ClientInner::Http(Box::new(HttpConn::connect_with_bridge(url, source).await?))
             }
         };
         Ok(Self {
             inner,
+            next_id: AtomicI64::new(1),
+        })
+    }
+
+    pub(crate) async fn connect_with_credentials(
+        cfg: &McpServerConfig,
+        credentials: McpCredentialMaterial,
+    ) -> Result<Self, String> {
+        let inner = match &cfg.transport {
+            McpTransport::Stdio { command, args, .. } => {
+                let connected = connect_stdio(command, args, &credentials)
+                    .await
+                    .map_err(|error| redact_mcp_error(&error, &credentials))?;
+                ClientInner::Stdio(Box::new(Mutex::new(connected)))
+            }
+            McpTransport::Http { url, .. } => ClientInner::Http(Box::new(
+                HttpConn::connect_with_credentials(url, credentials).await?,
+            )),
+        };
+        Ok(Self {
+            inner,
+            next_id: AtomicI64::new(1),
+        })
+    }
+
+    pub(crate) async fn connect_with_bearer_credential(
+        cfg: &McpServerConfig,
+        source: crate::credentials_bridge::PendingCredentialSource,
+    ) -> Result<Self, String> {
+        let McpTransport::Http { url, .. } = &cfg.transport else {
+            return Err("typed Bearer credential 仅支持 MCP HTTP transport".into());
+        };
+        Ok(Self {
+            inner: ClientInner::Http(Box::new(
+                HttpConn::connect_with_bearer_credential(url, source).await?,
+            )),
             next_id: AtomicI64::new(1),
         })
     }
@@ -247,7 +377,10 @@ impl McpClient {
         match &self.inner {
             ClientInner::Stdio(io) => {
                 let mut io = io.lock().await;
-                rpc_request(&mut io, id, method, params, to).await
+                let result = rpc_request(&mut io, id, method, params, to).await;
+                result.map_err(|error| {
+                    redact_mcp_error_values(&error, io.redaction_values.iter().map(String::as_str))
+                })
             }
             ClientInner::Http(conn) => {
                 let body =
@@ -287,16 +420,82 @@ impl McpClient {
     }
 }
 
+async fn resolve_mcp_credential_source(
+    cfg: &McpServerConfig,
+    broker: &CredentialBroker,
+) -> Result<Option<McpLeaseSource>, String> {
+    let (slot, legacy_secret_configured) = match &cfg.transport {
+        McpTransport::Stdio { env, .. } => ("env", !env.is_empty()),
+        McpTransport::Http { headers, .. } => ("headers", !headers.is_empty()),
+    };
+    let stable_inventory_id = format!("settings:mcp:{}:{slot}", cfg.instance_id);
+    let provider_or_connector_id = format!("mcp:{}", cfg.instance_id);
+    let Some(credential_ref) = broker
+        .pending_reference(
+            &stable_inventory_id,
+            BridgeCredentialConsumer::McpTransport,
+            &provider_or_connector_id,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        if legacy_secret_configured {
+            return Err(format!("credential_missing: {stable_inventory_id}"));
+        }
+        return Ok(None);
+    };
+    Ok(Some(McpLeaseSource {
+        broker: broker.clone(),
+        stable_inventory_id,
+        provider_or_connector_id,
+        credential_ref,
+    }))
+}
+
+async fn load_mcp_credentials(
+    cfg: &McpServerConfig,
+    broker: &CredentialBroker,
+) -> Result<McpCredentialMaterial, String> {
+    match resolve_mcp_credential_source(cfg, broker).await? {
+        Some(source) => source.issue_material().await,
+        None => Ok(McpCredentialMaterial::new(BTreeMap::new())),
+    }
+}
+
+fn decode_mcp_credential_bundle(bytes: &[u8]) -> Result<McpCredentialMaterial, String> {
+    let decoded = serde_json::from_slice::<BTreeMap<String, String>>(bytes)
+        .map_err(|_| "MCP credential bundle 无效".to_owned())?;
+    Ok(McpCredentialMaterial::new(decoded))
+}
+
+fn redact_mcp_error(error: &str, credentials: &BTreeMap<String, String>) -> String {
+    redact_mcp_error_values(error, credentials.values().map(String::as_str))
+}
+
+fn redact_mcp_error_values<'a>(error: &str, values: impl IntoIterator<Item = &'a str>) -> String {
+    let mut safe = error.to_owned();
+    for value in values.into_iter().filter(|value| !value.is_empty()) {
+        safe = safe.replace(value, "[REDACTED]");
+        if let Some(token) = value
+            .strip_prefix("Bearer ")
+            .filter(|token| !token.is_empty())
+        {
+            safe = safe.replace(token, "[REDACTED]");
+        }
+    }
+    crate::feedback::sanitize_paths(&safe.chars().take(2_000).collect::<String>())
+}
+
 /// spawn stdio 子进程 + initialize 握手。
 async fn connect_stdio(
     command: &str,
     args: &[String],
-    env: &BTreeMap<String, String>,
+    credential_material: &BTreeMap<String, String>,
 ) -> Result<McpIo, String> {
     let expanded_command = shellexpand::tilde(command).into_owned();
     let mut cmd = crate::proc_util::tokio_command(&expanded_command);
     cmd.args(args)
-        .envs(env)
+        .envs(credential_material)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null()) // 排空 stderr,防其缓冲填满挂死子进程
@@ -310,6 +509,7 @@ async fn connect_stdio(
         stdin,
         stdout,
         _child: child,
+        redaction_values: Zeroizing::new(credential_material.values().cloned().collect()),
     };
 
     // initialize(id=0)
@@ -318,15 +518,43 @@ async fn connect_stdio(
         "capabilities": {},
         "clientInfo": { "name": "CaseBoard", "version": env!("CARGO_PKG_VERSION") }
     });
-    rpc_request(&mut io, 0, "initialize", init, MCP_INIT_TIMEOUT).await?;
+    rpc_request(&mut io, 0, "initialize", init, MCP_INIT_TIMEOUT)
+        .await
+        .map_err(|error| redact_mcp_error(&error, credential_material))?;
     // initialized 通知(spec 要求;缺它部分 server 拒 tools/list)
     rpc_notify(&mut io, "notifications/initialized").await?;
     Ok(io)
 }
 
 impl HttpConn {
+    async fn connect_with_bridge(
+        url: &str,
+        lease_source: Option<McpLeaseSource>,
+    ) -> Result<Self, String> {
+        Self::connect(url, lease_source, None, None).await
+    }
+
+    async fn connect_with_credentials(
+        url: &str,
+        headers: McpCredentialMaterial,
+    ) -> Result<Self, String> {
+        Self::connect(url, None, Some(headers), None).await
+    }
+
+    async fn connect_with_bearer_credential(
+        url: &str,
+        source: crate::credentials_bridge::PendingCredentialSource,
+    ) -> Result<Self, String> {
+        Self::connect(url, None, None, Some(source)).await
+    }
+
     /// 建 HTTP 客户端 + initialize 握手 + initialized 通知。
-    async fn connect(url: &str, headers: &BTreeMap<String, String>) -> Result<Self, String> {
+    async fn connect(
+        url: &str,
+        lease_source: Option<McpLeaseSource>,
+        compatibility_headers: Option<McpCredentialMaterial>,
+        bearer_credential_source: Option<crate::credentials_bridge::PendingCredentialSource>,
+    ) -> Result<Self, String> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build()
@@ -334,7 +562,9 @@ impl HttpConn {
         let mut conn = Self {
             http,
             url: url.trim().to_string(),
-            extra_headers: headers.clone(),
+            lease_source,
+            compatibility_headers,
+            bearer_credential_source,
             session_id: None,
             protocol_version: None,
         };
@@ -374,7 +604,7 @@ impl HttpConn {
         to: Duration,
     ) -> Result<(Value, reqwest::header::HeaderMap), String> {
         match timeout(to, self.post_rpc_inner(body, want_id)).await {
-            Ok(r) => r,
+            Ok(result) => result,
             Err(_) => Err(format!("MCP HTTP 请求超时({}s)", to.as_secs())),
         }
     }
@@ -383,6 +613,43 @@ impl HttpConn {
         &self,
         body: Value,
         want_id: Option<i64>,
+    ) -> Result<(Value, reqwest::header::HeaderMap), String> {
+        let request_headers = match &self.lease_source {
+            Some(source) => Some(source.issue_material().await?),
+            None => None,
+        };
+        let bearer_material = match &self.bearer_credential_source {
+            Some(source) => Some(source.issue_material().await?),
+            None => None,
+        };
+        let bearer_headers = bearer_material.as_ref().map(|material| {
+            let mut headers = BTreeMap::new();
+            headers.insert(
+                "Authorization".to_owned(),
+                material.with_secret(|secret| format!("Bearer {secret}")),
+            );
+            McpCredentialMaterial::new(headers)
+        });
+        let headers = request_headers
+            .as_ref()
+            .or(bearer_headers.as_ref())
+            .or(self.compatibility_headers.as_ref());
+        let result = self.post_rpc_with_headers(body, want_id, headers).await;
+        let result = match headers {
+            Some(headers) => result.map_err(|error| redact_mcp_error(&error, headers)),
+            None => result.map_err(|error| redact_mcp_error_values(&error, std::iter::empty())),
+        };
+        match bearer_material {
+            Some(material) => result.map_err(|error| material.redact(&error)),
+            None => result,
+        }
+    }
+
+    async fn post_rpc_with_headers(
+        &self,
+        body: Value,
+        want_id: Option<i64>,
+        headers: Option<&McpCredentialMaterial>,
     ) -> Result<(Value, reqwest::header::HeaderMap), String> {
         let mut req = self
             .http
@@ -396,8 +663,10 @@ impl HttpConn {
         if let Some(sid) = &self.session_id {
             req = req.header("Mcp-Session-Id", sid.as_str());
         }
-        for (k, v) in &self.extra_headers {
-            req = req.header(k.as_str(), v.as_str());
+        if let Some(headers) = headers {
+            for (key, value) in headers.iter() {
+                req = req.header(key.as_str(), value.as_str());
+            }
         }
         let resp = req
             .json(&body)
@@ -613,13 +882,34 @@ impl Tool for McpForwardingTool {
 /// 的 server **跳过 + dlog**,绝不拖垮 chat。结果按工具名**确定性排序**(保前缀缓存稳定)。
 /// **隐私**:只 dlog server 名 + 工具数,绝不记 tool-call 参数(含案件内容)。
 pub async fn connect_mcp_servers(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>> {
+    let app_data_root = match crate::db::app_data_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            crate::dlog!("MCP credential bridge 数据目录不可用，跳过全部 MCP server: {error}");
+            return Vec::new();
+        }
+    };
+    let broker = match CredentialBroker::initialize(app_data_root).await {
+        Ok(broker) => broker,
+        Err(error) => {
+            crate::dlog!("MCP credential bridge 不可用，跳过全部 MCP server: {error}");
+            return Vec::new();
+        }
+    };
+    connect_mcp_servers_with_broker(configs, &broker).await
+}
+
+async fn connect_mcp_servers_with_broker(
+    configs: &[McpServerConfig],
+    broker: &CredentialBroker,
+) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     for cfg in configs.iter().filter(|c| c.enabled) {
         if let Err(e) = cfg.validate() {
             crate::dlog!("MCP server「{}」配置无效,跳过: {}", cfg.name, e);
             continue;
         }
-        let client = match McpClient::connect(cfg).await {
+        let client = match McpClient::connect_with_bridge(cfg, broker).await {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 crate::dlog!("MCP server「{}」连接失败,跳过: {}", cfg.name, e);

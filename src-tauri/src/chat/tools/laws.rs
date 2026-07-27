@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use walkdir::WalkDir;
 
 use super::{
-    opt_bool, opt_str, opt_u32, require_str, save_and_wrap, try_kb_hit, yuandian_key, Tool,
+    opt_bool, opt_str, opt_u32, require_str, save_and_wrap, try_kb_hit, yuandian_credential, Tool,
     ToolContext, ToolError, ToolResult,
 };
 use crate::yuandian;
@@ -131,7 +131,7 @@ async fn search_replacement_for_inactive_source(
         }
     }
 
-    let Ok(api_key) = yuandian_key(ctx) else {
+    let Ok(api_key) = yuandian_credential(ctx).await else {
         return inactive_replacement_result(
             &source,
             base_credits,
@@ -317,7 +317,7 @@ impl Tool for SearchLaws {
             }
         }
 
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::ft_search(api_key, &params).await?;
         if !crate::local_kb::validity::historical_research_requested("rh_ft_search", &cache_params)
         {
@@ -426,7 +426,7 @@ impl Tool for GetLawArticle {
         if let Some(r) = try_kb_hit(ctx, "rh_ft_detail", &cache_params) {
             return Ok(r);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         ensure_yuandian_budget(ctx, 1).await?;
         let params = yuandian::FtDetailParams {
             id: id.clone(),
@@ -516,7 +516,7 @@ async fn try_fulltext_article(
         Some(j) => (j, true),
         None => {
             // 2) 未命中 → 按 fgid 拉整部法规全文(版本正确),顺手缓存供后续 0 积分命中
-            let Ok(api_key) = yuandian_key(ctx) else {
+            let Ok(api_key) = yuandian_credential(ctx).await else {
                 return Ok(None); // 无 key → 降级单条
             };
             ensure_yuandian_budget(ctx, 5).await?;
@@ -739,7 +739,7 @@ impl Tool for SearchRegulations {
             }
         }
 
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::fg_search(api_key, &params).await?;
         if !crate::local_kb::validity::historical_research_requested("rh_fg_search", &cache_params)
         {
@@ -800,7 +800,7 @@ impl Tool for GetRegulationDetail {
             r.content = regulation_detail_for_llm(&r.content);
             return Ok(r);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         ensure_yuandian_budget(ctx, 5).await?;
         let params = yuandian::FgDetailParams {
             id,
@@ -859,7 +859,7 @@ impl Tool for LawVectorSearch {
                 return Ok(result);
             }
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::law_vector_search(api_key, &params).await?;
         if !crate::local_kb::validity::historical_research_requested(
             "law_vector_search",

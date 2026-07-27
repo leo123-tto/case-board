@@ -206,7 +206,7 @@ pub struct OrchestratorReport {
 pub async fn basic_query(
     pool: &SqlitePool,
     case_id: &str,
-    api_key: &str,
+    api_key: &crate::yuandian::YuandianCredentialSource,
 ) -> Result<OrchestratorReport, String> {
     let _query_guard = acquire_execution_query_read_guard(case_id).await;
     basic_query_while_read_locked(pool, case_id, api_key).await
@@ -217,7 +217,7 @@ pub async fn basic_query(
 pub(crate) async fn basic_query_while_read_locked(
     pool: &SqlitePool,
     case_id: &str,
-    api_key: &str,
+    api_key: &crate::yuandian::YuandianCredentialSource,
 ) -> Result<OrchestratorReport, String> {
     let start = std::time::Instant::now();
     let explicit_representation = exact_representation_for_external_query(pool, case_id).await?;
@@ -486,7 +486,7 @@ fn looks_like_enterprise(name: &str) -> bool {
 ///        guaranty / court_notice / court_session_notice / punishment /
 ///        corporate_tax / abnormal_operation / serious_illegal
 async fn query_enterprise(
-    api_key: &str,
+    api_key: &crate::yuandian::YuandianCredentialSource,
     subject: &Subject,
     base_dir: &std::path::Path,
     filed_at: Option<&str>,

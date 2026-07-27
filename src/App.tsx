@@ -34,7 +34,6 @@ import { EmptyState } from "@/modules/litigation/components/EmptyState";
 import { ProgressBanner } from "@/modules/litigation/components/ProgressBanner";
 import { confirmDialog } from "@/lib/dialog";
 import { useFeatureFlag } from "@/lib/featureFlags";
-import { primaryOcrIssues } from "@/lib/ocrSettings";
 import {
   checkForUpdate,
   deleteCase,
@@ -46,6 +45,7 @@ import {
   planImportFolder,
   commitImportFolder,
   listCases,
+  listCredentialMetadata,
   findFeishuCasePath,
   openInDefaultApp,
   refreshCaseFiles,
@@ -60,6 +60,7 @@ import {
   type ImportPlan,
   type ProgressEvent,
   type UpdateInfo,
+  type CredentialMetadata,
 } from "@/lib/types";
 import { SplitImportDialog } from "@/components/SplitImportDialog";
 
@@ -215,8 +216,8 @@ function MainApp() {
 
   // 首次启动检测是否需要 onboarding + 判断是否显示 DeepSeek chip
   useEffect(() => {
-    getSettings()
-      .then((s) => {
+    Promise.all([getSettings(), listCredentialMetadata().catch(() => [])])
+      .then(([s, credentials]) => {
         setUserDisplayName(s.user_display_name);
         // setup_completed 标志位是 onboarding 唯一可信凭证 —— 完成 wizard 时显式置 true。
         if (!s.setup_completed) {
@@ -230,8 +231,12 @@ function MainApp() {
         //   3. chat 功能跑起来后,即便 effective provider 是 local,
         //      用户也可能临时切回 cloud 跑生成任务
         // 老板 2026-05-27 反馈:同事配了 key 但 chip 不显示,核心问题是判定太严格。
-        const hasDeepSeekKey =
-          !!s.cloud_llm_api_key && s.cloud_llm_api_key.trim().length > 0;
+        const hasDeepSeekKey = credentials.some(
+          (item) =>
+            item.provider_or_connector_id === "llm.deepseek"
+            && item.kind === "api_key"
+            && item.secret_present,
+        );
         setShowDeepSeekChip(hasDeepSeekKey);
       })
       .catch((err) => console.error("加载 settings 失败:", err));
@@ -250,7 +255,7 @@ function MainApp() {
       .catch(() => {});
     // 2026-06-15 私人自用包防误更新:编译期设 VITE_NO_UPDATE_CHECK=1 → 跳过启动自动检查更新,
     // 不再弹「发现新版本」。背景:私人自用包带专属功能(「独立」tab),却和公开版共用同一个
-    // lawtools.top/latest.json;公开发版后版本号更高,会把私人版自动更新成公开版、丢掉专属功能
+    // lawtools.top 平台更新 feed;公开发版后版本号更高,会把私人版自动更新成公开版、丢掉专属功能
     // (作者就这么误装过)。公开构建不设此变量 → 照常检查,公开用户正常收到更新。
     // 手动点右下角版本 chip 仍可主动检查,不受影响。
     if (import.meta.env.VITE_NO_UPDATE_CHECK !== "1") {
@@ -337,11 +342,15 @@ function MainApp() {
   // 之前这里还在用 isCloud 严格判断,导致同事 onboarding 选 local + 设置里补填 cloud key
   // 后,关掉设置面板触发本回调,chip 就被错误隐藏。
   const refreshUserDisplayName = useCallback(() => {
-    getSettings()
-      .then((s) => {
+    Promise.all([getSettings(), listCredentialMetadata().catch(() => [])])
+      .then(([s, credentials]) => {
         setUserDisplayName(s.user_display_name);
-        const hasDeepSeekKey =
-          !!s.cloud_llm_api_key && s.cloud_llm_api_key.trim().length > 0;
+        const hasDeepSeekKey = credentials.some(
+          (item) =>
+            item.provider_or_connector_id === "llm.deepseek"
+            && item.kind === "api_key"
+            && item.secret_present,
+        );
         setShowDeepSeekChip(hasDeepSeekKey);
       })
       .catch(console.error);
@@ -462,48 +471,40 @@ function MainApp() {
   // V0.3:本地模型已隐藏 → 只走云端,这里恒按云端校验(与后端 effective_*=cloud 一致,
   // 同时消化老用户 ocr/llm_provider="local" 残留,避免前端漏检→后端却走云端而失败的错位)。
   const validateImportKeys = useCallback(async (): Promise<boolean> => {
-    const s = await getSettings();
+    const [s, credentials] = await Promise.all([
+      getSettings(),
+      listCredentialMetadata(),
+    ]);
 
     type Issue = { label: string; reason: "missing" | "unverified" };
     const issues: Issue[] = [];
+    const credentialFor = (provider: string): CredentialMetadata | undefined =>
+      credentials.find(
+        (item) =>
+          item.provider_or_connector_id === provider && item.kind === "api_key",
+      );
+    const pushCredentialIssue = (provider: string, label: string) => {
+      const credential = credentialFor(provider);
+      if (!credential?.secret_present) {
+        issues.push({ label, reason: "missing" });
+      } else if (credential.state !== "valid") {
+        issues.push({ label, reason: "unverified" });
+      }
+    };
 
-    issues.push(...primaryOcrIssues(s));
+    const paddlePrimary = s.ocr_cloud_primary === "paddle-vl";
+    pushCredentialIssue(
+      paddlePrimary ? "ocr.paddle_vl" : "ocr.mineru",
+      paddlePrimary
+        ? "PaddleOCR 访问令牌(云端 OCR)"
+        : "MinerU API Token(云端 OCR)",
+    );
     {
       // 2026-06-15/16:按云端后端校验对应的 key,与后端 effective_cloud_llm_backend 三选一对齐
       // (minimax / 通用兼容 glm·mimo·kimi·custom / 其余回落 DeepSeek)。各后端 key 字段独立。
       const backend = s.cloud_llm_backend ?? "deepseek";
       const isMinimax = backend === "minimax";
       const isCompat = ["glm", "mimo", "kimi", "custom"].includes(backend);
-      const compatKey =
-        backend === "glm"
-          ? s.glm_llm_api_key || s.compat_llm_api_key
-          : backend === "mimo"
-            ? s.mimo_llm_api_key || s.compat_llm_api_key
-            : backend === "kimi"
-              ? s.kimi_llm_api_key || s.compat_llm_api_key
-              : backend === "custom"
-                ? s.custom_llm_api_key || s.compat_llm_api_key
-                : s.compat_llm_api_key;
-      const compatVerifiedAt =
-        backend === "glm"
-          ? s.glm_llm_verified_at || s.compat_llm_verified_at
-          : backend === "mimo"
-            ? s.mimo_llm_verified_at || s.compat_llm_verified_at
-            : backend === "kimi"
-              ? s.kimi_llm_verified_at || s.compat_llm_verified_at
-              : backend === "custom"
-                ? s.custom_llm_verified_at || s.compat_llm_verified_at
-                : s.compat_llm_verified_at;
-      const filled = isMinimax
-        ? !!s.minimax_api_key?.trim()
-        : isCompat
-          ? !!compatKey?.trim()
-          : !!s.cloud_llm_api_key?.trim();
-      const verified = isMinimax
-        ? !!s.minimax_verified_at
-        : isCompat
-          ? !!compatVerifiedAt
-          : !!s.deepseek_verified_at;
       const providerName = isMinimax
         ? "MiniMax"
         : isCompat
@@ -521,11 +522,12 @@ function MainApp() {
         }
       }
       const label = `${providerName} API Key(云端 LLM)`;
-      if (!filled) {
-        issues.push({ label, reason: "missing" });
-      } else if (!verified) {
-        issues.push({ label, reason: "unverified" });
-      }
+      const provider = isMinimax
+        ? "llm.minimax"
+        : isCompat
+          ? `llm.${backend}`
+          : "llm.deepseek";
+      pushCredentialIssue(provider, label);
     }
 
     if (issues.length > 0) {

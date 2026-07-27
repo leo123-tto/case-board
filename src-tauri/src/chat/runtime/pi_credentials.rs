@@ -187,6 +187,28 @@ pub fn resolve_pi_credential(
     }))
 }
 
+/// `caseboard-custom` 是 0.4 material model 的 Pi 兼容入口，不是 Pi Provider 凭据槽。
+/// 它只复现旧 `LlmConfig.api_key` 的 material settings 语义；不得读取或回写 Pi OS vault。
+pub fn resolve_caseboard_custom_credential(
+    settings: &Settings,
+    _vault: &dyn PiCredentialVault,
+) -> Option<ResolvedPiCredential> {
+    let key = match settings.effective_cloud_llm_backend() {
+        "minimax" => settings.minimax_api_key.clone(),
+        "glm" | "mimo" | "kimi" | "custom" => settings.effective_compat_llm_api_key(),
+        _ => settings.cloud_llm_api_key.clone(),
+    };
+    key.map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(|key| ResolvedPiCredential {
+            credential: PiCredential::ApiKey {
+                key: Some(key),
+                env: std::collections::BTreeMap::new(),
+            },
+            source: PiCredentialSource::LegacySettings,
+        })
+}
+
 fn validate_provider_id(provider_id: &str) -> Result<(), String> {
     if provider_id.is_empty()
         || provider_id.len() > 100
@@ -199,7 +221,7 @@ fn validate_provider_id(provider_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_credential(credential: &PiCredential) -> Result<(), String> {
+pub(crate) fn validate_credential(credential: &PiCredential) -> Result<(), String> {
     match credential {
         PiCredential::ApiKey { key, env } => {
             if key.as_deref().is_none_or(|value| value.trim().is_empty()) && env.is_empty() {

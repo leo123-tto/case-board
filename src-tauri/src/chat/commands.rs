@@ -316,7 +316,7 @@ pub async fn case_chat_impl(
 
     // ── 1. 取 settings + LlmConfig ────────────────────────────────────
     let settings: Settings = crate::settings::read_settings().unwrap_or_default();
-    validate_ai_assistant_ready(&settings)?;
+    validate_ai_assistant_ready(&settings).await?;
     let mut llm_config = LlmConfig::from_settings(&settings);
 
     // ── 3. 读最近聊天历史(最近 6 对 = 12 条) ────────────────────────

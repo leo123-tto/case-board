@@ -9,8 +9,16 @@
 //!   - V0.1 阶段只用纯文本接口(文档先用 textutil 抽文本,再喂给 LLM)
 //!   - V0.2 用 vision 接口直接喂图片/PDF(MiniCPM-V 是多模态的)
 
+use std::fmt;
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::credentials_bridge::{
+    BridgeCredentialConsumer, CredentialBroker, CredentialRefV1, PendingSecretLeaseRequest,
+};
 
 pub mod capability;
 pub mod gateway;
@@ -237,14 +245,249 @@ pub struct LlmConfig {
     pub endpoint: String,
     /// 模型名,比如 `MiniCPM-V-4_6-Q8_0.gguf` 或 `qwen2.5:7b`
     pub model: String,
-    /// 可选 API key(云端时填,本机不填)
-    pub api_key: Option<String>,
+    /// 云端凭据的 bridge locator/source；只含 broker、stable id、provider id 和 non-secret ref。
+    pub credential: Option<LlmCredentialSource>,
     /// 单次请求超时(秒)
     pub timeout_secs: u64,
     /// 抽取类请求(extract_case_fields / global_extract)用的温度。
     /// DeepSeek / 本机:0.0(确定性);MiniMax M 系列**不能用 0.0**(思考会死循环),用 0.3。
     /// 2026-06-15。注意:chat 链路温度走 `model_router::ModelChoice`,不读本字段。
     pub temperature: f32,
+}
+
+/// LLM family 的非秘密凭据来源。
+///
+/// Production config 仅持有 stable inventory/provider locator；HTTP 操作开始时才初始化
+/// broker、解析 authenticated reference 并签发一次性 typed lease。测试与已解析调用可注入
+/// broker + reference，仍不持有明文 secret。
+#[derive(Clone)]
+pub struct LlmCredentialSource {
+    broker: Option<CredentialBroker>,
+    locators: Vec<LlmCredentialLocator>,
+    credential_ref: Option<CredentialRefV1>,
+}
+
+#[derive(Clone, Debug)]
+struct LlmCredentialLocator {
+    stable_inventory_id: String,
+    provider_id: String,
+}
+
+impl LlmCredentialSource {
+    pub fn new(
+        broker: CredentialBroker,
+        stable_inventory_id: impl Into<String>,
+        provider_id: impl Into<String>,
+        credential_ref: CredentialRefV1,
+    ) -> Self {
+        Self {
+            broker: Some(broker),
+            locators: vec![LlmCredentialLocator {
+                stable_inventory_id: stable_inventory_id.into(),
+                provider_id: provider_id.into(),
+            }],
+            credential_ref: Some(credential_ref),
+        }
+    }
+
+    pub(crate) fn pending(
+        stable_inventory_id: impl Into<String>,
+        provider_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            broker: None,
+            locators: vec![LlmCredentialLocator {
+                stable_inventory_id: stable_inventory_id.into(),
+                provider_id: provider_id.into(),
+            }],
+            credential_ref: None,
+        }
+    }
+
+    fn pending_with_fallback(
+        stable_inventory_id: impl Into<String>,
+        provider_id: impl Into<String>,
+        fallback_stable_inventory_id: impl Into<String>,
+        fallback_provider_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            broker: None,
+            locators: vec![
+                LlmCredentialLocator {
+                    stable_inventory_id: stable_inventory_id.into(),
+                    provider_id: provider_id.into(),
+                },
+                LlmCredentialLocator {
+                    stable_inventory_id: fallback_stable_inventory_id.into(),
+                    provider_id: fallback_provider_id.into(),
+                },
+            ],
+            credential_ref: None,
+        }
+    }
+
+    pub fn identity(&self) -> (&str, &str) {
+        let locator = self
+            .locators
+            .first()
+            .expect("LLM credential source always has at least one locator");
+        (&locator.stable_inventory_id, &locator.provider_id)
+    }
+
+    fn set_broker(&mut self, broker: CredentialBroker) {
+        self.broker = Some(broker);
+    }
+
+    /// Metadata-only readiness check. This authenticates the journal mapping without opening the
+    /// encrypted vault or materializing the secret.
+    pub async fn is_ready(&self) -> Result<bool, String> {
+        let broker = match &self.broker {
+            Some(broker) => broker.clone(),
+            None => {
+                let app_data_root = crate::db::app_data_dir()
+                    .map_err(|error| format!("credential_bridge_unavailable: {error}"))?;
+                CredentialBroker::initialize(app_data_root)
+                    .await
+                    .map_err(|error| format!("credential_bridge_unavailable: {error}"))?
+            }
+        };
+        for locator in &self.locators {
+            let actual = broker
+                .pending_reference(
+                    &locator.stable_inventory_id,
+                    BridgeCredentialConsumer::LlmProvider,
+                    &locator.provider_id,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if actual.is_some()
+                && self
+                    .credential_ref
+                    .as_ref()
+                    .is_none_or(|expected| actual.as_ref() == Some(expected))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn issue_material(&self) -> Result<LlmCredentialMaterial, String> {
+        let broker = match &self.broker {
+            Some(broker) => broker.clone(),
+            None => {
+                let app_data_root = crate::db::app_data_dir()
+                    .map_err(|error| format!("credential_bridge_unavailable: {error}"))?;
+                CredentialBroker::initialize(app_data_root)
+                    .await
+                    .map_err(|error| format!("credential_bridge_unavailable: {error}"))?
+            }
+        };
+        let (locator, credential_ref) = match &self.credential_ref {
+            Some(credential_ref) => (
+                self.locators
+                    .first()
+                    .expect("explicit LLM credential reference has one locator"),
+                credential_ref.clone(),
+            ),
+            None => {
+                let mut resolved = None;
+                for locator in &self.locators {
+                    match broker
+                        .pending_reference(
+                            &locator.stable_inventory_id,
+                            BridgeCredentialConsumer::LlmProvider,
+                            &locator.provider_id,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?
+                    {
+                        Some(credential_ref) => {
+                            resolved = Some((locator, credential_ref));
+                            break;
+                        }
+                        None => continue,
+                    }
+                }
+                resolved.ok_or_else(|| {
+                    let stable_inventory_id = self
+                        .locators
+                        .first()
+                        .map(|locator| locator.stable_inventory_id.as_str())
+                        .unwrap_or("unknown");
+                    format!("credential_missing: {stable_inventory_id}")
+                })?
+            }
+        };
+        let request = PendingSecretLeaseRequest::new(
+            BridgeCredentialConsumer::LlmProvider,
+            &locator.stable_inventory_id,
+            &locator.provider_id,
+            credential_ref,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut lease = broker
+            .issue_pending_lease(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        lease
+            .with_secret(|bytes| {
+                std::str::from_utf8(bytes)
+                    .map(str::to_owned)
+                    .map(LlmCredentialMaterial::new)
+                    .map_err(|_| "LLM credential 不是有效 UTF-8".to_owned())
+            })
+            .map_err(|error| error.to_string())?
+    }
+}
+
+impl fmt::Debug for LlmCredentialSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LlmCredentialSource")
+            .field("locators", &self.locators)
+            .field("credential_ref", &self.credential_ref)
+            .field("broker", &self.broker.as_ref().map(|_| "<configured>"))
+            .finish()
+    }
+}
+
+pub(crate) struct LlmCredentialMaterial(Zeroizing<String>);
+
+impl LlmCredentialMaterial {
+    fn new(secret: String) -> Self {
+        Self(Zeroizing::new(secret))
+    }
+
+    fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub(crate) fn stream_redaction_secret(&self) -> &str {
+        self.expose()
+    }
+
+    pub(crate) fn redact(&self, value: &str) -> String {
+        let secret = self.expose();
+        if secret.is_empty() {
+            value.to_owned()
+        } else {
+            value.replace(secret, "[REDACTED]")
+        }
+    }
+}
+
+impl Drop for LlmCredentialMaterial {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for LlmCredentialMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LlmCredentialMaterial(<redacted>)")
+    }
 }
 
 /// 把「通用兼容后端」的 endpoint 归一成完整 chat completions URL。
@@ -271,7 +514,7 @@ impl LlmConfig {
         Self {
             endpoint: "http://127.0.0.1:8899/v1/chat/completions".to_string(),
             model: "MiniCPM-V-4_6-Q8_0.gguf".to_string(),
-            api_key: None,
+            credential: None,
             timeout_secs: 180,
             temperature: 0.0,
         }
@@ -307,7 +550,10 @@ impl LlmConfig {
                 return Self {
                     endpoint,
                     model,
-                    api_key: settings.minimax_api_key.clone(),
+                    credential: Some(LlmCredentialSource::pending(
+                        "settings:minimax_api_key",
+                        "llm.minimax",
+                    )),
                     timeout_secs: 120, // M 系列思考慢,给足
                     temperature: 0.3,
                 };
@@ -333,10 +579,18 @@ impl LlmConfig {
                     .or_else(|| preset.map(|p| p.default_model.to_string()))
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+                let backend = settings.effective_cloud_llm_backend();
+                let (stable_inventory_id, provider_id) =
+                    llm_compat_primary_credential_identity(backend);
                 return Self {
                     endpoint,
                     model,
-                    api_key: settings.effective_compat_llm_api_key(),
+                    credential: Some(LlmCredentialSource::pending_with_fallback(
+                        stable_inventory_id,
+                        provider_id,
+                        "settings:compat_llm_api_key",
+                        "llm.compat",
+                    )),
                     timeout_secs: 90,
                     temperature: 0.3, // 兼容档可能是推理型,0.0 易死循环 → 同 MiniMax 取 0.3
                 };
@@ -364,7 +618,10 @@ impl LlmConfig {
             Self {
                 endpoint,
                 model: base_model,
-                api_key: settings.cloud_llm_api_key.clone(),
+                credential: Some(LlmCredentialSource::pending(
+                    "settings:cloud_llm_api_key",
+                    "llm.deepseek",
+                )),
                 timeout_secs: 60, // 云端比本机快,60s 足够;本机要 180s
                 temperature: 0.0,
             }
@@ -387,16 +644,77 @@ impl LlmConfig {
                     .ollama_model
                     .clone()
                     .unwrap_or_else(|| "MiniCPM-V-4_6-Q8_0.gguf".to_string()),
-                api_key: None,
+                credential: None,
                 timeout_secs: 180,
                 temperature: 0.0,
             }
         }
     }
+
+    pub fn credential_identity(&self) -> Option<(&str, &str)> {
+        self.credential.as_ref().map(LlmCredentialSource::identity)
+    }
+
+    pub fn has_credential_locator(&self) -> bool {
+        self.credential.is_some()
+    }
+
+    pub async fn credential_is_ready(&self) -> Result<bool, String> {
+        match &self.credential {
+            Some(source) => source.is_ready().await,
+            None => Ok(false),
+        }
+    }
+
+    /// 案件材料与 Native/兼容助手启动前的 metadata-only 凭据门禁。
+    ///
+    /// 只认证 bridge journal 中的 locator/reference，不读取 legacy settings secret，
+    /// 也不打开加密 vault。真正的 secret 仍到单次 HTTP operation 才签发 lease。
+    pub async fn ensure_material_ready(&self) -> Result<(), String> {
+        const SETTINGS_HINT: &str = "请前往「设置 → 大脑 → 材料处理模型」填写并验证后重试。";
+        match self.credential_is_ready().await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
+                "材料处理模型凭据缺失或尚未迁移到本机凭据桥。{SETTINGS_HINT}"
+            )),
+            Err(error) => Err(format!("材料处理模型凭据不可读：{error}。{SETTINGS_HINT}")),
+        }
+    }
+
+    pub fn with_credential_broker(mut self, broker: CredentialBroker) -> Self {
+        if let Some(source) = self.credential.as_mut() {
+            source.set_broker(broker);
+        }
+        self
+    }
+
+    pub(crate) async fn authorize_request(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<(reqwest::RequestBuilder, Option<LlmCredentialMaterial>), String> {
+        let Some(source) = &self.credential else {
+            return Ok((request, None));
+        };
+        let material = source.issue_material().await?;
+        let request = request.bearer_auth(material.expose());
+        Ok((request, Some(material)))
+    }
+}
+
+fn llm_compat_primary_credential_identity(backend: &str) -> (&'static str, &'static str) {
+    match backend {
+        "glm" => ("settings:glm_llm_api_key", "llm.glm"),
+        "mimo" => ("settings:mimo_llm_api_key", "llm.mimo"),
+        "kimi" => ("settings:kimi_llm_api_key", "llm.kimi"),
+        "custom" => ("settings:custom_llm_api_key", "llm.custom"),
+        _ => ("settings:compat_llm_api_key", "llm.compat"),
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum LlmError {
+    #[error("LLM 凭据不可用:{0}")]
+    Credential(String),
     #[error("LLM 服务不可达:{0}")]
     Network(String),
     #[error("LLM 返回错误状态 {0}:{1}")]

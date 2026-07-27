@@ -51,7 +51,7 @@ export function UpdateAvailableDialog({ info, onClose }: Props) {
     setDownloaded(0);
     setTotal(0);
     try {
-      const update = await checkAppUpdate();
+      const update = await checkAppUpdate(info);
       if (!update) {
         // endpoint 还没上线 / 不可达 / 当前版本其实不低于远端 —— 回退手动下载
         setErrMsg(

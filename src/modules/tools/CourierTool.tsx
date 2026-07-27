@@ -29,13 +29,17 @@ import {
   queryExpress,
   deleteExpressTrack,
   getSettings,
+  listCredentialMetadata,
+  revokeCredential,
+  saveCredential,
   saveSettings,
   openUrl,
   type ExpressTrack,
 } from "@/lib/api";
-import type { Settings } from "@/lib/types";
+import type { CredentialMetadata, Settings } from "@/lib/types";
 import { toast } from "@/components/ui/toast";
 import { confirmDialog } from "@/lib/dialog";
+import { CredentialField } from "@/components/settings/CredentialField";
 
 const CARRIERS: { code: string; name: string }[] = [
   { code: "shunfeng", name: "顺丰" },
@@ -163,25 +167,29 @@ export function CourierTool() {
   // 快递100 接口配置(2026-06-16:从设置页迁到这里,就近配置 customer + key)
   const [settings, setSettings] = useState<Settings | null>(null);
   const [custCfg, setCustCfg] = useState("");
-  const [keyCfg, setKeyCfg] = useState("");
+  const [credential, setCredential] = useState<CredentialMetadata | null>(null);
   const [savingCfg, setSavingCfg] = useState(false);
   const [cfgDirty, setCfgDirty] = useState(false);
   const [cfgOpen, setCfgOpen] = useState(false);
   const configured = !!(
-    settings?.kuaidi100_customer?.trim() && settings?.kuaidi100_key?.trim()
+    settings?.kuaidi100_customer?.trim() && credential?.secret_present
   );
 
   // 打开面板:读 settings(快递100 配置)+ 本地单号 + 自动刷新在途单号(40 天内免费)
   useEffect(() => {
-    getSettings()
-      .then((s) => {
+    Promise.all([getSettings(), listCredentialMetadata().catch(() => [])])
+      .then(([s, metadata]) => {
         setSettings(s);
         setCustCfg(s.kuaidi100_customer ?? "");
-        setKeyCfg(s.kuaidi100_key ?? "");
+        const current =
+          metadata.find(
+            (item) =>
+              item.provider_or_connector_id === "connector.kuaidi100"
+              && item.kind === "api_key",
+          ) ?? null;
+        setCredential(current);
         // 未配置则展开配置区提示填写,已配置则收起
-        setCfgOpen(
-          !(s.kuaidi100_customer?.trim() && s.kuaidi100_key?.trim()),
-        );
+        setCfgOpen(!(s.kuaidi100_customer?.trim() && current?.secret_present));
       })
       .catch(() => {});
     listExpressTracks()
@@ -199,7 +207,6 @@ export function CourierTool() {
       const next: Settings = {
         ...settings,
         kuaidi100_customer: custCfg.trim() || null,
-        kuaidi100_key: keyCfg.trim() || null,
       };
       await saveSettings(next);
       setSettings(next);
@@ -312,22 +319,26 @@ export function CourierTool() {
               className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm placeholder:text-muted-foreground/50 focus:border-foreground focus:outline-none focus:ring-1 focus:ring-foreground/20"
             />
           </div>
-          <div className="space-y-1">
-            <label className="block text-caption text-muted-foreground">
-              key(授权 key)
-            </label>
-            <input
-              type="password"
-              value={keyCfg}
-              onChange={(e) => {
-                setKeyCfg(e.target.value);
-                setCfgDirty(true);
-              }}
-              placeholder="快递100 后台的 key"
-              autoComplete="off"
-              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm placeholder:text-muted-foreground/50 focus:border-foreground focus:outline-none focus:ring-1 focus:ring-foreground/20"
-            />
-          </div>
+          <CredentialField
+            label="key（授权 key）"
+            status={credential}
+            onSave={async (secretInput) => {
+              const next = await saveCredential({
+                handle: credential?.handle ?? null,
+                providerOrConnectorId: "connector.kuaidi100",
+                kind: "api_key",
+                secretInput,
+              });
+              setCredential(next);
+              return next;
+            }}
+            onRevoke={async (handle, revision) => {
+              const next = await revokeCredential(handle, revision);
+              setCredential(next);
+              return next;
+            }}
+            placeholder="输入新的快递100 key"
+          />
           <div className="flex items-center justify-end gap-2">
             <span className="text-caption text-muted-foreground">
               只存本机,不上传任何地方

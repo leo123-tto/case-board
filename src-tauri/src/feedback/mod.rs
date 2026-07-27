@@ -17,6 +17,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -227,24 +228,23 @@ pub struct BackendStat {
 pub struct SettingsSnapshot {
     pub setup_completed: bool,
     pub user_display_name_set: bool,
-    pub mineru_api_key: String,
     pub mineru_endpoint: Option<String>,
-    pub mineru_verified: bool,
-    /// 2026-06-12:PaddleOCR VL key 状态 + 云端 OCR 主力选择(老快照缺字段 → serde 默认)
-    #[serde(default)]
-    pub paddle_vl_api_key: String,
-    #[serde(default)]
-    pub paddle_vl_verified: bool,
     #[serde(default)]
     pub ocr_cloud_primary: String,
-    pub deepseek_api_key: String,
     pub deepseek_endpoint: Option<String>,
-    pub deepseek_verified: bool,
-    pub yuandian_api_key: String,
-    pub yuandian_verified: bool,
+    #[serde(default)]
+    pub credential_statuses: BTreeMap<String, CredentialStatusSnapshot>,
     pub local_model_dir: Option<String>,
     pub local_server_endpoint: Option<String>,
     pub local_server_auto_start: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialStatusSnapshot {
+    pub handle: String,
+    pub revision: i64,
+    pub state: crate::credentials_bridge::BridgeCredentialState,
+    pub secret_present: bool,
 }
 
 /// 系统级诊断(2026-05-26 V0.1.11)。
@@ -338,14 +338,10 @@ fn strip_endpoint_auth(url: &str) -> String {
     trimmed.to_string()
 }
 
-fn key_status(opt: &Option<String>) -> String {
-    match opt.as_deref() {
-        Some(s) if !s.trim().is_empty() => "[SET]".into(),
-        _ => "[EMPTY]".into(),
-    }
-}
-
-fn build_settings_snapshot(s: &crate::settings::Settings) -> SettingsSnapshot {
+fn build_settings_snapshot(
+    s: &crate::settings::Settings,
+    credential_statuses: BTreeMap<String, CredentialStatusSnapshot>,
+) -> SettingsSnapshot {
     SettingsSnapshot {
         setup_completed: s.setup_completed,
         user_display_name_set: s
@@ -353,21 +349,21 @@ fn build_settings_snapshot(s: &crate::settings::Settings) -> SettingsSnapshot {
             .as_deref()
             .map(|x| !x.trim().is_empty())
             .unwrap_or(false),
-        mineru_api_key: key_status(&s.mineru_api_key),
         mineru_endpoint: s.mineru_endpoint.as_deref().map(strip_endpoint_auth),
-        mineru_verified: s.mineru_verified_at.is_some(),
-        paddle_vl_api_key: key_status(&s.paddle_vl_api_key),
-        paddle_vl_verified: s.paddle_vl_verified_at.is_some(),
         ocr_cloud_primary: s.effective_ocr_cloud_primary().to_string(),
-        deepseek_api_key: key_status(&s.cloud_llm_api_key),
         deepseek_endpoint: s.cloud_llm_endpoint.as_deref().map(strip_endpoint_auth),
-        deepseek_verified: s.deepseek_verified_at.is_some(),
-        yuandian_api_key: key_status(&s.yuandian_api_key),
-        yuandian_verified: s.yuandian_verified_at.is_some(),
+        credential_statuses,
         local_model_dir: s.local_model_dir.clone(),
         local_server_endpoint: s.ollama_endpoint.as_deref().map(strip_endpoint_auth),
         local_server_auto_start: s.local_server_auto_start.unwrap_or(true),
     }
+}
+
+pub fn settings_snapshot_for(
+    settings: &crate::settings::Settings,
+    credential_statuses: BTreeMap<String, CredentialStatusSnapshot>,
+) -> SettingsSnapshot {
+    build_settings_snapshot(settings, credential_statuses)
 }
 
 fn dir_size_and_count(dir: &std::path::Path) -> (u64, u64) {
@@ -631,7 +627,23 @@ pub async fn collect(
         .collect();
 
     // 2026-05-26 V0.1.11 加:settings 脱敏快照 + 系统级 + stderr ring buffer + 前端 console
-    let settings_snapshot = build_settings_snapshot(&settings);
+    let credential_statuses = crate::credentials_commands::list_credential_metadata(None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|metadata| {
+            (
+                metadata.provider_or_connector_id,
+                CredentialStatusSnapshot {
+                    handle: metadata.handle.as_str().to_owned(),
+                    revision: metadata.revision,
+                    state: metadata.state,
+                    secret_present: metadata.secret_present,
+                },
+            )
+        })
+        .collect();
+    let settings_snapshot = build_settings_snapshot(&settings, credential_statuses);
     let system_info = collect_system_info();
     let kb_memory = collect_kb_memory_diagnostic(&settings);
     let stderr_tail = crate::diagnostic_log::snapshot();
@@ -1560,12 +1572,12 @@ fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
     //   方便作者拿到反馈 MD 第一眼就能识别"朋友 key 没验证"这种盲区
     md.push_str(&format!(
         "- MinerU key:{} · endpoint:{}\n",
-        key_state_display(&s.mineru_api_key, s.mineru_verified),
+        key_state_display(s.credential_statuses.get("ocr.mineru")),
         s.mineru_endpoint.as_deref().unwrap_or("(默认)"),
     ));
     md.push_str(&format!(
         "- PaddleOCR key:{} · 云端 OCR 主力:{}\n",
-        key_state_display(&s.paddle_vl_api_key, s.paddle_vl_verified),
+        key_state_display(s.credential_statuses.get("ocr.paddle_vl")),
         if s.ocr_cloud_primary.is_empty() {
             "mineru"
         } else {
@@ -1574,12 +1586,12 @@ fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
     ));
     md.push_str(&format!(
         "- DeepSeek key:{} · endpoint:{}\n",
-        key_state_display(&s.deepseek_api_key, s.deepseek_verified),
+        key_state_display(s.credential_statuses.get("llm.deepseek")),
         s.deepseek_endpoint.as_deref().unwrap_or("(默认)"),
     ));
     md.push_str(&format!(
         "- 元典 key:{}\n",
-        key_state_display(&s.yuandian_api_key, s.yuandian_verified),
+        key_state_display(s.credential_statuses.get("connector.yuandian")),
     ));
     md.push_str(&format!(
         "- 本机模型目录:{}\n",
@@ -2024,18 +2036,21 @@ fn redact_feedback_runtime_secret(value: &str) -> String {
 }
 
 /// 反馈 MD 里 key 状态的统一文案。三态:
-/// - `[SET]` + verified=true   → "已填 · 已验证 ✓"
-/// - `[SET]` + verified=false  → "**已填 · ⚠ 未通过验证(可能无效 key)**"
-/// - `[EMPTY]`                 → "未填"
-fn key_state_display(api_key_status: &str, verified: bool) -> String {
-    if api_key_status == "[SET]" {
-        if verified {
+/// - metadata `valid` → "已填 · 已验证 ✓"
+/// - metadata 存在且 secret_present → "**已填 · ⚠ 未通过验证(可能无效 key)**"
+/// - metadata 缺失或已无 secret → "未填"
+fn key_state_display(status: Option<&CredentialStatusSnapshot>) -> String {
+    match status {
+        Some(status)
+            if status.secret_present
+                && status.state == crate::credentials_bridge::BridgeCredentialState::Valid =>
+        {
             "已填 · 已验证 ✓".to_string()
-        } else {
+        }
+        Some(status) if status.secret_present => {
             "**已填 · ⚠ 未通过验证(可能无效 key)**".to_string()
         }
-    } else {
-        "未填".to_string()
+        _ => "未填".to_string(),
     }
 }
 

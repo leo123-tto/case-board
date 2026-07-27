@@ -133,11 +133,18 @@ impl PiStartRequest {
         config: &LlmConfig,
         request: &AgentLoopRequest,
         registry: &ToolRegistry,
+        credential: Option<PiCredential>,
     ) -> Result<Self, String> {
         let capability = ProviderCapability::from_backend("", &config.endpoint, &config.model);
-        let (api_key, auth_header) = match config.api_key.as_deref().filter(|key| !key.is_empty()) {
-            Some(key) => (key.to_string(), true),
-            None => (LOCAL_RUNTIME_KEY.to_string(), false),
+        let (credential, auth_header) = match credential {
+            Some(credential) => (credential, true),
+            None => (
+                PiCredential::ApiKey {
+                    key: Some(LOCAL_RUNTIME_KEY.to_string()),
+                    env: std::collections::BTreeMap::new(),
+                },
+                false,
+            ),
         };
         let reasoning_model = {
             let model = config.model.to_ascii_lowercase();
@@ -205,10 +212,7 @@ impl PiStartRequest {
                 provider_id: "caseboard-custom".into(),
                 model_id: config.model.clone(),
                 thinking_level: None,
-                credential: Some(PiCredential::ApiKey {
-                    key: Some(api_key),
-                    env: std::collections::BTreeMap::new(),
-                }),
+                credential: Some(credential),
                 caseboard_custom: Some(PiCustomModelConfig {
                     base_url,
                     auth_header,

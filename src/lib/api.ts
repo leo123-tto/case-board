@@ -49,7 +49,16 @@ import type {
   Settings,
   UpdateInfo,
   VerifyResult,
+  CredentialKind,
+  CredentialMetadata,
+  CredentialOwnerScope,
+  LegacyCredentialMigrationStatus,
 } from "./types";
+import {
+  sanitizeDeviceSyncStatusForFrontend,
+  sanitizeSettingsForFrontend,
+  sanitizeTeamStatusForFrontend,
+} from "./credentials";
 
 export * from "./api/cases";
 export * from "./api/files";
@@ -190,11 +199,7 @@ export function verifyOpenAICompatKey(
 }
 
 /** 在线验证元典 API key。走免费 MCP 余额工具，不消耗法律业务接口积分。 */
-export function verifyYuandianKey(apiKey: string): Promise<VerifyResult> {
-  return invoke<VerifyResult>("verify_yuandian_key", { apiKey });
-}
-
-/** 2026-05-25 V0.1.8:检测远程最新版本(lawtools.top 的 version.json)。
+/** 检测与当前平台 Stable/Legacy 路由一致的远程 target manifest。
  *  失败时 has_update=false + error 字段填上原因,前端可静默忽略。*/
 export function checkForUpdate(): Promise<UpdateInfo> {
   return invoke<UpdateInfo>("check_for_update");
@@ -206,8 +211,55 @@ export function appVersion(): Promise<string> {
 }
 
 /** 读取用户设置(endpoint 字段有 sensible 默认值,api_key 不会有默认值)。 */
-export function getSettings(): Promise<Settings> {
-  return invoke<Settings>("get_settings");
+export async function getSettings(): Promise<Settings> {
+  return sanitizeSettingsForFrontend(await invoke<Settings>("get_settings"));
+}
+
+export function listCredentialMetadata(
+  ownerScope?: CredentialOwnerScope,
+): Promise<CredentialMetadata[]> {
+  return invoke<CredentialMetadata[]>("list_credential_metadata", {
+    ownerScope: ownerScope ?? null,
+  });
+}
+
+export function saveCredential(input: {
+  handle: string | null;
+  providerOrConnectorId: string;
+  kind: CredentialKind;
+  secretInput: string;
+  stableInventoryId?: string | null;
+}): Promise<CredentialMetadata> {
+  return invoke<CredentialMetadata>("save_credential", {
+    ...input,
+    stableInventoryId: input.stableInventoryId ?? null,
+  });
+}
+
+export function verifyCredential(
+  handle: string,
+  revision: number,
+): Promise<CredentialMetadata> {
+  return invoke<CredentialMetadata>("verify_credential", { handle, revision });
+}
+
+export function revokeCredential(
+  handle: string,
+  revision: number,
+): Promise<CredentialMetadata> {
+  return invoke<CredentialMetadata>("revoke_credential", { handle, revision });
+}
+
+export function getLegacyCredentialMigrationStatus(): Promise<LegacyCredentialMigrationStatus> {
+  return invoke<LegacyCredentialMigrationStatus>("get_legacy_credential_migration_status");
+}
+
+export function startLegacyCredentialMigration(
+  confirmed: true,
+): Promise<LegacyCredentialMigrationStatus> {
+  return invoke<LegacyCredentialMigrationStatus>("start_legacy_credential_migration", {
+    confirmed,
+  });
 }
 
 export type ResearchProvider = "exa" | "firecrawl";
@@ -525,37 +577,43 @@ export function testMcpServer(
 /* 个人设备工作区同步（Mac / Windows 局域网对等）                    */
 /* ------------------------------------------------------------------ */
 
-export function deviceSyncStatus(): Promise<import("./types").DeviceSyncStatus> {
-  return invoke("device_sync_status");
+export async function deviceSyncStatus(): Promise<import("./types").DeviceSyncStatus> {
+  return sanitizeDeviceSyncStatusForFrontend(await invoke("device_sync_status"));
 }
 
 export function deviceSyncDefaultName(): Promise<string> {
   return invoke("device_sync_default_name");
 }
 
-export function deviceSyncSetEnabled(
+export async function deviceSyncSetEnabled(
   enabled: boolean,
 ): Promise<import("./types").DeviceSyncStatus> {
-  return invoke("device_sync_set_enabled", { enabled });
+  return sanitizeDeviceSyncStatusForFrontend(
+    await invoke("device_sync_set_enabled", { enabled }),
+  );
 }
 
-export function deviceSyncCreate(
+export async function deviceSyncCreate(
   groupName: string,
   deviceName: string,
 ): Promise<import("./types").DeviceSyncStatus> {
-  return invoke("device_sync_create", { groupName, deviceName });
+  return sanitizeDeviceSyncStatusForFrontend(
+    await invoke("device_sync_create", { groupName, deviceName }),
+  );
 }
 
 export function deviceSyncDiscover(): Promise<import("./types").DiscoveredDeviceGroup[]> {
   return invoke("device_sync_discover");
 }
 
-export function deviceSyncJoin(
+export async function deviceSyncJoin(
   groupId: string,
   pairingCode: string,
   deviceName: string,
 ): Promise<import("./types").DeviceSyncStatus> {
-  return invoke("device_sync_join", { groupId, pairingCode, deviceName });
+  return sanitizeDeviceSyncStatusForFrontend(
+    await invoke("device_sync_join", { groupId, pairingCode, deviceName }),
+  );
 }
 
 export function deviceSyncRefreshCode(): Promise<string> {
@@ -574,15 +632,15 @@ export function deviceSyncForget(): Promise<void> {
 /* 团队版 Phase 1(LAN 接力同步)                                      */
 /* ------------------------------------------------------------------ */
 
-export function teamStatus(): Promise<import("./types").TeamStatus> {
-  return invoke("team_status");
+export async function teamStatus(): Promise<import("./types").TeamStatus> {
+  return sanitizeTeamStatusForFrontend(await invoke("team_status"));
 }
 
-export function teamCreate(
+export async function teamCreate(
   teamName: string,
   myName: string
 ): Promise<import("./types").TeamStatus> {
-  return invoke("team_create", { teamName, myName });
+  return sanitizeTeamStatusForFrontend(await invoke("team_create", { teamName, myName }));
 }
 
 /** 扫描局域网内可加入的团队(约 3 秒)。 */
@@ -590,12 +648,12 @@ export function teamDiscover(): Promise<import("./types").DiscoveredTeam[]> {
   return invoke("team_discover");
 }
 
-export function teamJoin(
+export async function teamJoin(
   teamId: string,
   code: string,
   myName: string
 ): Promise<import("./types").TeamStatus> {
-  return invoke("team_join", { teamId, code, myName });
+  return sanitizeTeamStatusForFrontend(await invoke("team_join", { teamId, code, myName }));
 }
 
 export function teamLeave(): Promise<void> {
@@ -1155,10 +1213,6 @@ export function findFeishuCasePath(eventSummary: string): Promise<string | null>
 }
 
 /** 发送一条不含案件信息的飞书机器人测试消息。 */
-export function testFeishuWebhook(url: string): Promise<void> {
-  return invoke<void>("test_feishu_webhook", { url });
-}
-
 /* ------------------------------------------------------------------ */
 /* 法院一张网在线立案(2026-06-17 · 整合外部贡献 PR #8)                   */
 /* ------------------------------------------------------------------ */
@@ -1293,14 +1347,9 @@ export interface ConsoleError {
 export interface SettingsSnapshot {
   setup_completed: boolean;
   user_display_name_set: boolean;
-  mineru_api_key: string; // "[SET]" | "[EMPTY]"
   mineru_endpoint: string | null;
-  mineru_verified: boolean;
-  deepseek_api_key: string;
   deepseek_endpoint: string | null;
-  deepseek_verified: boolean;
-  yuandian_api_key: string;
-  yuandian_verified: boolean;
+  credential_statuses: Record<string, import("./types").CredentialStatusView | null>;
   local_model_dir: string | null;
   local_server_endpoint: string | null;
   local_server_auto_start: boolean;
@@ -2295,9 +2344,8 @@ export function getYuandianBalance(
 export function verifyEmbeddingKey(
   endpoint: string,
   model: string,
-  apiKey: string,
 ): Promise<number> {
-  return invoke<number>("verify_embedding_key", { endpoint, model, apiKey });
+  return invoke<number>("verify_embedding_key", { endpoint, model });
 }
 
 /* ============================================================

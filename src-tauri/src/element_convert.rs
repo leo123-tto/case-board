@@ -625,15 +625,7 @@ fn find_template(id: &str) -> Result<ElementDocumentType, String> {
 }
 
 fn ocr_context(settings: &crate::settings::Settings) -> OcrContext {
-    let cloud = settings.effective_ocr_provider() == "cloud";
-    OcrContext {
-        cloud_enabled: cloud,
-        mineru_token: cloud.then(|| settings.mineru_api_key.clone()).flatten(),
-        paddle_vl_token: cloud.then(|| settings.paddle_vl_api_key.clone()).flatten(),
-        cloud_primary: settings.effective_ocr_cloud_primary().into(),
-        force_backend: None,
-        poll_tx: None,
-    }
+    OcrContext::from_settings(settings)
 }
 
 fn extract_json_from_content(content: &str) -> String {
@@ -688,26 +680,29 @@ async fn complete_elements(
     if !is_minimax {
         body["response_format"] = serde_json::json!({"type": "json_object"});
     }
-    let mut request = reqwest::Client::builder()
+    let request = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(config.timeout_secs * 2))
         .build()
         .map_err(|e| LlmError::Network(e.to_string()))?
         .post(&config.endpoint)
         .json(&body);
-    if let Some(key) = config
-        .api_key
-        .as_deref()
-        .filter(|key| !key.trim().is_empty())
-    {
-        request = request.bearer_auth(key);
-    }
-    let response = request
-        .send()
+    let (request, credential) = config
+        .authorize_request(request)
         .await
-        .map_err(|e| LlmError::Network(e.to_string()))?;
+        .map_err(LlmError::Credential)?;
+    let response = request.send().await.map_err(|e| {
+        let message = credential
+            .as_ref()
+            .map_or_else(|| e.to_string(), |value| value.redact(&e.to_string()));
+        LlmError::Network(message)
+    })?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
+        let body = match credential.as_ref() {
+            Some(value) => value.redact(&body),
+            None => body,
+        };
         let short = body.chars().take(500).collect::<String>();
         return Err(LlmError::HttpStatus(
             status.as_u16(),
@@ -740,7 +735,10 @@ async fn complete_elements(
                 .filter(|value| !value.trim().is_empty())
         })
         .ok_or_else(|| LlmError::ResponseFormat("缺少 choices[0].message.content".into()))?;
-    let cleaned = extract_json_from_content(content);
+    let content = credential
+        .as_ref()
+        .map_or_else(|| content.to_owned(), |value| value.redact(content));
+    let cleaned = extract_json_from_content(&content);
     serde_json::from_str(&cleaned)
         .map_err(|e| LlmError::ContentJson(format!("{}; raw = {}", e, content)))
 }
@@ -1001,12 +999,7 @@ pub async fn generate_element_document(
 
     let settings = crate::settings::read_settings().unwrap_or_default();
     let config = LlmConfig::from_settings(&settings);
-    if config
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
+    if !config.credential_is_ready().await.unwrap_or(false)
         && !config.endpoint.contains("127.0.0.1")
         && !config.endpoint.contains("localhost")
     {

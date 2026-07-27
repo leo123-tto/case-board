@@ -311,33 +311,3 @@ pub async fn verify_openai_compat_key(api_key: &str, endpoint: &str, model: &str
     }
     VerifyResult::fail(format!("HTTP {} · {}", code, snippet))
 }
-
-/// 验证元典(open.chineselaw.com)API key。
-///
-/// 2026-07-12 起改用 `yuandian-law` MCP 自带的免费余额工具验证。旧版会先调 1 分
-/// 企业搜索、再调 50 分 hall_detect，单点一次「验证」就可能浪费 51 分；余额工具既能
-/// 证明 Bearer key 有效，又不消费法律业务接口积分。
-pub async fn verify_yuandian_key(api_key: &str) -> VerifyResult {
-    let api_key = api_key.trim();
-    if api_key.is_empty() {
-        return VerifyResult::fail("API Key 为空");
-    }
-    if !api_key.starts_with("sk_") {
-        return VerifyResult::fail("格式不像元典 API key(应以 sk_ 开头,注意是下划线)");
-    }
-
-    match crate::yuandian::balance::verify_api_key(api_key).await {
-        Ok(_) => VerifyResult::ok(),
-        Err(error) => {
-            let lower = error.to_ascii_lowercase();
-            if lower.contains("401") || lower.contains("403") {
-                VerifyResult::fail("API Key 无效、已过期或未授权 MCP 服务(401/403)")
-            } else {
-                VerifyResult::fail(format!(
-                    "元典 MCP 余额验证失败: {}",
-                    error.chars().take(200).collect::<String>()
-                ))
-            }
-        }
-    }
-}

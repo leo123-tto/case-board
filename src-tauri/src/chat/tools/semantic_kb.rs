@@ -51,24 +51,24 @@ impl Tool for SemanticSearchLocalKb {
         };
 
         // 没配 embedding key → 优雅提示改用关键词工具(不报错)
-        let key = ctx
-            .settings
-            .embedding_api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let Some(key) = key else {
+        let credential = crate::embedding::credential_source();
+        if !credential.is_ready().await.map_err(ToolError::Runtime)? {
             return Ok(ToolResult::plain(
                 "本地知识库未配置语义检索(embedding 未设置)。请改用 `search_local_kb`(关键词检索),\
                  或提示用户在设置页配置 embedding 服务。不要反复调用本工具。",
             ));
-        };
+        }
         let endpoint = ctx.settings.embedding_endpoint.as_deref().unwrap_or("");
         let model = ctx.settings.embedding_model.as_deref().unwrap_or("");
 
         // embed 报错透传(坑#8),让 LLM 看到真错自行回退关键词工具。
         let hits = crate::local_kb::semantic::semantic_search(
-            &kb.root, query, top_n, endpoint, model, key,
+            &kb.root,
+            query,
+            top_n,
+            endpoint,
+            model,
+            &credential,
         )
         .await
         .map_err(ToolError::Runtime)?;

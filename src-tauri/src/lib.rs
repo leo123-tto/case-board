@@ -4,6 +4,8 @@ pub mod contract_draft;
 pub mod contract_review;
 pub mod court_filing_env;
 pub mod court_sms;
+pub mod credentials_bridge;
+mod credentials_commands;
 pub mod dashboard_assistant;
 pub mod db;
 pub mod deepseek;
@@ -426,7 +428,7 @@ async fn import_case_folder(
     pool: tauri::State<'_, SqlitePool>,
     path: String,
 ) -> Result<ImportResult, String> {
-    material_llm_settings()?;
+    material_llm_settings().await?;
     let p = Path::new(&path);
     if !p.exists() {
         return Err(format!("路径不存在: {}", path));
@@ -509,6 +511,11 @@ pub struct CommitCase {
     pub name: String,
 }
 
+/// 一次拆分导入的案件数上限。3 → 8(2026-07-26 反馈 ab3264ea:一个案卷常有几十个子目录,3 个太紧)。
+/// 不敢再放大的理由不是并发(`spawn_extraction_batch` 已逐案排队),而是**云端 OCR 免费额度是总量**:
+/// 材料一多,MinerU / PaddleOCR 免费额度当天就用光,后面全是识别失败。护栏留着。
+const MAX_SPLIT_IMPORT_CASES: usize = 8;
+
 /// 拆分批量建案的**写库部分**(不含后台抽取,便于真库集成测试)。
 ///
 /// - `root`:被拖入的上层文件夹。若它此前已作为**单个案件**导入过(且不在本次要建的子案件里),
@@ -581,6 +588,16 @@ async fn build_split_cases(
     Ok(results)
 }
 
+/// 拆分导入的案件数上限校验(抽出来便于单测)。
+fn validate_split_import_case_count(case_count: usize) -> Result<(), String> {
+    if case_count > MAX_SPLIT_IMPORT_CASES {
+        return Err(format!(
+            "一次最多导入 {MAX_SPLIT_IMPORT_CASES} 个案件(本次选了 {case_count} 个)。云端 OCR 免费额度按量计,材料一多容易额度用尽、大批识别失败;请减少勾选分批导入,或点「合并成 1 个案件」。"
+        ));
+    }
+    Ok(())
+}
+
 /// 按确认后的拆分预案**批量建案**(写库 + 每案后台抽取)。前端拆分弹窗点确认后调用。
 #[tauri::command]
 async fn commit_import_folder(
@@ -590,16 +607,11 @@ async fn commit_import_folder(
     cases: Vec<CommitCase>,
     shared_dirs: Vec<String>,
 ) -> Result<Vec<ImportResult>, String> {
-    material_llm_settings()?;
-    // 2026-06-16 防呆(反馈 ea761d3d):一次最多导入 3 个案件,保护后面 OCR 不被批量打爆限流。
-    // 前端 SplitImportDialog 也会在选 >3 时禁用「拆成 N 个」按钮;这里是后端兜底。
-    // (「合并成 1 个案件」走 import_case_folder 单案路径,不经这里,不受 3 案上限影响。)
-    if cases.len() > 3 {
-        return Err(format!(
-            "一次最多导入 3 个案件(本次选了 {} 个)。免费 OCR 批量识别容易被限流卡死,请减少勾选、分批导入。",
-            cases.len()
-        ));
-    }
+    material_llm_settings().await?;
+    // 多案件走 spawn_extraction_batch 逐案排队(不再形成 N×8 并发),所以 3 案可以放宽到 8;
+    // 但云端 OCR 免费额度是总量,不能无限放开。前端 SplitImportDialog 也会在超过同一上限时禁用确认按钮。
+    // (「合并成 1 个案件」走 import_case_folder 单案路径,不经这里,不受此上限影响。)
+    validate_split_import_case_count(cases.len())?;
     let results = build_split_cases(pool.inner(), &root, &cases, &shared_dirs).await?;
     // 2026-06-16:多案件按顺序排队抽取(单后台任务逐案 await),不再每案各起一个并发 pipeline
     // → 避免 N×8 并发 OCR 打爆 MinerU 限流(详见 pipeline::spawn_extraction_batch)。
@@ -1052,15 +1064,18 @@ fn write_case_visual_export(
 ///
 /// 自动补上默认 endpoint(MinerU / Ollama),但 api_key 不补默认值。
 #[tauri::command]
-fn get_settings() -> Result<settings::Settings, String> {
-    settings::read_settings().map(|s| s.with_defaults_for_display())
+fn get_settings() -> Result<serde_json::Value, String> {
+    settings::read_settings().map(|s| s.with_defaults_for_display().frontend_safe_view())
 }
 
 /// 所有主动触发案件材料 LLM 处理的命令共用同一配置门禁。
-fn material_llm_settings() -> Result<settings::Settings, String> {
+async fn material_llm_settings() -> Result<settings::Settings, String> {
     let settings = settings::read_settings()
         .map_err(|error| format!("无法读取 AI 配置：{error}。请前往「设置 → 大脑」检查配置。"))?;
-    settings.validate_material_llm_ready()?;
+    settings.validate_material_llm_non_secret_config()?;
+    llm::LlmConfig::from_settings(&settings)
+        .ensure_material_ready()
+        .await?;
     Ok(settings)
 }
 
@@ -1243,12 +1258,6 @@ async fn verify_deepseek_key(api_key: String, endpoint: Option<String>) -> verif
     verify::verify_deepseek_key(&api_key, endpoint.as_deref()).await
 }
 
-/// 2026-05-25 V0.1.8 · 验证元典(open.chineselaw.com)API key,前端「验证」按钮触发。
-#[tauri::command]
-async fn verify_yuandian_key(api_key: String) -> verify::VerifyResult {
-    verify::verify_yuandian_key(&api_key).await
-}
-
 /// 2026-06-15 · 验证 MiniMax API key,前端「验证」按钮触发。
 #[tauri::command]
 async fn verify_minimax_key(api_key: String, endpoint: Option<String>) -> verify::VerifyResult {
@@ -1268,7 +1277,7 @@ async fn verify_openai_compat_key(
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:lawtools.top 的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:lawtools.top 的 Stable/Legacy target manifest。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -1296,6 +1305,7 @@ fn save_settings(payload: settings::Settings) -> Result<(), String> {
         // 启停走 device_sync_set_enabled，那里还负责同步启停网络运行时。
         payload.device_sync_enabled = disk.device_sync_enabled;
     }
+    payload.clear_bridge_authoritative_plaintext();
     settings::write_settings(&payload)
 }
 
@@ -1334,7 +1344,7 @@ async fn ensure_local_ready() -> Result<(), String> {
 /// 来就报"LLM 提取失败"。现改成 `from_settings`,跟主 pipeline 保持一致。
 #[tauri::command]
 async fn extract_fields_from_text(text: String) -> Result<llm::ExtractedFields, String> {
-    let settings = material_llm_settings()?;
+    let settings = material_llm_settings().await?;
     let config = llm::LlmConfig::from_settings(&settings);
     llm::extract_case_fields(&config, &text)
         .await
@@ -1352,7 +1362,7 @@ async fn extract_fields_from_text(text: String) -> Result<llm::ExtractedFields, 
 async fn reaggregate_all_cases(
     pool: tauri::State<'_, SqlitePool>,
 ) -> Result<ingest::global_pipeline::ReaggregateReport, String> {
-    let settings = material_llm_settings()?;
+    let settings = material_llm_settings().await?;
     let llm_config = llm::LlmConfig::from_settings(&settings);
     ingest::global_pipeline::rerun_all_cases(pool.inner(), &llm_config)
         .await
@@ -1899,8 +1909,8 @@ async fn find_feishu_case_path(event_summary: String) -> Result<Option<String>, 
 
 /// 测试飞书群机器人 Webhook；发送一条不含案件信息的测试消息。
 #[tauri::command]
-async fn test_feishu_webhook(url: String) -> Result<(), String> {
-    feishu_reminder::test_webhook(&url).await
+async fn test_feishu_webhook() -> Result<(), String> {
+    feishu_reminder::test_webhook(&feishu_reminder::credential_source()).await
 }
 
 // ============================================================================
@@ -3191,12 +3201,9 @@ fn infer_court_region(court_name: &str) -> CourtRegion {
 /// 使用 MinerU batch API 上传 PDF → OCR → 解析文本。
 async fn extract_agents_from_pdf(
     pdf_path: &str,
-    settings: &crate::settings::Settings,
+    credential: &crate::credentials_bridge::PendingCredentialSource,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let api_key = settings
-        .mineru_api_key
-        .clone()
-        .ok_or_else(|| "未配置 MinerU API Key".to_string())?;
+    let material = credential.issue_material().await?;
 
     let client = reqwest::Client::new();
     let file_name = std::path::Path::new(pdf_path)
@@ -3209,27 +3216,27 @@ async fn extract_agents_from_pdf(
     let batch_resp = client
         .post("https://mineru.net/api/v4/file-urls/batch")
         .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .bearer_auth(material.expose())
         .json(&serde_json::json!({
             "files": [{"name": file_name, "data_id": uuid::Uuid::new_v4().to_string()}],
             "model_version": "vlm"
         }))
         .send()
         .await
-        .map_err(|e| format!("MinerU batch 请求失败: {}", e))?;
+        .map_err(|e| material.redact(&format!("MinerU batch 请求失败: {}", e)))?;
 
     let batch_result: serde_json::Value = batch_resp
         .json()
         .await
-        .map_err(|e| format!("解析 MinerU batch 响应失败: {}", e))?;
+        .map_err(|e| material.redact(&format!("解析 MinerU batch 响应失败: {}", e)))?;
 
     if batch_result.get("code").and_then(|v| v.as_i64()) != Some(0) {
-        return Err(format!(
+        return Err(material.redact(&format!(
             "MinerU batch 失败: {}",
             batch_result
                 .get("msg")
                 .unwrap_or(&serde_json::json!("未知错误"))
-        ));
+        )));
     }
 
     let batch_id = batch_result["data"]["batch_id"]
@@ -3260,15 +3267,15 @@ async fn extract_agents_from_pdf(
                 "https://mineru.net/api/v4/extract-results/batch/{}",
                 batch_id
             ))
-            .header("Authorization", format!("Bearer {}", api_key))
+            .bearer_auth(material.expose())
             .send()
             .await
-            .map_err(|e| format!("轮询 MinerU 结果失败: {}", e))?;
+            .map_err(|e| material.redact(&format!("轮询 MinerU 结果失败: {}", e)))?;
 
         let result: serde_json::Value = result_resp
             .json()
             .await
-            .map_err(|e| format!("解析 MinerU 结果失败: {}", e))?;
+            .map_err(|e| material.redact(&format!("解析 MinerU 结果失败: {}", e)))?;
 
         let extract = result
             .get("data")
@@ -3667,7 +3674,13 @@ async fn start_court_filing(
         if let Some(slot2) = mats.get("2").and_then(|v| v.as_array()) {
             if let Some(first_mat) = slot2.first().and_then(|v| v.as_array()) {
                 if let Some(pdf_path) = first_mat.first().and_then(|v| v.as_str()) {
-                    match extract_agents_from_pdf(pdf_path, &settings).await {
+                    let mineru_credential =
+                        crate::credentials_bridge::PendingCredentialSource::pending(
+                            crate::credentials_bridge::BridgeCredentialConsumer::OcrProvider,
+                            "settings:mineru_api_key",
+                            "ocr.mineru",
+                        );
+                    match extract_agents_from_pdf(pdf_path, &mineru_credential).await {
                         Ok(extracted_agents) => {
                             if !extracted_agents.is_empty() {
                                 // 合并：保留原有律师档案里的代理人，追加从 PDF 提取的（去重）
@@ -4457,12 +4470,9 @@ async fn yuandian_deep_dive(
     case_id: String,
 ) -> Result<yuandian::deep_dive::DeepDiveReport, String> {
     let settings = settings::read_settings().unwrap_or_default();
-    let api_key = settings
-        .yuandian_api_key
-        .as_deref()
-        .ok_or_else(|| "元典 API key 未配置 — 请到 Settings 里填".to_string())?;
+    let credential = yuandian::credential_source();
     let llm_config = llm::LlmConfig::from_settings(&settings);
-    yuandian::deep_dive::run_deep_dive(pool.inner(), &case_id, api_key, &llm_config).await
+    yuandian::deep_dive::run_deep_dive(pool.inner(), &case_id, &credential, &llm_config).await
 }
 
 #[tauri::command]
@@ -4471,17 +4481,14 @@ async fn yuandian_basic_query(
     case_id: String,
 ) -> Result<YuandianP1Response, String> {
     let settings = settings::read_settings().unwrap_or_default();
-    let api_key = settings
-        .yuandian_api_key
-        .as_deref()
-        .ok_or_else(|| "元典 API key 未配置 — 请到 Settings 里填".to_string())?;
+    let credential = yuandian::credential_source();
 
     // 读锁必须覆盖 P1 元典查询和 P1.2 风险评估，避免两者之间保存 B 而报告仍使用 A。
     let _query_guard = yuandian::orchestrator::acquire_execution_query_read_guard(&case_id).await;
 
     // P1.1 跑元典 16 端点；此处已由 command 持锁，不能再次取读锁。
     let orch =
-        yuandian::orchestrator::basic_query_while_read_locked(pool.inner(), &case_id, api_key)
+        yuandian::orchestrator::basic_query_while_read_locked(pool.inner(), &case_id, &credential)
             .await?;
 
     // P1.2 LLM 写风险报告
@@ -4732,7 +4739,7 @@ async fn global_extract_case(
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
 ) -> Result<ingest::global_pipeline::GlobalExtractReport, String> {
-    let settings = material_llm_settings()?;
+    let settings = material_llm_settings().await?;
     let llm_config = llm::LlmConfig::from_settings(&settings);
     let report =
         ingest::global_pipeline::run_global_extract(pool.inner(), &case_id, &llm_config).await;
@@ -4866,10 +4873,12 @@ async fn get_deepseek_balance(
 ) -> Result<Option<deepseek::DeepSeekBalance>, String> {
     if refresh {
         let settings = settings::read_settings().unwrap_or_default();
-        let Some(api_key) = settings.cloud_llm_api_key.as_deref() else {
-            return Err("尚未配置 DeepSeek API key".into());
-        };
-        let bal = deepseek::fetch_balance_and_persist(pool.inner(), api_key)
+        let mut config = llm::LlmConfig::from_settings(&settings);
+        config.credential = Some(llm::LlmCredentialSource::pending(
+            "settings:cloud_llm_api_key",
+            "llm.deepseek",
+        ));
+        let bal = deepseek::fetch_balance_and_persist(pool.inner(), &config)
             .await
             .map_err(|e| e.to_string())?;
         Ok(Some(bal))
@@ -4982,7 +4991,7 @@ async fn recompute_case_extraction(
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
 ) -> Result<usize, String> {
-    material_llm_settings()?;
+    material_llm_settings().await?;
     // 1) 重置 done → pending,清抽取产物
     let res = sqlx::query(
         "UPDATE documents \
@@ -5033,7 +5042,7 @@ async fn retry_failed_case_documents(
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
 ) -> Result<usize, String> {
-    material_llm_settings()?;
+    material_llm_settings().await?;
     let res = sqlx::query(
         "UPDATE documents SET extraction_status = 'pending', last_error = NULL \
          WHERE case_id = ? AND extraction_status = 'failed' \
@@ -5600,13 +5609,12 @@ async fn download_court_sms_to_folder(
     })
 }
 
-/// 快递100 凭证(每次读不缓存,改了实时生效)。
-fn kuaidi100_creds() -> (String, String) {
-    let s = settings::read_settings().unwrap_or_default();
-    (
-        s.kuaidi100_customer.unwrap_or_default(),
-        s.kuaidi100_key.unwrap_or_default(),
-    )
+/// 快递100 customer 是非秘密 metadata；key 由 typed bridge lease 提供。
+fn kuaidi100_customer() -> String {
+    settings::read_settings()
+        .unwrap_or_default()
+        .kuaidi100_customer
+        .unwrap_or_default()
 }
 
 /// 查询并跟踪一个单号:实时查 → 落本地 express_tracks.json → 返回最新全列表。
@@ -5618,8 +5626,9 @@ async fn query_express(
     num: String,
     phone: String,
 ) -> Result<Vec<express::TrackRecord>, String> {
-    let (customer, key) = kuaidi100_creds();
-    express::query_and_track(&customer, &key, &com, &com_name, &num, &phone).await
+    let customer = kuaidi100_customer();
+    let credential = express::credential_source();
+    express::query_and_track(&customer, &credential, &com, &com_name, &num, &phone).await
 }
 
 /// 列出本地所有跟踪记录(不联网)。
@@ -5631,11 +5640,15 @@ fn list_express_tracks() -> Vec<express::TrackRecord> {
 /// 刷新在跟踪的单号(未签收 + 30 天内 + 距上次轮询≥6 小时)。同单号 40 天内重查免费。
 #[tauri::command]
 async fn refresh_express_tracks() -> Result<Vec<express::TrackRecord>, String> {
-    let (customer, key) = kuaidi100_creds();
-    if customer.is_empty() || key.is_empty() {
+    let customer = kuaidi100_customer();
+    if customer.is_empty() {
         return Ok(express::load_tracks());
     }
-    express::refresh_active(&customer, &key, 6).await
+    let credential = express::credential_source();
+    if !credential.is_ready().await? {
+        return Err("credential_missing: settings:kuaidi100_key".into());
+    }
+    express::refresh_active(&customer, &credential, 6).await
 }
 
 /// 删除一个跟踪记录。
@@ -6028,7 +6041,11 @@ async fn test_mcp_server(
     config: chat::mcp_bridge::McpServerConfig,
 ) -> Result<McpTestReport, String> {
     config.validate()?;
-    let client = chat::mcp_bridge::McpClient::connect(&config).await?;
+    let app_data_root = db::app_data_dir().map_err(|error| error.to_string())?;
+    let broker = credentials_bridge::CredentialBroker::initialize(app_data_root)
+        .await
+        .map_err(|error| error.to_string())?;
+    let client = chat::mcp_bridge::McpClient::connect_with_bridge(&config, &broker).await?;
     let tools = client.list_tools().await?;
     Ok(McpTestReport {
         tool_count: tools.len(),
@@ -6859,19 +6876,20 @@ async fn build_local_kb_semantic_index(
     let settings = settings::read_settings().unwrap_or_default();
     let kb = local_kb::cache::LocalKb::auto_detect(&settings)
         .ok_or_else(|| "本地知识库未启用,无法建索引".to_string())?;
-    let key = settings
-        .embedding_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            "未配置 embedding API key，请到设置里配置并验证 embedding 服务".to_string()
-        })?;
+    let credential = embedding::credential_source();
+    if !credential.is_ready().await? {
+        return Err("未配置 embedding API key，请到设置里配置并验证 embedding 服务".into());
+    }
     let endpoint = settings.embedding_endpoint.as_deref().unwrap_or("");
     let model = settings.embedding_model.as_deref().unwrap_or("");
-    let index =
-        local_kb::semantic::build_or_update_index(&kb.root, endpoint, model, key, Some(&app))
-            .await?;
+    let index = local_kb::semantic::build_or_update_index(
+        &kb.root,
+        endpoint,
+        model,
+        &credential,
+        Some(&app),
+    )
+    .await?;
     Ok(index.stats())
 }
 
@@ -6910,18 +6928,16 @@ pub(crate) fn spawn_kb_auto_index(app: tauri::AppHandle) {
         if settings.kb_semantic_auto_index == Some(false) {
             return;
         }
-        let key = settings
-            .embedding_api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let Some(key) = key else { return }; // 没配 embedding 不自动索引
+        let credential = embedding::credential_source();
+        if !credential.is_ready().await.unwrap_or(false) {
+            return;
+        }
         let Some(kb) = local_kb::cache::LocalKb::auto_detect(&settings) else {
             return;
         };
         let endpoint = settings.embedding_endpoint.as_deref().unwrap_or("");
         let model = settings.embedding_model.as_deref().unwrap_or("");
-        local_kb::semantic::auto_update_index(&kb.root, endpoint, model, key, app).await;
+        local_kb::semantic::auto_update_index(&kb.root, endpoint, model, &credential, app).await;
     });
 }
 
@@ -6930,14 +6946,10 @@ pub(crate) fn spawn_kb_auto_index(app: tauri::AppHandle) {
 #[tauri::command]
 async fn embedding_speed_test(n: u32) -> Result<serde_json::Value, String> {
     let settings = settings::read_settings().unwrap_or_default();
-    let key = settings
-        .embedding_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            "未配置 embedding API key，请到设置里配置并验证 embedding 服务".to_string()
-        })?;
+    let credential = embedding::credential_source();
+    if !credential.is_ready().await? {
+        return Err("未配置 embedding API key，请到设置里配置并验证 embedding 服务".into());
+    }
     let endpoint = settings.embedding_endpoint.as_deref().unwrap_or("");
     let model = settings.embedding_model.as_deref().unwrap_or("");
     let count = n.clamp(1, 32) as usize;
@@ -6945,7 +6957,7 @@ async fn embedding_speed_test(n: u32) -> Result<serde_json::Value, String> {
         .map(|i| format!("法律检索速度测试探针第{i}条:合同解除的法定情形与违约责任。"))
         .collect();
     let t0 = std::time::Instant::now();
-    let v = embedding::embed(endpoint, model, key, &probes).await?;
+    let v = embedding::embed(endpoint, model, &credential, &probes).await?;
     let ms = t0.elapsed().as_millis() as u64;
     let dim = v.first().map(|e| e.len()).unwrap_or(0);
     Ok(serde_json::json!({
@@ -6987,29 +6999,24 @@ async fn get_yuandian_balance(
     pool: tauri::State<'_, SqlitePool>,
     refresh: bool,
 ) -> Result<Option<yuandian::balance::YuandianBalanceView>, String> {
-    let settings = settings::read_settings().unwrap_or_default();
-    let Some(api_key) = settings
-        .yuandian_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-    else {
+    let credential = yuandian::credential_source();
+    if !credential.is_ready().await? {
         return if refresh {
             Err("尚未配置元典 API key".into())
         } else {
             Ok(None)
         };
-    };
-
-    if !refresh {
-        return yuandian::balance::cached_balance(pool.inner(), api_key).await;
     }
 
-    match yuandian::balance::fetch_and_persist(pool.inner(), api_key).await {
+    if !refresh {
+        return yuandian::balance::cached_balance(pool.inner(), &credential).await;
+    }
+
+    match yuandian::balance::fetch_and_persist(pool.inner(), &credential).await {
         Ok(balance) => Ok(Some(balance)),
         Err(error) => {
             let safe_error: String = error.chars().take(240).collect();
-            match yuandian::balance::cached_balance(pool.inner(), api_key).await? {
+            match yuandian::balance::cached_balance(pool.inner(), &credential).await? {
                 Some(cached) => Ok(Some(cached.with_refresh_error(safe_error))),
                 None => Err(safe_error),
             }
@@ -7019,12 +7026,9 @@ async fn get_yuandian_balance(
 
 /// 验证 embedding 配置:embed 一个探针词,成功返回向量维度。给设置页「验证」按钮。
 #[tauri::command]
-async fn verify_embedding_key(
-    endpoint: String,
-    model: String,
-    api_key: String,
-) -> Result<usize, String> {
-    embedding::verify(&endpoint, &model, &api_key).await
+async fn verify_embedding_key(endpoint: String, model: String) -> Result<usize, String> {
+    let credential = embedding::credential_source();
+    embedding::verify(&endpoint, &model, &credential).await
 }
 
 // ============================================================================
@@ -7088,10 +7092,49 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            // 0.4 credential bridge:在业务库及消费者启动前完成 3A pending seal，并对已切族
+            // 执行可恢复的 3B 净化/激活；失败保留旧值并在下次启动重试。
+            let app_data_root = db::app_data_dir().map_err(|error| {
+                Box::<dyn std::error::Error>::from(format!("找不到数据目录: {error}"))
+            })?;
+            let pending_migration = match tauri::async_runtime::block_on(
+                credentials_bridge::run_automatic_migration(&app_data_root),
+            ) {
+                Ok(report) => report,
+                Err(error) => {
+                    dlog!(
+                        "[startup] credential pending migration failed (nonfatal; retry next startup): {}",
+                        error
+                    );
+                    credentials_bridge::PendingMigrationReport::failed(
+                        "credential-bridge",
+                        error.to_string(),
+                    )
+                }
+            };
+            dlog!(
+                "[startup] credential automatic migration: status={:?}, entries={}, sealed={}, authenticated={}, mcp_ids_added={}, sanitized={}, activated={}, source_errors={}",
+                pending_migration.status,
+                pending_migration.entries.len(),
+                pending_migration.sealed_count,
+                pending_migration.authenticated_count,
+                pending_migration.mcp_instance_ids_added,
+                pending_migration.sanitized,
+                pending_migration.activated_count,
+                pending_migration.source_errors.len(),
+            );
+            for source_error in &pending_migration.source_errors {
+                dlog!(
+                    "[startup] credential pending migration source failed (nonfatal; retry next startup): source={}, error={}",
+                    source_error.source,
+                    source_error.error,
+                );
+            }
+
             // 启动时同步初始化数据库连接池 + 跑 migrations
             // 用 tauri::async_runtime::block_on 避免前端在 pool 就绪前发命令
-            let db_path = db::default_db_path()
-                .map_err(|e| Box::<dyn std::error::Error>::from(format!("找不到数据目录: {}", e)))?
+            let db_path = app_data_root
+                .join("caseboard.db")
                 .to_string_lossy()
                 .to_string();
             let pool = tauri::async_runtime::block_on(db::init_pool(&db_path)).map_err(|e| {
@@ -7146,6 +7189,7 @@ pub fn run() {
             let team_pool = pool.clone();
             let feishu_reminder_pool = pool.clone();
             app.manage(pool);
+            app.manage(pending_migration);
             // chat 模块全局 cancel 注册表(V0.1.13+)
             app.manage(chat::ChatCancelRegistry::default());
             app.manage(TeamNetState::default());
@@ -7231,6 +7275,7 @@ pub fn run() {
             open_url,
             reveal_in_finder,
             get_settings,
+            credentials_commands::list_credential_metadata, credentials_commands::save_credential, credentials_commands::verify_credential, credentials_commands::revoke_credential, credentials_commands::get_legacy_credential_migration_status, credentials_commands::start_legacy_credential_migration,
             get_network_research_statuses,
             save_network_research_key,
             verify_network_research_provider,
@@ -7346,7 +7391,6 @@ pub fn run() {
             verify_deepseek_key,
             verify_minimax_key,
             verify_openai_compat_key,
-            verify_yuandian_key,
             check_for_update,
             app_version,
             seed_demo_case_if_empty,

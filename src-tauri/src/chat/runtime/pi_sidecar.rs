@@ -9,7 +9,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::pi_credentials::{resolve_pi_credential, OsPiCredentialVault, PiCredentialVault};
+use super::pi_credentials::{
+    resolve_caseboard_custom_credential, resolve_pi_credential, OsPiCredentialVault,
+    PiCredentialVault,
+};
 use super::pi_locator::resolve_pi_runtime_binary;
 use super::pi_protocol::{
     PiHostMessage, PiModelConfig, PiRuntimeCapabilities, PiSidecarMessage, PiStartRequest,
@@ -522,44 +525,51 @@ pub async fn run_pi_chat(
                 "{error}。请前往「设置 → 大脑 → Pi Provider」重新选择并完成配置。"
             ))
         })?;
-    let (selected_model, credential_type, credential_source) = if selection.provider_id
-        == "caseboard-custom"
-    {
-        let credential_type = config
-            .api_key
-            .as_deref()
-            .filter(|key| !key.trim().is_empty())
-            .map(|_| "api_key".to_string())
-            .or_else(|| Some("local_runtime".to_string()));
-        (None, credential_type, Some("caseboard_custom".to_string()))
-    } else {
-        let resolved_credential =
-                resolve_pi_credential(ctx.settings, &OsPiCredentialVault, &selection.provider_id)
-                    .map_err(AgentLoopError::RuntimeUnavailable)?
-                    .ok_or_else(|| {
-                        AgentLoopError::RuntimeUnavailable(format!(
-                            "Pi Provider「{}」尚未配置可用凭据。请前往「设置 → 大脑 → Pi Provider」完成配置后重试。",
-                            selection.provider_id
-                        ))
-                    })?;
-        let credential_type = resolved_credential.credential_type().to_string();
-        let credential_source = resolved_credential.source.as_str().to_string();
-        (
-            Some(PiModelConfig {
-                provider_id: selection.provider_id,
-                model_id: selection.model_id,
-                thinking_level: selection.thinking_level,
-                credential: Some(resolved_credential.credential),
-                caseboard_custom: None,
-            }),
-            Some(credential_type),
-            Some(credential_source),
-        )
-    };
+    let (selected_model, caseboard_custom_credential, credential_type, credential_source) =
+        if selection.provider_id == "caseboard-custom" {
+            let credential =
+                resolve_caseboard_custom_credential(ctx.settings, &OsPiCredentialVault)
+                    .map(|resolved| resolved.credential);
+            let credential_type = credential
+                .as_ref()
+                .map(|_| "api_key".to_string())
+                .or_else(|| Some("local_runtime".to_string()));
+            (
+                None,
+                credential,
+                credential_type,
+                Some("caseboard_custom".to_string()),
+            )
+        } else {
+            let resolved_credential =
+            resolve_pi_credential(ctx.settings, &OsPiCredentialVault, &selection.provider_id)
+                .map_err(AgentLoopError::RuntimeUnavailable)?
+                .ok_or_else(|| {
+                    AgentLoopError::RuntimeUnavailable(format!(
+                        "Pi Provider「{}」尚未配置可用凭据。请前往「设置 → 大脑 → Pi Provider」完成配置后重试。",
+                        selection.provider_id
+                    ))
+                })?;
+            let credential_type = resolved_credential.credential_type().to_string();
+            let credential_source = resolved_credential.source.as_str().to_string();
+            (
+                Some(PiModelConfig {
+                    provider_id: selection.provider_id,
+                    model_id: selection.model_id,
+                    thinking_level: selection.thinking_level,
+                    credential: Some(resolved_credential.credential),
+                    caseboard_custom: None,
+                }),
+                None,
+                Some(credential_type),
+                Some(credential_source),
+            )
+        };
     let result = run_pi_chat_with_command_selected(
         PiChatProcess {
             process: PiProcessCommand::new(resolved.binary),
             selected_model,
+            caseboard_custom_credential,
             credential_type,
             credential_source,
             trace_sink: PiTraceSink::AppData,
@@ -587,6 +597,7 @@ pub async fn run_pi_chat(
 struct PiChatProcess {
     process: PiProcessCommand,
     selected_model: Option<PiModelConfig>,
+    caseboard_custom_credential: Option<crate::chat::runtime::pi_protocol::PiCredential>,
     credential_type: Option<String>,
     credential_source: Option<String>,
     trace_sink: PiTraceSink,
@@ -620,8 +631,14 @@ async fn run_pi_chat_with_command_selected(
         },
     });
     let request_id = uuid::Uuid::new_v4().to_string();
-    let mut start = PiStartRequest::from_caseboard(&request_id, config, &request, registry)
-        .map_err(AgentLoopError::RuntimeUnavailable)?;
+    let mut start = PiStartRequest::from_caseboard(
+        &request_id,
+        config,
+        &request,
+        registry,
+        invocation.caseboard_custom_credential,
+    )
+    .map_err(AgentLoopError::RuntimeUnavailable)?;
     if let Some(model) = invocation.selected_model {
         start.model = model;
     }

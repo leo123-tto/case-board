@@ -48,26 +48,27 @@ impl Tool for SemanticSearchCaseDocs {
             .unwrap_or(DEFAULT_TOP_N);
 
         // 配置门禁:没配 embedding key → 优雅回退提示(不报错,让模型改用关键词工具,AI 无感)
-        let key = ctx
-            .settings
-            .embedding_api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let Some(key) = key else {
+        let credential = crate::embedding::credential_source();
+        if !credential.is_ready().await.map_err(ToolError::Runtime)? {
             return Ok(ToolResult::plain(
                 "本案未配置语义检索(embedding 未设置)。请改用 `find_in_document`(关键词精确查)\
                  或 `read_case_doc`(读全文)来查材料;如需启用语义检索,请提示用户在设置页配置 embedding。\
                  不要反复调用本工具。",
             ));
-        };
+        }
         let endpoint = ctx.settings.embedding_endpoint.as_deref().unwrap_or("");
         let model = ctx.settings.embedding_model.as_deref().unwrap_or("");
 
         let docs = list_documents_by_case(ctx.pool, case_id).await?;
         // embed 报错透传(坑#8):网络/额度问题让 LLM 看到真错,自行回退关键词工具。
         let hits = crate::embedding::index::semantic_search(
-            case_id, &docs, query, top_n, endpoint, model, key,
+            case_id,
+            &docs,
+            query,
+            top_n,
+            endpoint,
+            model,
+            &credential,
         )
         .await
         .map_err(ToolError::Runtime)?;

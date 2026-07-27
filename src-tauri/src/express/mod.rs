@@ -10,6 +10,16 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::credentials_bridge::{BridgeCredentialConsumer, PendingCredentialSource};
+
+pub fn credential_source() -> PendingCredentialSource {
+    PendingCredentialSource::pending(
+        BridgeCredentialConsumer::CourierConnector,
+        "settings:kuaidi100_key",
+        "connector.kuaidi100",
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackNode {
     /// 节点时间(ftime 优先,退化到 time)
@@ -67,19 +77,21 @@ fn build_param(com: &str, num: &str, phone: &str) -> String {
 /// `phone` = 收寄件人手机号(顺丰/中通必填,其它选填)。
 pub async fn query(
     customer: &str,
-    key: &str,
+    credential: &PendingCredentialSource,
     com: &str,
     num: &str,
     phone: &str,
 ) -> Result<ExpressResult, String> {
-    if customer.trim().is_empty() || key.trim().is_empty() {
+    if customer.trim().is_empty() {
         return Err("未配置快递100 customer / key,请到设置里填写(申请见 api.kuaidi100.com)".into());
     }
     if num.trim().is_empty() {
         return Err("运单号不能为空".into());
     }
     let param = build_param(com, num, phone);
-    let signature = sign(&param, key, customer);
+    let material = credential.issue_material().await?;
+    let signature = sign(&param, material.expose(), customer);
+    drop(material);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -212,13 +224,13 @@ fn hours_since(iso: &str, now: chrono::DateTime<chrono::Local>) -> i64 {
 /// 查询并跟踪一个单号:实时查 → upsert 进本地列表 → 返回最新全列表(倒序)。
 pub async fn query_and_track(
     customer: &str,
-    key: &str,
+    credential: &PendingCredentialSource,
     com: &str,
     com_name: &str,
     num: &str,
     phone: &str,
 ) -> Result<Vec<TrackRecord>, String> {
-    let r = query(customer, key, com, num, phone).await?;
+    let r = query(customer, credential, com, num, phone).await?;
     let mut tracks = load_tracks();
     let now = now_iso();
     let delivered = is_delivered(&r.state);
@@ -257,7 +269,7 @@ pub async fn query_and_track(
 /// 同单号 40 天内重查免费,所以每天刷一次不额外花钱;已签收 / 超 30 天不刷。
 pub async fn refresh_active(
     customer: &str,
-    key: &str,
+    credential: &PendingCredentialSource,
     min_hours: i64,
 ) -> Result<Vec<TrackRecord>, String> {
     let mut tracks = load_tracks();
@@ -274,7 +286,7 @@ pub async fn refresh_active(
         .map(|t| (t.com.clone(), t.num.clone(), t.phone.clone()))
         .collect();
     for (com, num, phone) in to_poll {
-        if let Ok(r) = query(customer, key, &com, &num, &phone).await {
+        if let Ok(r) = query(customer, credential, &com, &num, &phone).await {
             if let Some(t) = tracks.iter_mut().find(|t| t.com == com && t.num == num) {
                 t.state = r.state.clone();
                 t.state_text = r.state_text;

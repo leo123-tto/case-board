@@ -467,7 +467,7 @@ function ManagePanel({
   const isLeader = identity.role === "leader";
   const [busy, setBusy] = useState(false);
   const [permFor, setPermFor] = useState<string | null>(null);
-  const [pairingCode, setPairingCode] = useState(identity.pairing_code ?? null);
+  const [pairingCode, setPairingCode] = useState<string | null>(null);
 
   async function run(label: string, f: () => Promise<void>) {
     if (busy) return;
@@ -485,9 +485,9 @@ function ManagePanel({
     <div className="mb-5 space-y-3 rounded-lg border border-border bg-card/60 p-4">
       {isLeader && (
         <div className="flex flex-wrap items-center gap-2 rounded-md border border-sky-200 bg-sky-50/60 p-3">
-          <span className="text-xs text-sky-900">配对码(告诉要加入的队友):</span>
+          <span className="text-xs text-sky-900">新配对码(仅本次显示):</span>
           <span className="font-mono text-xl font-bold tracking-[0.3em] text-sky-700">
-            {pairingCode ?? "——"}
+            {pairingCode ?? "点击右侧刷新生成"}
           </span>
           <button
             type="button"

@@ -62,7 +62,11 @@ AGENTS.md
 
 # 项目内部讨论 / 决策记录 / 方法论 / 分发交接文档
 # (可能含客户名 / 决策过程 / 敏感产品策略;作者本地保留)
-docs/
+# 默认不进 git;要跨机器共享(Mac mini 拉取)的工程文档放 docs/shared/,
+# 该目录默认进 git,纪律:禁写案件/客户/个人信息与任何 key。
+# 其余 docs 需进 git 时沿用 git add -f 显式加入(已有 73 个文件如此)。
+docs/*
+!docs/shared/
 
 # FleetView / Claude Code 本地 session 状态
 .clawhub/
@@ -70,3 +74,4 @@ docs/
 
 # macOS 系统 metadata
 *.DS_Store
+.claude/

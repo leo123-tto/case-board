@@ -205,6 +205,7 @@ impl ToolRegistry {
             Box::new(companies::EnterpriseChangeInfo),
             Box::new(companies::EnterpriseWritList),
             Box::new(companies::EnterpriseAnnualReport),
+            Box::new(companies::ListedAnnouncementSearch),
             // 幻觉校验 1
             Box::new(verify::VerifyLegalCitations),
             // 案件文档 4
@@ -405,16 +406,18 @@ pub(crate) fn opt_bool(args: &Value, key: &str) -> Option<bool> {
     args.get(key).and_then(|v| v.as_bool())
 }
 
-/// 拿元典 API key,空串 / 缺失返回 `NoYuandianKey`。
-pub(crate) fn yuandian_key<'a>(ctx: &'a ToolContext<'_>) -> Result<&'a str, ToolError> {
-    let k = ctx
-        .settings
-        .yuandian_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or(ToolError::NoYuandianKey)?;
-    Ok(k)
+/// metadata-only 检查 3A journal 后返回非秘密元典 locator；不打开 vault。
+pub(crate) async fn yuandian_credential(
+    _ctx: &ToolContext<'_>,
+) -> Result<&'static crate::yuandian::YuandianCredentialSource, ToolError> {
+    static SOURCE: std::sync::OnceLock<crate::yuandian::YuandianCredentialSource> =
+        std::sync::OnceLock::new();
+    let source = SOURCE.get_or_init(crate::yuandian::credential_source);
+    match source.is_ready().await {
+        Ok(true) => Ok(source),
+        Ok(false) => Err(ToolError::NoYuandianKey),
+        Err(error) => Err(ToolError::Runtime(error)),
+    }
 }
 
 /// 元典付费检索成功后,把接口返回的完整 JSON 原样交给模型。

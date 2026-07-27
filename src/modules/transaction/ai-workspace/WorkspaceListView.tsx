@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { confirmDialog } from "@/lib/dialog";
 import { cn } from "@/lib/utils";
 
 import {
@@ -141,7 +142,7 @@ export function WorkspaceListView({ onOpen }: Props) {
   };
 
   const archive = async (workspace: AiWorkspaceSummary) => {
-    if (!window.confirm(`确认归档“${workspace.title}”？归档不会删除其中的材料、文稿或对话。`)) {
+    if (!(await confirmDialog(`确认归档“${workspace.title}”？归档不会删除其中的材料、文稿或对话。`, { okLabel: "归档" }))) {
       return;
     }
     try {

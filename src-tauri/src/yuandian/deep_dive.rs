@@ -36,7 +36,7 @@ pub struct DeepDiveReport {
 pub async fn run_deep_dive(
     pool: &SqlitePool,
     case_id: &str,
-    api_key: &str,
+    api_key: &crate::yuandian::YuandianCredentialSource,
     llm_config: &LlmConfig,
 ) -> Result<DeepDiveReport, String> {
     // 保持到全部 hints/原始文件/元典/LLM 工作结束，禁止查询中变更精确委托人。
@@ -50,7 +50,7 @@ pub async fn run_deep_dive(
 async fn run_deep_dive_inner(
     pool: &SqlitePool,
     case_id: &str,
-    api_key: &str,
+    api_key: &crate::yuandian::YuandianCredentialSource,
     llm_config: &LlmConfig,
     bound_p1: Option<super::artifact_binding::P1Artifacts>,
 ) -> DeepDiveReport {
@@ -380,7 +380,7 @@ corpus 顶部「案件元信息」段会给立案日。请扫 P1 + P2 全部数�
 /* ============ 深挖单项实现 ============ */
 
 async fn dig_enterprise(
-    api_key: &str,
+    api_key: &crate::yuandian::YuandianCredentialSource,
     name: &str,
     base_dir: &std::path::Path,
     files: &mut Vec<String>,
@@ -456,7 +456,7 @@ async fn dig_enterprise(
 }
 
 async fn dig_case(
-    api_key: &str,
+    api_key: &crate::yuandian::YuandianCredentialSource,
     case_no: &str,
     base_dir: &std::path::Path,
     files: &mut Vec<String>,
@@ -475,7 +475,7 @@ async fn dig_case(
 }
 
 async fn dig_person(
-    api_key: &str,
+    api_key: &crate::yuandian::YuandianCredentialSource,
     name: &str,
     base_dir: &std::path::Path,
     files: &mut Vec<String>,

@@ -122,6 +122,46 @@ const AUTHORITY_SOURCES: &[&str] = &[
     "检指导案例",
 ];
 
+// 上市公司公告(rh_ssgsgg_search)专用枚举 —— 跟 REGIONS/CASE_REGIONS 都不同:
+// 没有"中央/最高",但多出"境外""香港"。照官方取值范围原样登记,别复用上面两个。
+const LISTED_MARKETS: &[&str] = &["深证A股", "上证A股", "北证A股"];
+
+const LISTED_AREAS: &[&str] = &[
+    "浙江",
+    "北京",
+    "广东",
+    "江苏",
+    "上海",
+    "山东",
+    "四川",
+    "安徽",
+    "福建",
+    "湖北",
+    "湖南",
+    "河南",
+    "重庆",
+    "辽宁",
+    "江西",
+    "河北",
+    "新疆",
+    "陕西",
+    "海南",
+    "天津",
+    "甘肃",
+    "云南",
+    "吉林",
+    "黑龙江",
+    "广西",
+    "山西",
+    "贵州",
+    "西藏",
+    "宁夏",
+    "内蒙古",
+    "青海",
+    "境外",
+    "香港",
+];
+
 fn date(description: &str) -> Value {
     json!({"type": "string", "format": "date", "description": description})
 }
@@ -344,6 +384,26 @@ pub(super) fn enterprise_annual_report() -> Value {
         "additionalProperties": false,
         "properties": properties,
         "required": ["year"]
+    })
+}
+
+pub(super) fn listed_announcement_search() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "title": {"type": "string", "description": "公告标题：按空格切分后需全部命中"},
+            "name": {"type": "string", "description": "公司全称，子串模糊命中"},
+            "jc": {"type": "string", "description": "股票简称，精确匹配"},
+            "content": {"type": "string", "description": "公告全文检索词；空格拆分后按 search_mode 连接"},
+            "search_mode": {"type": "string", "enum": ["AND", "OR"], "default": "AND", "description": "全文关键词拼接模式，仅作用于 content"},
+            "fbrq_start": date("公告发布日期起，含当日，YYYY-MM-DD"),
+            "fbrq_end": date("公告发布日期止，含当日，YYYY-MM-DD"),
+            "market": {"type": "string", "enum": LISTED_MARKETS, "description": "交易所，精确匹配"},
+            "area": {"type": "string", "enum": LISTED_AREAS, "description": "地区，精确匹配"},
+            "zsx_type": {"type": "string", "description": "中上协行业分类，子串模糊命中"},
+            "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "返回条数；官方默认与上限均为 50"}
+        }
     })
 }
 

@@ -16,7 +16,10 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
 
+import type { UpdateInfo } from "@/lib/types";
+
 const PENDING_KEY = "caseboard.pending_update";
+const CHECK_TIMEOUT_MS = 8_000;
 
 export interface PendingUpdate {
   version: string;
@@ -31,12 +34,33 @@ export type DownloadProgress = {
 };
 
 /**
- * 检查是否有可用的应用内更新(走 tauri.conf 配置的 latest.json endpoint,自动验签)。
+ * 检查是否有可用的应用内更新。`updater_target` 由 Rust 按平台/OS 版本安全选择,
+ * tauri.conf 的 endpoint 模板据此读取与提示完全相同的 Stable/Legacy manifest。
  * 有更新返回 Update 句柄;无更新或不可达返回 null(静默,由上层决定是否回退手动下载)。
  */
-export async function checkAppUpdate(): Promise<Update | null> {
+export async function checkAppUpdate(
+  info: Pick<UpdateInfo, "latest" | "updater_target">,
+): Promise<Update | null> {
+  if (!info.updater_target || !info.latest) return null;
+
   try {
-    return await check();
+    const update = await check({
+      target: info.updater_target,
+      timeout: CHECK_TIMEOUT_MS,
+    });
+    if (!update) return null;
+
+    // manifest 在提示后发生变化时不静默安装另一个版本。关闭旧 resource,
+    // 让用户重新检查后再确认新的版本与说明。
+    if (update.version !== info.latest) {
+      try {
+        await update.close();
+      } catch {
+        /* resource 关闭失败也不能放行版本不一致的安装 */
+      }
+      return null;
+    }
+    return update;
   } catch {
     // endpoint 不可达 / 签名校验失败 / 非 Tauri 环境 —— 一律静默,交给上层兜底
     return null;

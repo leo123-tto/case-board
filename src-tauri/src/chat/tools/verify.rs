@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use super::{require_str, yuandian_key, Tool, ToolContext, ToolError, ToolResult};
+use super::{require_str, yuandian_credential, Tool, ToolContext, ToolError, ToolResult};
 use crate::yuandian;
 
 pub struct VerifyLegalCitations;
@@ -26,7 +26,7 @@ impl Tool for VerifyLegalCitations {
 
     async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
         let text = require_str(args, "text")?;
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         // **不缓存** — 校验需要实时数据
         let resp = yuandian::hall_detect(api_key, text).await?;
         Ok(ToolResult {

@@ -267,24 +267,31 @@ pub async fn review_contract(
         body["response_format"] = serde_json::json!({"type": "json_object"});
     }
 
-    let mut req = reqwest::Client::builder()
+    let req = reqwest::Client::builder()
         // 审查比抽取更长,给足超时
         .timeout(std::time::Duration::from_secs(config.timeout_secs * 4))
         .build()
         .map_err(|e| LlmError::Network(e.to_string()))?
         .post(&config.endpoint)
         .json(&body);
-    if let Some(key) = &config.api_key {
-        req = req.bearer_auth(key);
-    }
-
-    let response = req
-        .send()
+    let (req, credential) = config
+        .authorize_request(req)
         .await
-        .map_err(|e| LlmError::Network(e.to_string()))?;
+        .map_err(LlmError::Credential)?;
+
+    let response = req.send().await.map_err(|e| {
+        let message = credential
+            .as_ref()
+            .map_or_else(|| e.to_string(), |value| value.redact(&e.to_string()));
+        LlmError::Network(message)
+    })?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
+        let text = match credential.as_ref() {
+            Some(value) => value.redact(&text),
+            None => text,
+        };
         return Err(LlmError::HttpStatus(status.as_u16(), text));
     }
     let json: serde_json::Value = response
@@ -299,7 +306,10 @@ pub async fn review_contract(
         .and_then(|c| c.as_str())
         .ok_or_else(|| LlmError::ResponseFormat("无 choices[0].message.content".into()))?;
 
-    let cleaned = extract_json_object(content);
+    let content = credential
+        .as_ref()
+        .map_or_else(|| content.to_owned(), |value| value.redact(content));
+    let cleaned = extract_json_object(&content);
     serde_json::from_str::<ContractReviewResult>(&cleaned)
         .map_err(|e| LlmError::ContentJson(format!("{}\n---原始---\n{}", e, cleaned)))
 }

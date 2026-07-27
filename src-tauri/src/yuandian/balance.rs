@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
 
-use crate::chat::mcp_bridge::{McpClient, McpServerConfig, McpTransport};
+use crate::chat::mcp_bridge::{new_mcp_instance_id, McpClient, McpServerConfig, McpTransport};
 
 const MCP_LAW_URL: &str = "https://open.chineselaw.com/mcp/law/stream";
 const BALANCE_TOOL: &str = "yuandian_get_user_balance";
@@ -105,26 +105,36 @@ fn parse_balance_result(result: &Value) -> Result<(i64, i64), String> {
     Ok((points, count))
 }
 
-async fn fetch_mcp_balance(api_key: &str) -> Result<(i64, i64), String> {
-    let mut headers = BTreeMap::new();
-    headers.insert("Authorization".into(), format!("Bearer {api_key}"));
+async fn fetch_mcp_balance(
+    credential: &crate::yuandian::YuandianCredentialSource,
+) -> Result<(i64, i64), String> {
     let config = McpServerConfig {
+        instance_id: new_mcp_instance_id(),
         name: "yuandian-law".into(),
         transport: McpTransport::Http {
             url: MCP_LAW_URL.into(),
-            headers,
+            headers: BTreeMap::new(),
         },
         enabled: true,
     };
-    let client = McpClient::connect(&config).await?;
+    let client = McpClient::connect_with_bearer_credential(&config, credential.clone()).await?;
     let result = client.call_tool_value(BALANCE_TOOL, &json!({})).await?;
     parse_balance_result(&result)
 }
 
 /// 免费验证元典 key，并返回当前积分/次数余额。替代旧版用 1 分企业搜索 + 50 分
 /// hall_detect 做探针的昂贵做法。
-pub async fn verify_api_key(api_key: &str) -> Result<(i64, i64), String> {
-    fetch_mcp_balance(api_key).await
+pub async fn verify_api_key(
+    credential: &crate::yuandian::YuandianCredentialSource,
+) -> Result<(i64, i64), String> {
+    fetch_mcp_balance(credential).await
+}
+
+async fn credential_fingerprint(
+    credential: &crate::yuandian::YuandianCredentialSource,
+) -> Result<String, String> {
+    let material = credential.issue_material().await?;
+    Ok(material.with_secret(key_fingerprint))
 }
 
 async fn local_totals(pool: &SqlitePool) -> Result<(i64, i64), sqlx::Error> {
@@ -216,13 +226,13 @@ fn to_view(
 /// 通过免费 MCP 工具刷新余额、保存快照并返回相邻区间对账结果。
 pub async fn fetch_and_persist(
     pool: &SqlitePool,
-    api_key: &str,
+    credential: &crate::yuandian::YuandianCredentialSource,
 ) -> Result<YuandianBalanceView, String> {
     let previous = latest_snapshot(pool).await.map_err(|e| e.to_string())?;
-    let (point_balance, count_balance) = fetch_mcp_balance(api_key).await?;
+    let (point_balance, count_balance) = fetch_mcp_balance(credential).await?;
     let (local_credits_total, local_api_calls_total) =
         local_totals(pool).await.map_err(|e| e.to_string())?;
-    let fingerprint = key_fingerprint(api_key);
+    let fingerprint = credential_fingerprint(credential).await?;
     let fetched_at = Local::now().to_rfc3339();
     let result = sqlx::query(
         "INSERT INTO yuandian_balance_snapshots \
@@ -254,9 +264,16 @@ pub async fn fetch_and_persist(
 /// 读取当前 key 最近一次快照，不联网。若用户刚换 key，旧账户余额不会串过来。
 pub async fn cached_balance(
     pool: &SqlitePool,
-    api_key: &str,
+    credential: &crate::yuandian::YuandianCredentialSource,
 ) -> Result<Option<YuandianBalanceView>, String> {
-    let fingerprint = key_fingerprint(api_key);
+    let fingerprint = credential_fingerprint(credential).await?;
+    cached_balance_for_fingerprint(pool, &fingerprint).await
+}
+
+async fn cached_balance_for_fingerprint(
+    pool: &SqlitePool,
+    fingerprint: &str,
+) -> Result<Option<YuandianBalanceView>, String> {
     let current: Option<BalanceSnapshot> = sqlx::query_as(
         "SELECT id, key_fingerprint, point_balance, count_balance, local_credits_total, \
                 local_api_calls_total, fetched_at \

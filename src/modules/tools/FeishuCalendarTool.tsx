@@ -13,7 +13,6 @@ import {
   CalendarClock,
   Loader2,
   Save,
-  Send,
   CheckCircle2,
   AlertTriangle,
   ChevronDown,
@@ -23,11 +22,15 @@ import {
 import {
   fetchFeishuCalendar,
   getSettings,
+  listCredentialMetadata,
+  revokeCredential,
+  saveCredential,
   saveSettings,
-  testFeishuWebhook,
+  verifyCredential,
 } from "@/lib/api";
-import type { Settings } from "@/lib/types";
+import type { CredentialMetadata, Settings } from "@/lib/types";
 import { toast } from "@/components/ui/toast";
+import { CredentialField } from "@/components/settings/CredentialField";
 
 function todayISO(): string {
   const d = new Date();
@@ -42,10 +45,10 @@ export function FeishuCalendarTool() {
   const [enabled, setEnabled] = useState(false);
   const [larkPath, setLarkPath] = useState("");
   const [appToken, setAppToken] = useState("");
+  const [credentials, setCredentials] = useState<CredentialMetadata[]>([]);
   const [tableId, setTableId] = useState("");
   const [poolOpen, setPoolOpen] = useState(false);
   const [reminderEnabled, setReminderEnabled] = useState(false);
-  const [webhookUrl, setWebhookUrl] = useState("");
   const [reminderTime, setReminderTime] = useState("09:00");
   const [reminderDays, setReminderDays] = useState(7);
   const [reminderOpen, setReminderOpen] = useState(false);
@@ -55,26 +58,34 @@ export function FeishuCalendarTool() {
   const [testing, setTesting] = useState(false);
   const [testOk, setTestOk] = useState<boolean | null>(null);
   const [testMsg, setTestMsg] = useState<string | null>(null);
-  const [testingWebhook, setTestingWebhook] = useState(false);
-  const [webhookTestOk, setWebhookTestOk] = useState<boolean | null>(null);
-  const [webhookTestMsg, setWebhookTestMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    getSettings()
-      .then((s) => {
+    Promise.all([getSettings(), listCredentialMetadata().catch(() => [])])
+      .then(([s, metadata]) => {
         setSettings(s);
+        setCredentials(metadata);
         setEnabled(s.feishu_enabled === true);
         setLarkPath(s.feishu_lark_cli_path ?? "");
         setAppToken(s.feishu_app_token ?? "");
         setTableId(s.feishu_cases_table_id ?? "");
         setReminderEnabled(s.feishu_reminder_enabled === true);
-        setWebhookUrl(s.feishu_webhook_url ?? "");
         setReminderTime(s.feishu_reminder_time ?? "09:00");
         setReminderDays(s.feishu_reminder_days ?? 7);
-        if ((s.feishu_app_token ?? "").trim() || (s.feishu_cases_table_id ?? "").trim()) {
+        if (
+          (s.feishu_app_token ?? "").trim()
+          || (s.feishu_cases_table_id ?? "").trim()
+        ) {
           setPoolOpen(true);
         }
-        if (s.feishu_reminder_enabled === true || (s.feishu_webhook_url ?? "").trim()) {
+        if (
+          s.feishu_reminder_enabled === true
+          || metadata.some(
+            (item) =>
+              item.provider_or_connector_id === "feishu.reminder"
+              && item.kind === "webhook_secret"
+              && item.secret_present,
+          )
+        ) {
           setReminderOpen(true);
         }
       })
@@ -82,10 +93,44 @@ export function FeishuCalendarTool() {
   }, []);
 
   const markDirty = () => setDirty(true);
+  const webhookCredential = () =>
+    credentials.find(
+      (item) =>
+        item.provider_or_connector_id === "feishu.reminder"
+        && item.kind === "webhook_secret",
+    ) ?? null;
+  const replaceCredential = (next: CredentialMetadata) =>
+    setCredentials((previous) => [
+      ...previous.filter((item) => item.handle !== next.handle),
+      next,
+    ]);
+  const saveBridgeCredential = async (secretInput: string) => {
+    const current = webhookCredential();
+    const next = await saveCredential({
+      handle: current?.handle ?? null,
+      providerOrConnectorId: "feishu.reminder",
+      kind: "webhook_secret",
+      secretInput,
+    });
+    replaceCredential(next);
+    return next;
+  };
+  const verifyBridgeCredential = async () => {
+    const current = webhookCredential();
+    if (!current) throw new Error("凭据尚未配置");
+    const next = await verifyCredential(current.handle, current.revision);
+    replaceCredential(next);
+    return next;
+  };
+  const revokeBridgeCredential = async (handle: string, revision: number) => {
+    const next = await revokeCredential(handle, revision);
+    replaceCredential(next);
+    return next;
+  };
 
   const handleSave = async () => {
     if (!settings) return;
-    if (reminderEnabled && !webhookUrl.trim()) {
+    if (reminderEnabled && !webhookCredential()?.secret_present) {
       toast("启用飞书手机提醒前，请先填写机器人 Webhook URL", "error");
       setReminderOpen(true);
       return;
@@ -99,7 +144,6 @@ export function FeishuCalendarTool() {
         feishu_app_token: appToken.trim() || null,
         feishu_cases_table_id: tableId.trim() || null,
         feishu_reminder_enabled: reminderEnabled,
-        feishu_webhook_url: webhookUrl.trim() || null,
         feishu_reminder_time: reminderTime,
         feishu_reminder_days: reminderDays,
       };
@@ -114,26 +158,9 @@ export function FeishuCalendarTool() {
     }
   };
 
-  const handleTestWebhook = async () => {
-    if (!webhookUrl.trim()) return;
-    setTestingWebhook(true);
-    setWebhookTestOk(null);
-    setWebhookTestMsg(null);
-    try {
-      await testFeishuWebhook(webhookUrl.trim());
-      setWebhookTestOk(true);
-      setWebhookTestMsg("测试消息已发送，请在飞书手机端查看");
-    } catch (e) {
-      setWebhookTestOk(false);
-      setWebhookTestMsg(String(e));
-    } finally {
-      setTestingWebhook(false);
-    }
-  };
-
   // 测试连接:先存当前配置,再拉今天的飞书日历(透传真实错误,守坑#8)。
   const handleTest = async () => {
-    if (reminderEnabled && !webhookUrl.trim()) {
+    if (reminderEnabled && !webhookCredential()?.secret_present) {
       toast("启用飞书手机提醒前，请先填写机器人 Webhook URL", "error");
       setReminderOpen(true);
       return;
@@ -150,7 +177,6 @@ export function FeishuCalendarTool() {
           feishu_app_token: appToken.trim() || null,
           feishu_cases_table_id: tableId.trim() || null,
           feishu_reminder_enabled: reminderEnabled,
-          feishu_webhook_url: webhookUrl.trim() || null,
           feishu_reminder_time: reminderTime,
           feishu_reminder_days: reminderDays,
         };
@@ -263,38 +289,14 @@ export function FeishuCalendarTool() {
                 <p className="text-xs text-muted-foreground">默认关闭；每天成功推送一次，App 重启不会重复发送</p>
               </div>
             </label>
-            <div className="space-y-1.5">
-              <label className="text-sm font-medium text-foreground">飞书机器人 Webhook URL</label>
-              <div className="flex gap-2">
-                <input
-                  type="password"
-                  value={webhookUrl}
-                  onChange={(event) => {
-                    setWebhookUrl(event.target.value);
-                    setWebhookTestOk(null);
-                    setWebhookTestMsg(null);
-                    markDirty();
-                  }}
-                  placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
-                  autoComplete="off"
-                  className="min-w-0 flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:border-foreground/40"
-                />
-                <button
-                  type="button"
-                  onClick={handleTestWebhook}
-                  disabled={testingWebhook || !webhookUrl.trim()}
-                  className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent disabled:opacity-50"
-                >
-                  {testingWebhook ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
-                  测试提醒
-                </button>
-              </div>
-              {webhookTestMsg && (
-                <p className={webhookTestOk ? "text-xs text-emerald-700" : "text-xs text-red-700"}>
-                  {webhookTestOk ? "✓ " : "✕ "}{webhookTestMsg}
-                </p>
-              )}
-            </div>
+            <CredentialField
+              label="飞书机器人 Webhook URL"
+              status={webhookCredential()}
+              onSave={saveBridgeCredential}
+              onVerify={verifyBridgeCredential}
+              onRevoke={revokeBridgeCredential}
+              placeholder="输入新的飞书机器人 Webhook URL"
+            />
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
                 <label className="text-sm font-medium text-foreground">每日推送时间</label>
@@ -397,7 +399,7 @@ export function FeishuCalendarTool() {
         <button
           type="button"
           onClick={handleTest}
-          disabled={testing || saving || testingWebhook}
+          disabled={testing || saving}
           className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent disabled:opacity-50"
         >
           {testing ? <Loader2 className="size-4 animate-spin" /> : <CalendarClock className="size-4" />}
@@ -406,7 +408,7 @@ export function FeishuCalendarTool() {
         <button
           type="button"
           onClick={handleSave}
-          disabled={saving || testing || testingWebhook || !dirty}
+          disabled={saving || testing || !dirty}
           className="inline-flex items-center gap-1.5 rounded-md bg-foreground px-3 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90 disabled:opacity-50"
         >
           {saving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}

@@ -175,23 +175,22 @@ pub async fn complete_non_stream_chat(
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_error = None;
     for attempt in 0..MAX_ATTEMPTS {
-        let mut req = client.post(&config.endpoint).json(&body);
-        if let Some(key) = config
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            req = req.bearer_auth(key);
-        }
+        let (req, credential) = config
+            .authorize_request(client.post(&config.endpoint).json(&body))
+            .await
+            .map_err(|error| LlmGatewayError::new(LlmGatewayErrorKind::Auth, error))?;
 
         let response = match req.send().await {
             Ok(response) => response,
             Err(error) => {
+                let safe_error = credential.as_ref().map_or_else(
+                    || error.to_string(),
+                    |value| value.redact(&error.to_string()),
+                );
                 let mapped = if error.is_timeout() {
-                    LlmGatewayError::new(LlmGatewayErrorKind::Timeout, error.to_string())
+                    LlmGatewayError::new(LlmGatewayErrorKind::Timeout, safe_error)
                 } else {
-                    LlmGatewayError::new(LlmGatewayErrorKind::Network, error.to_string())
+                    LlmGatewayError::new(LlmGatewayErrorKind::Network, safe_error)
                 };
                 if attempt + 1 >= MAX_ATTEMPTS {
                     return Err(mapped);
@@ -205,7 +204,10 @@ pub async fn complete_non_stream_chat(
         if !status.is_success() {
             let retry_after = retry_after_seconds(response.headers());
             let error_body = response.text().await.unwrap_or_default();
-            let error = LlmGatewayError::http(status.as_u16(), error_body.clone());
+            let safe_error_body = credential
+                .as_ref()
+                .map_or_else(|| error_body.clone(), |value| value.redact(&error_body));
+            let error = LlmGatewayError::http(status.as_u16(), safe_error_body);
             let retryable = status.as_u16() == 429 || status.is_server_error();
             // 余额/总额度耗尽不是瞬时限流，等待只会拖慢并重复失败。
             if !retryable || is_quota_exhausted(&error_body) || attempt + 1 >= MAX_ATTEMPTS {
@@ -219,7 +221,28 @@ pub async fn complete_non_stream_chat(
         let value = response.json::<Value>().await.map_err(|e| {
             LlmGatewayError::new(LlmGatewayErrorKind::ResponseFormat, e.to_string())
         })?;
-        return parse_non_stream_chat_response(value);
+        let mut output = parse_non_stream_chat_response(value).map_err(|mut error| {
+            if let Some(credential) = credential.as_ref() {
+                error.message = credential.redact(&error.message);
+            }
+            error
+        })?;
+        if let Some(credential) = credential.as_ref() {
+            output.content = credential.redact(&output.content);
+            output.reasoning_content = output
+                .reasoning_content
+                .as_deref()
+                .map(|value| credential.redact(value));
+            output.finish_reason = output
+                .finish_reason
+                .as_deref()
+                .map(|value| credential.redact(value));
+            output.model = output
+                .model
+                .as_deref()
+                .map(|value| credential.redact(value));
+        }
+        return Ok(output);
     }
     Err(last_error.unwrap_or_else(|| {
         LlmGatewayError::new(

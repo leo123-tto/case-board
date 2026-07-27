@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::{
-    opt_str, opt_u32, require_str, save_and_wrap, try_kb_hit, yuandian_key, Tool, ToolContext,
-    ToolError, ToolResult,
+    opt_str, opt_u32, require_str, save_and_wrap, try_kb_hit, yuandian_credential, Tool,
+    ToolContext, ToolError, ToolResult,
 };
 use crate::yuandian::{self, EntityId};
 
@@ -77,7 +77,7 @@ impl Tool for EnterpriseSearch {
         {
             return Ok(result);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::enterprise_search_with_limit(api_key, name, top_k).await?;
         Ok(save_and_wrap(
             ctx,
@@ -120,7 +120,7 @@ impl Tool for EnterpriseAggregationSummary {
         {
             return Ok(result);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::enterprise_aggregation_summary(api_key, &eid).await?;
         // 聚合 10 积分
         Ok(save_and_wrap(
@@ -164,7 +164,7 @@ impl Tool for EnterpriseBaseInfo {
         {
             return Ok(result);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::enterprise_base_info(api_key, &eid).await?;
         Ok(save_and_wrap(
             ctx,
@@ -208,7 +208,7 @@ impl Tool for EnterpriseChangeInfo {
         {
             return Ok(result);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::enterprise_change_info(api_key, &eid, page).await?;
         Ok(save_and_wrap(
             ctx,
@@ -252,7 +252,7 @@ impl Tool for EnterpriseWritList {
         {
             return Ok(result);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::enterprise_writ_list(api_key, &eid, page).await?;
         Ok(save_and_wrap(
             ctx,
@@ -297,13 +297,87 @@ impl Tool for EnterpriseAnnualReport {
         {
             return Ok(result);
         }
-        let api_key = yuandian_key(ctx)?;
+        let api_key = yuandian_credential(ctx).await?;
         let resp = yuandian::enterprise_annual_report(api_key, &eid, year).await?;
         Ok(save_and_wrap(
             ctx,
             "rh_enterpriseAnnualReport",
             &cache_params,
             &cache_key,
+            resp,
+        ))
+    }
+}
+
+/// 官方要求请求体不能为空(`top_k` 不计入),这里提前挡住并顺带给出缓存/展示用摘要。
+fn ssgsgg_params_from_args(args: &Value) -> Result<yuandian::SsgsggSearchParams, ToolError> {
+    let params = yuandian::SsgsggSearchParams {
+        title: opt_str(args, "title").map(String::from),
+        name: opt_str(args, "name").map(String::from),
+        jc: opt_str(args, "jc").map(String::from),
+        content: opt_str(args, "content").map(String::from),
+        search_mode: opt_str(args, "search_mode").map(String::from),
+        fbrq_start: opt_str(args, "fbrq_start").map(String::from),
+        fbrq_end: opt_str(args, "fbrq_end").map(String::from),
+        market: opt_str(args, "market").map(String::from),
+        area: opt_str(args, "area").map(String::from),
+        zsx_type: opt_str(args, "zsx_type").map(String::from),
+        top_k: Some(opt_u32(args, "top_k").unwrap_or(20).clamp(1, 50)),
+    };
+    ssgsgg_summary(&params)?;
+    Ok(params)
+}
+
+fn ssgsgg_summary(params: &yuandian::SsgsggSearchParams) -> Result<String, ToolError> {
+    params
+        .name
+        .as_ref()
+        .or(params.jc.as_ref())
+        .or(params.title.as_ref())
+        .or(params.content.as_ref())
+        .or(params.zsx_type.as_ref())
+        .or(params.market.as_ref())
+        .or(params.area.as_ref())
+        .cloned()
+        .ok_or_else(|| {
+            ToolError::InvalidArgs(
+                "上市公司公告检索至少填写一个检索字段(top_k 不算),否则官方直接返回失败".into(),
+            )
+        })
+}
+
+pub struct ListedAnnouncementSearch;
+
+#[async_trait]
+impl Tool for ListedAnnouncementSearch {
+    fn name(&self) -> &str {
+        "search_listed_announcements"
+    }
+    fn description(&self) -> &str {
+        include_str!("descriptions/search_listed_announcements.md")
+    }
+    fn parameters_schema(&self) -> Value {
+        super::yuandian_schema::listed_announcement_search()
+    }
+
+    async fn execute(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolResult, ToolError> {
+        let params = ssgsgg_params_from_args(args)?;
+        let summary = ssgsgg_summary(&params)?;
+        let cache_params = serde_json::to_value(&params).map_err(|error| {
+            ToolError::Runtime(format!("上市公司公告检索缓存参数序列化失败:{error}"))
+        })?;
+        if let Some(r) = try_kb_hit(ctx, "rh_ssgsgg_search", &cache_params) {
+            return Ok(r);
+        }
+        // 不走 local_first_gate:本地 KB 没有上市公司公告这一数据源,
+        // 走企业域会拿企业调查报告冒名顶替公告结果。同参数缓存(try_kb_hit)仍然生效。
+        let api_key = yuandian_credential(ctx).await?;
+        let resp = yuandian::search_ssgsgg_with_params(api_key, &params).await?;
+        Ok(save_and_wrap(
+            ctx,
+            "rh_ssgsgg_search",
+            &cache_params,
+            &summary,
             resp,
         ))
     }

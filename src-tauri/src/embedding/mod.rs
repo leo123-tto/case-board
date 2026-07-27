@@ -11,12 +11,21 @@
 
 pub mod index;
 
+use crate::credentials_bridge::{BridgeCredentialConsumer, PendingCredentialSource};
 use serde::Deserialize;
 use std::time::Duration;
 
 /// 默认 endpoint / model：硅基流动 bge-m3。设置留空时用这两个值兜底。
 pub const DEFAULT_ENDPOINT: &str = "https://api.siliconflow.cn/v1/embeddings";
 pub const DEFAULT_MODEL: &str = "BAAI/bge-m3";
+
+pub fn credential_source() -> PendingCredentialSource {
+    PendingCredentialSource::pending(
+        BridgeCredentialConsumer::EmbeddingProvider,
+        "settings:embedding_api_key",
+        "embedding",
+    )
+}
 
 #[derive(Deserialize)]
 struct EmbeddingResponse {
@@ -33,12 +42,9 @@ struct EmbeddingData {
 pub async fn embed(
     endpoint: &str,
     model: &str,
-    key: &str,
+    credential: &PendingCredentialSource,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, String> {
-    if key.trim().is_empty() {
-        return Err("未配置 embedding API key,请到设置里填写".into());
-    }
     if texts.is_empty() {
         return Ok(vec![]);
     }
@@ -57,18 +63,25 @@ pub async fn embed(
         .build()
         .map_err(|e| format!("构造 HTTP 客户端失败: {e}"))?;
     let body = serde_json::json!({ "model": md, "input": texts });
-    let resp = client
-        .post(ep)
-        .header("Authorization", format!("Bearer {key}"))
-        .json(&body)
+    let material = credential.issue_material().await?;
+    let request = material.with_secret(|secret| {
+        client
+            .post(ep)
+            .header("Authorization", format!("Bearer {secret}"))
+            .json(&body)
+    });
+    let resp = request
         .send()
         .await
-        .map_err(|e| format!("请求 embedding 失败: {e}"))?;
+        .map_err(|e| format!("请求 embedding 失败: {}", material.redact(&e.to_string())))?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("读取 embedding 响应失败: {e}"))?;
+    let text = resp.text().await.map_err(|e| {
+        format!(
+            "读取 embedding 响应失败: {}",
+            material.redact(&e.to_string())
+        )
+    })?;
+    let text = material.redact(&text);
     if !status.is_success() {
         return Err(format!(
             "embedding API {}: {}",
@@ -86,8 +99,12 @@ pub async fn embed(
 }
 
 /// 验证 embedding 配置:embed 一个探针词,成功返回向量维度(给设置页验证按钮显示)。
-pub async fn verify(endpoint: &str, model: &str, key: &str) -> Result<usize, String> {
-    let v = embed(endpoint, model, key, &["法律检索探针".to_string()]).await?;
+pub async fn verify(
+    endpoint: &str,
+    model: &str,
+    credential: &PendingCredentialSource,
+) -> Result<usize, String> {
+    let v = embed(endpoint, model, credential, &["法律检索探针".to_string()]).await?;
     v.first()
         .map(|e| e.len())
         .ok_or_else(|| "embedding 返回空向量".to_string())

@@ -5,7 +5,7 @@
 //! - 我们靠"昨日快照 vs 今日 fetch 余额 delta"算今日消费
 //! - 每天保存一次快照(`deepseek_balance_snapshots` 表)
 //!
-//! API key 从 `settings.cloud_llm_api_key` 读(已经存在用户设置里)。
+//! API key 只通过 credential bridge 的 `llm.deepseek` typed lease 短期获取。
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -34,6 +34,8 @@ pub struct DeepSeekBalance {
 pub enum DeepSeekError {
     #[error("DeepSeek API key 未配置")]
     NoApiKey,
+    #[error("DeepSeek 凭据不可用:{0}")]
+    Credential(String),
     #[error("网络请求失败:{0}")]
     Network(String),
     #[error("DeepSeek 返回非 200 状态:{0} - {1}")]
@@ -69,16 +71,16 @@ struct BalanceResponse {
 /// 拉 DeepSeek 当前余额 + 计算今日消费 + 写当天快照。
 ///
 /// 流程:
-///   1. 读 settings.cloud_llm_api_key
+///   1. 通过 `llm.deepseek` typed lease 获取短期 credential material
 ///   2. fetch GET /user/balance + Bearer Authorization
 ///   3. 找 currency=CNY 那条
 ///   4. 算今日消费:今天 0 点之前最近的一条快照 - 当前 totalBalance
 ///   5. UPSERT 今天的快照(每天保留一条,刷新 fetched_at + total_balance)
 pub async fn fetch_balance_and_persist(
     pool: &SqlitePool,
-    api_key: &str,
+    config: &crate::llm::LlmConfig,
 ) -> Result<DeepSeekBalance, DeepSeekError> {
-    if api_key.trim().is_empty() {
+    if config.credential_identity() != Some(("settings:cloud_llm_api_key", "llm.deepseek")) {
         return Err(DeepSeekError::NoApiKey);
     }
 
@@ -88,18 +90,28 @@ pub async fn fetch_balance_and_persist(
         .build()
         .map_err(|e| DeepSeekError::Network(e.to_string()))?;
 
-    let resp = client
+    let request = client
         .get(BALANCE_ENDPOINT)
-        .bearer_auth(api_key)
         .header("Accept", "application/json")
-        .header("Cache-Control", "no-cache")
-        .send()
+        .header("Cache-Control", "no-cache");
+    let (request, credential) = config
+        .authorize_request(request)
         .await
-        .map_err(|e| DeepSeekError::Network(e.to_string()))?;
+        .map_err(DeepSeekError::Credential)?;
+    let resp = request.send().await.map_err(|e| {
+        let message = credential
+            .as_ref()
+            .map_or_else(|| e.to_string(), |value| value.redact(&e.to_string()));
+        DeepSeekError::Network(message)
+    })?;
 
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
+        let body = match credential.as_ref() {
+            Some(value) => value.redact(&body),
+            None => body,
+        };
         return Err(DeepSeekError::HttpStatus(status.as_u16(), body));
     }
 

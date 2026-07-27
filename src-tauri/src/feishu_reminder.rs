@@ -10,10 +10,13 @@ use chrono::{Datelike, Local, NaiveDate, NaiveTime};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
+use crate::credentials_bridge::{BridgeCredentialConsumer, PendingCredentialSource};
 use crate::settings;
 
 const DEFAULT_TIME: &str = "09:00";
 const DEFAULT_DAYS: u32 = 7;
+const WEBHOOK_STABLE_ID: &str = "settings:feishu_webhook_url";
+const WEBHOOK_PROVIDER_ID: &str = "feishu.reminder";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReminderItem {
@@ -82,6 +85,64 @@ fn parse_feishu_response(status: u16, body: &str) -> Result<(), String> {
         return Err(format!("飞书 Webhook 返回 code={code}: {message}"));
     }
     Ok(())
+}
+
+fn bounded_redacted_webhook_error(value: &str, secret: &str) -> String {
+    let mut redacted = value.replace(secret, "[REDACTED]");
+    if let Ok(url) = reqwest::Url::parse(secret) {
+        if let Some(token) = url.path_segments().and_then(Iterator::last) {
+            if !token.is_empty() {
+                redacted = redacted.replace(token, "[REDACTED]");
+            }
+        }
+    }
+    redacted.chars().take(512).collect()
+}
+
+fn parse_feishu_response_with_secret(status: u16, body: &str, secret: &str) -> Result<(), String> {
+    parse_feishu_response(status, body)
+        .map_err(|error| bounded_redacted_webhook_error(&error, secret))
+}
+
+fn validate_feishu_webhook_target(raw: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw.trim())
+        .map_err(|_| "飞书 Webhook 必须是有效的 HTTPS URL".to_string())?;
+    if url.scheme() != "https" {
+        return Err("飞书 Webhook 必须使用 HTTPS".into());
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("飞书 Webhook URL 含有不允许的认证、端口或附加参数".into());
+    }
+    if !matches!(
+        url.host_str(),
+        Some("open.feishu.cn" | "open.larksuite.com")
+    ) {
+        return Err("飞书 Webhook 仅允许官方飞书或 Lark 域名".into());
+    }
+    let segments = url
+        .path_segments()
+        .map(Iterator::collect::<Vec<_>>)
+        .unwrap_or_default();
+    if segments.len() != 5
+        || segments[..4] != ["open-apis", "bot", "v2", "hook"]
+        || segments[4].is_empty()
+    {
+        return Err("飞书 Webhook 路径格式无效".into());
+    }
+    Ok(url)
+}
+
+pub fn credential_source() -> PendingCredentialSource {
+    PendingCredentialSource::pending(
+        BridgeCredentialConsumer::FeishuConnector,
+        WEBHOOK_STABLE_ID,
+        WEBHOOK_PROVIDER_ID,
+    )
 }
 
 fn should_send(
@@ -282,11 +343,12 @@ async fn mark_sent(pool: &SqlitePool, date: NaiveDate, item_count: usize) -> Res
     Ok(())
 }
 
-pub async fn send_webhook(url: &str, content: &str) -> Result<(), String> {
-    let url = url.trim();
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err("飞书 Webhook URL 必须以 http:// 或 https:// 开头".into());
-    }
+pub async fn send_webhook(
+    credential: &PendingCredentialSource,
+    content: &str,
+) -> Result<(), String> {
+    let material = credential.issue_material().await?;
+    let url = validate_feishu_webhook_target(material.expose())?;
     let response = reqwest::Client::new()
         .post(url)
         .json(&serde_json::json!({
@@ -307,10 +369,10 @@ pub async fn send_webhook(url: &str, content: &str) -> Result<(), String> {
         })?;
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
-    parse_feishu_response(status, &body)
+    parse_feishu_response_with_secret(status, &body, material.expose())
 }
 
-pub async fn test_webhook(url: &str) -> Result<(), String> {
+pub async fn test_webhook(credential: &PendingCredentialSource) -> Result<(), String> {
     let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
     let message = build_message(&[ReminderGroup {
         case_name: "CaseBoard 测试".into(),
@@ -320,42 +382,58 @@ pub async fn test_webhook(url: &str) -> Result<(), String> {
             content: "这是一条来自 CaseBoard 的测试消息 ✅".into(),
         }],
     }]);
-    send_webhook(url, &message).await
+    send_webhook(credential, &message).await
+}
+
+struct ReminderConfig {
+    credential: PendingCredentialSource,
+    target: NaiveTime,
+    days: u32,
+}
+
+fn reminder_config_from_snapshot(current: &settings::Settings) -> Option<ReminderConfig> {
+    if !current.feishu_reminder_enabled.unwrap_or(false)
+        || current
+            .device_sync
+            .as_ref()
+            .is_some_and(|identity| !identity.is_primary())
+    {
+        return None;
+    }
+    Some(ReminderConfig {
+        credential: credential_source(),
+        target: current
+            .feishu_reminder_time
+            .as_deref()
+            .and_then(|value| NaiveTime::parse_from_str(value, "%H:%M").ok())
+            .unwrap_or_else(|| NaiveTime::parse_from_str(DEFAULT_TIME, "%H:%M").unwrap()),
+        days: current.feishu_reminder_days.unwrap_or(DEFAULT_DAYS),
+    })
 }
 
 async fn run_once(pool: &SqlitePool) -> Result<(), String> {
-    if !crate::device_sync::is_automation_owner() {
-        return Ok(());
-    }
     let current = settings::read_settings()?;
-    if !current.feishu_reminder_enabled.unwrap_or(false) {
+    let Some(config) = reminder_config_from_snapshot(&current) else {
         return Ok(());
-    }
-    let url = current
-        .feishu_webhook_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .ok_or_else(|| "飞书手机提醒已开启，但未填写 Webhook URL".to_string())?;
-    let target = current
-        .feishu_reminder_time
-        .as_deref()
-        .and_then(|value| NaiveTime::parse_from_str(value, "%H:%M").ok())
-        .unwrap_or_else(|| NaiveTime::parse_from_str(DEFAULT_TIME, "%H:%M").unwrap());
+    };
     let now = Local::now();
     let today = now.date_naive();
-    if !should_send(today, now.time(), target, last_sent_date(pool).await?) {
+    if !should_send(
+        today,
+        now.time(),
+        config.target,
+        last_sent_date(pool).await?,
+    ) {
         return Ok(());
     }
 
-    let days = current.feishu_reminder_days.unwrap_or(DEFAULT_DAYS);
     let end = today
-        .checked_add_days(chrono::Days::new(days as u64))
+        .checked_add_days(chrono::Days::new(config.days as u64))
         .ok_or_else(|| "飞书提醒日期范围溢出".to_string())?;
     let groups = collect_pending_between(pool, today, end).await?;
     let item_count = groups.iter().map(|group| group.items.len()).sum();
     if !groups.is_empty() {
-        send_webhook(url, &build_message(&groups)).await?;
+        send_webhook(&config.credential, &build_message(&groups)).await?;
     }
     mark_sent(pool, today, item_count).await
 }

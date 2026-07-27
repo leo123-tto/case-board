@@ -20,6 +20,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::credentials_bridge::{BridgeCredentialConsumer, PendingCredentialSource};
+
 const MB: u64 = 1024 * 1024;
 
 /// MinerU 精准 API 的文件大小上限(200MB,API 硬上限)。
@@ -117,10 +119,10 @@ pub struct OcrContext {
     /// - `true` → 走云端 OCR(需至少一个 token)
     /// - `false` → 走本机 MiniCPM-V vision(慢一点,但 0 上传)
     pub cloud_enabled: bool,
-    /// MinerU API token(Settings.mineru_api_key)
-    pub mineru_token: Option<String>,
-    /// PaddleOCR VL-1.6 token(Settings.paddle_vl_api_key,2026-06-12)
-    pub paddle_vl_token: Option<String>,
+    /// MinerU typed credential locator，不含 secret。
+    pub mineru_credential: Option<PendingCredentialSource>,
+    /// PaddleOCR/PP-OCRv6 typed credential locator，不含 secret。
+    pub paddle_vl_credential: Option<PendingCredentialSource>,
     /// 云端 OCR 主力:`"mineru"`(默认)/ `"paddle-vl"`(Settings.effective_ocr_cloud_primary)。
     /// 主力失败 / 超时 / 额度用完时,若另一家 token 已填则自动切换(动态主备)。
     pub cloud_primary: String,
@@ -132,6 +134,32 @@ pub struct OcrContext {
     /// 轮询循环每拍 `send` 一次 [`OcrPollUpdate`],前端据此显示"排队 / 识别中(已 N 秒)"。
     /// `None` = 不上报(测试 / 本地模式 / 不关心进度的调用)。`#[derive(Default)]` 下默认 None。
     pub poll_tx: Option<tokio::sync::mpsc::UnboundedSender<OcrPollUpdate>>,
+}
+
+impl OcrContext {
+    pub fn from_settings(settings: &crate::settings::Settings) -> Self {
+        let cloud = settings.effective_ocr_provider() == "cloud";
+        Self {
+            cloud_enabled: cloud,
+            mineru_credential: cloud.then(|| {
+                PendingCredentialSource::pending(
+                    BridgeCredentialConsumer::OcrProvider,
+                    "settings:mineru_api_key",
+                    "ocr.mineru",
+                )
+            }),
+            paddle_vl_credential: cloud.then(|| {
+                PendingCredentialSource::pending(
+                    BridgeCredentialConsumer::OcrProvider,
+                    "settings:paddle_vl_api_key",
+                    "ocr.paddle_vl",
+                )
+            }),
+            cloud_primary: settings.effective_ocr_cloud_primary().to_string(),
+            force_backend: None,
+            poll_tx: None,
+        }
+    }
 }
 
 /// 把本地文件转换成流式 HTTP body。旧实现会先 `std::fs::read` 整份文件；8 路并发遇到
@@ -211,14 +239,9 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
     if let Some(fb) = ctx.force_backend.as_deref() {
         if fb == "ppocrv6" {
             // PP-OCRv6 走 AIStudio,复用 PaddleOCR 的 token(同平台同账号)。
-            let token = ctx
-                .paddle_vl_token
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty());
-            let Some(token) = token else {
+            let Some(source) = ctx.paddle_vl_credential.as_ref() else {
                 return OcrResult::Failed {
-                    error: "去水印 OCR(PP-OCRv6)需在设置里填 PaddleOCR(百度 AI Studio)token".into(),
+                    error: "credential_missing: settings:paddle_vl_api_key".into(),
                     attempted: vec!["ppocrv6"],
                 };
             };
@@ -228,9 +251,18 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
                     attempted: vec!["ppocrv6"],
                 };
             }
+            let material = match source.issue_material().await {
+                Ok(material) => material,
+                Err(error) => {
+                    return OcrResult::Failed {
+                        error,
+                        attempted: vec!["ppocrv6"],
+                    }
+                }
+            };
             return match crate::ingest::ppocrv6_http::extract_with_ppocrv6(
                 path,
-                token,
+                material.expose(),
                 PADDLE_VL_TIMEOUT_SEC,
                 ctx.poll_tx.as_ref(),
             )
@@ -242,7 +274,7 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
                     elapsed_ms: started.elapsed().as_millis(),
                 },
                 Err(e) => OcrResult::Failed {
-                    error: format!("ppocrv6: {}", e),
+                    error: format!("ppocrv6: {}", material.redact(&e)),
                     attempted: vec!["ppocrv6"],
                 },
             };
@@ -260,21 +292,15 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
                 ),
             };
         }
-        let mineru_token = ctx
-            .mineru_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty());
-        let paddle_token = ctx
-            .paddle_vl_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty());
-
-        // (backend 名, token)。effective_ocr_cloud_primary 已保证选 paddle-vl 时 key 必填,
-        // 这里再按 token 实际有无过滤一遍,防 Settings 旁路改出空 key。
-        let mineru_entry = mineru_token.map(|t| ("mineru-precision", t));
-        let paddle_entry = paddle_token.map(|t| ("paddle-vl", t));
+        // (backend 名, non-secret credential locator)。每个真实后端尝试独立签发 lease。
+        let mineru_entry = ctx
+            .mineru_credential
+            .as_ref()
+            .map(|source| ("mineru-precision", source));
+        let paddle_entry = ctx
+            .paddle_vl_credential
+            .as_ref()
+            .map(|source| ("paddle-vl", source));
 
         // 2026-06-16:office 文档(doc/rtf/odt/ppt/xls 等)**只有 MinerU 能解析,Paddle 不支持**。
         // 这类文件强制只走 MinerU(跳过 Paddle,别浪费一次必失败的调用);只配了 Paddle 没配
@@ -284,7 +310,7 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
             .and_then(|n| n.to_str())
             .map(|n| crate::ingest::extractor::is_office_cloud_ext(&n.to_lowercase()))
             .unwrap_or(false);
-        let order: Vec<(&'static str, &str)> = if is_office {
+        let order: Vec<(&'static str, &PendingCredentialSource)> = if is_office {
             match mineru_entry {
                 Some(e) => vec![e],
                 None => {
@@ -312,7 +338,7 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
         let total = order.len();
         let mut attempted: Vec<&'static str> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
-        for (i, (backend, token)) in order.into_iter().enumerate() {
+        for (i, (backend, source)) in order.into_iter().enumerate() {
             // 有备用时主力收紧到 300s(排队严重早点切);最后一棒给足 900s
             let timeout = if i + 1 < total {
                 PRIMARY_TIMEOUT_WITH_FALLBACK_SEC
@@ -329,17 +355,30 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
                 errors.push(format!("{}: {}", backend, e));
                 continue;
             }
+            let material = match source.issue_material().await {
+                Ok(material) => material,
+                Err(error) => {
+                    if i + 1 < total {
+                        crate::dlog!("[ocr] 后端 {} 凭据不可用，切换备用", backend);
+                    }
+                    errors.push(format!("{backend}: {error}"));
+                    continue;
+                }
+            };
             let result = match backend {
                 "paddle-vl" => {
                     crate::ingest::paddle_vl_http::extract_with_paddle_vl(
                         path,
-                        token,
+                        material.expose(),
                         timeout,
                         ctx.poll_tx.as_ref(),
                     )
                     .await
                 }
-                _ => run_mineru_precision(path, token, timeout, ctx.poll_tx.as_ref()).await,
+                _ => {
+                    run_mineru_precision(path, material.expose(), timeout, ctx.poll_tx.as_ref())
+                        .await
+                }
             };
             match result {
                 Ok(text) => {
@@ -350,10 +389,11 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
                     }
                 }
                 Err(e) => {
+                    let error = material.redact(&e);
                     if i + 1 < total {
-                        crate::dlog!("[ocr] 主力 {} 失败,自动切换备用: {}", backend, e);
+                        crate::dlog!("[ocr] 主力 {} 失败,自动切换备用: {}", backend, error);
                     }
-                    errors.push(format!("{}: {}", backend, e));
+                    errors.push(format!("{}: {}", backend, error));
                 }
             }
         }

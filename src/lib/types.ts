@@ -762,6 +762,8 @@ export interface LawyerProfile {
 /** 外部 MCP server 配置项(对应 Rust chat::mcp_bridge::McpServerConfig)。
  *  transport 是 tagged union,形状必须跟后端 serde 完全一致,否则整次保存会反序列化失败。 */
 export interface McpServerConfig {
+  /** 持久、不可变的随机 UUID；改名或修改 transport 时必须原样保留。 */
+  instance_id: string;
   /** 人读名,也用作工具命名空间前缀(mcp__<name>__<tool>)。 */
   name: string;
   transport: McpTransport;
@@ -878,6 +880,90 @@ export interface TeamStatus {
   roster: TeamRoster | null;
 }
 
+/* ------------------------------------------------------------------ */
+/* Credential bridge metadata-only frontend contract                  */
+/* ------------------------------------------------------------------ */
+
+/** 持久凭据引用；只指向 bridge revision，不包含 secret。 */
+export interface CredentialRefV1 {
+  handle: string;
+  revision: number;
+}
+
+/** 普通状态查询的唯一前端形状；查询不得打开 vault。 */
+export interface CredentialStatusView extends CredentialRefV1 {
+  state:
+    | "pending_migration"
+    | "unverified"
+    | "valid"
+    | "expired"
+    | "revoked"
+    | "unreadable"
+    | "legacy_system_pending"
+    | "legacy_system_declined"
+    | "legacy_system_failed";
+  secret_present: boolean;
+}
+
+export type CredentialKind =
+  | "api_key"
+  | "pi_credential_bundle"
+  | "oauth_access_token"
+  | "oauth_refresh_token"
+  | "password"
+  | "webhook_secret"
+  | "app_token"
+  | "app_secret"
+  | "verification_token"
+  | "encryption_key"
+  | "mcp_secret"
+  | "sync_key"
+  | "session_cookie";
+
+export type CredentialOwnerScope =
+  | { scope: "global" }
+  | {
+      scope: "provider" | "connector" | "workspace" | "case" | "device_group" | "team";
+      id: string;
+    };
+
+export interface CredentialMetadata extends CredentialStatusView {
+  provider_or_connector_id: string;
+  kind: CredentialKind;
+  owner_scope: CredentialOwnerScope;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export type LegacySystemImportState =
+  | "pending"
+  | "imported"
+  | "already_imported"
+  | "missing"
+  | "unreadable"
+  | "failed";
+
+export interface LegacySystemImportItem {
+  stable_inventory_id: string;
+  provider_or_connector_id: string;
+  state: LegacySystemImportState;
+  handle: string | null;
+  revision: number | null;
+  expired: boolean;
+  reconnect_required: boolean;
+  error: string | null;
+}
+
+export interface LegacyCredentialMigrationStatus {
+  pending: boolean;
+  pending_count: number;
+  declined: boolean;
+  failed: boolean;
+  attempted: boolean;
+  last_attempted_at_ms: number | null;
+  items: LegacySystemImportItem[];
+}
+
 /** 团队看板里的单个案件(登记表粒度快照)。 */
 export interface TeamSnapshotCase {
   /** 案件在所有人本机的 id(编辑请求定位用;老快照可能为空串)。 */
@@ -970,6 +1056,10 @@ export interface UpdateInfo {
   released_at: string | null;
   notes: string | null;
   download_url: string | null;
+  /** 兼容性更新通道。未知平台不分配通道。 */
+  channel: "stable" | "legacy" | null;
+  /** 与 Rust 提示 manifest 同源,原样传给 Tauri updater `check({ target })`。 */
+  updater_target: string | null;
   error: string | null;
 }
 

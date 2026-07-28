@@ -133,6 +133,9 @@ type CompatSettingKey =
   | "custom_llm_model";
 type CompatFieldKind = "endpoint" | "model";
 
+/** 停止修改后多久自动保存(2026-07-27 老板要求:改完自动落盘,省得忘点保存;按钮保留)。 */
+const AUTO_SAVE_DELAY_MS = 1_500;
+
 const PI_THINKING_LEVELS: PiThinkingLevel[] = [
   "off",
   "minimal",
@@ -711,17 +714,33 @@ export function SettingsModal({
     onDirtyChange?.(dirty);
   }, [dirty, onDirtyChange]);
 
-  async function handleSave() {
-    if (!settings) return;
+  // 自动保存与并发防护(2026-07-27 真机反馈:改 Pi 模型后忘点/点了保存无感知失败)。
+  const savingRef = useRef(false);
+  const persistSettingsRef = useRef<(reason: "manual" | "auto") => Promise<boolean>>(
+    async () => false,
+  );
+  const settingsLiveRef = useRef<Settings | null>(null);
+  settingsLiveRef.current = settings;
+  const dirtyRef = useRef(false);
+  dirtyRef.current = dirty;
+
+  /**
+   * 共享保存例程:manual=点保存按钮;auto=防抖自动保存/卸载兜底。
+   * 失败一律弹显眼 toast —— 此前失败只在页面深处渲染错误块,用户完全无感知,
+   * 以为"保存按钮失灵"(2026-07-27 真机:切 Pi 模型保存不生效正是这样暴露的)。
+   */
+  async function persistSettings(_reason: "manual" | "auto"): Promise<boolean> {
+    const snapshot = settings;
+    if (!snapshot || savingRef.current) return false;
+    savingRef.current = true;
     setSaving(true);
     setError(null);
     try {
       const prepared = prepareSettingsForSave({
-        ...settings,
-        weather_city: normalizeWeatherCity(settings.weather_city),
+        ...snapshot,
+        weather_city: normalizeWeatherCity(snapshot.weather_city),
       });
       await saveSettings(prepared);
-      setSettings(prepared);
       const savedWeatherCity = normalizeWeatherCity(prepared.weather_city);
       if (savedWeatherCity !== savedWeatherCityRef.current) {
         savedWeatherCityRef.current = savedWeatherCity;
@@ -730,27 +749,55 @@ export function SettingsModal({
       for (const [name, value] of Object.entries(featureFlagDraft)) {
         setFeatureFlag(name as FeatureFlagName, value);
       }
-      setDirty(false);
+      if (settingsLiveRef.current === snapshot) {
+        // 保存期间用户没有继续改 → 落地规范化结果并清 dirty。
+        setSettings(prepared);
+        setDirty(false);
+      }
+      // 若保存期间又有新修改:保留新草稿与 dirty,防抖会再次自动保存,不吞用户输入。
       // 2026-05-27 · 两种模式都要通知父组件 settings 已经变了,父组件据此重判依赖项
       // (如 DeepSeek 余额 chip 是否显示)。修复同事场景:onboarding 选"稍后再配置"
       // 进 page 模式补填 key,保存后 chip 不出现 —— 因为 page 模式只显示 toast、不触发
       // onClose,父组件的 showDeepSeekChip 状态从未更新。
       onSaved?.();
-      if (isPage) {
-        // page 模式:不关闭页面,显示"已保存"提示
-        setSaved(true);
-        setSaving(false);
-        // 3 秒后清掉"已保存"提示
-        setTimeout(() => setSaved(false), 3000);
-      } else {
-        // modal 模式:保存成功 → 自动关闭(作者 2026-05-23 晚九 反馈)
-        handleClose();
-      }
+      setSaved(true);
+      setTimeout(() => setSaved(false), 3000);
+      return true;
     } catch (e) {
       setError(String(e));
+      toast(`设置保存失败：${String(e)}`, "error", 8000);
+      return false;
+    } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   }
+  persistSettingsRef.current = persistSettings;
+
+  async function handleSave() {
+    const ok = await persistSettings("manual");
+    // modal 模式:保存成功 → 自动关闭(作者 2026-05-23 晚九 反馈);page 模式留在原页显示"已保存"。
+    if (ok && !isPage) handleClose();
+  }
+
+  // 2026-07-27 · 防抖自动保存:停止修改 1.5s 后自动落盘,省得忘点保存;保存按钮保留。
+  // settings/dirty 每变一次都会重置计时器;正在保存时由 savingRef 防重入,
+  // 保存期间的新修改保持 dirty → 下一轮防抖续保。
+  useEffect(() => {
+    if (!dirty || !settings) return;
+    const timer = window.setTimeout(() => {
+      void persistSettingsRef.current("auto");
+    }, AUTO_SAVE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [dirty, settings]);
+
+  // 卸载兜底:防抖计时器没走完就关页/切走时,把未保存草稿直接落盘。
+  useEffect(
+    () => () => {
+      if (dirtyRef.current) void persistSettingsRef.current("auto");
+    },
+    [],
+  );
 
   function updateField<K extends keyof Settings>(key: K, value: Settings[K]) {
     setSettings((prev) => (prev ? { ...prev, [key]: value } : prev));

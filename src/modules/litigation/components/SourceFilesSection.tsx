@@ -19,12 +19,11 @@ import {
   X,
 } from "lucide-react";
 
-import { type Document, STAGE_ORDER } from "@/lib/types";
+import { type Document } from "@/lib/types";
 import { formatBytes } from "@/lib/format";
 import { cn, docDisplayName } from "@/lib/utils";
 import { useFeatureFlag } from "@/lib/featureFlags";
 
-import { type GroupKey } from "../lib/groupByStage";
 import { documentMatchesSearch } from "../lib/documentSearch";
 import {
   buildFileTree,
@@ -47,7 +46,7 @@ import {
 } from "../lib/docMarks";
 
 /** 源文件区视图模式:AI 视图 / 原始视图 / 源结构视图 */
-type ViewMode = "folder" | "stage" | "organize";
+type ViewMode = "folder" | "organize";
 
 const PARTY_SIDES = ["原告", "被告", "第三人"] as const;
 
@@ -62,6 +61,9 @@ export interface MarkHandlers {
   onMarkSubmissionStage: (docIds: string[], value: SubmissionStage | null) => void;
   /** 重命名(板内显示名,单文档;name=null/空=清回原文件名) */
   onRename: (docId: string, name: string | null) => void;
+  /** 2026-07-28:「原始视图」下线后,单份材料的重抽/去水印重识别改挂右键菜单,能力不丢。 */
+  onReextract?: (doc: Document) => void;
+  onReextractDewatermark?: (doc: Document) => void;
 }
 
 /* ------------------------------------------------------------------ */
@@ -71,7 +73,6 @@ export interface MarkHandlers {
 export function SourceFilesSection({
   total,
   aiArtifacts,
-  groups,
   documents,
   sourceFolder,
   markMap,
@@ -97,7 +98,6 @@ export function SourceFilesSection({
 }: {
   total: number;
   aiArtifacts: Document[];
-  groups: Record<GroupKey, Document[]>;
   /** 全部文档(含 AI 产物);原结构视图用非产物的源文件派生文件夹树 */
   documents: Document[];
   /** 案件源文件夹绝对路径,派生原结构相对路径用 */
@@ -152,6 +152,8 @@ export function SourceFilesSection({
     onMarkEvidenceAttitude,
     onMarkSubmissionStage,
     onRename,
+    onReextract,
+    onReextractDewatermark,
   };
   const failedDocs = sourceDocs.filter((doc) => doc.extraction_status === "failed");
   const failedCount = failedDocs.length;
@@ -247,36 +249,17 @@ export function SourceFilesSection({
       {expanded && (
         <div className="space-y-6 border-t border-border px-5 py-5">
           {failedDocs.length > 0 && (
-            <div
-              role="alert"
-              className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-3 text-xs text-amber-950"
-            >
-              <p className="font-medium">
-                {failedDocs.length} 份材料处理失败。请先按下面原因修复，再重试失败材料。
-              </p>
-              <ul className="mt-2 space-y-1">
-                {failedDocs.slice(0, 8).map((doc) => (
-                  <li key={doc.id} className="break-words">
-                    <span className="font-medium">{docDisplayName(doc)}</span>
-                    <span className="text-amber-800">
-                      {`：${doc.last_error?.trim() || "OCR 或字段识别失败，未返回具体原因"}`}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-              {failedDocs.length > 8 && (
-                <p className="mt-2 text-amber-800">另有 {failedDocs.length - 8} 份失败材料。</p>
-              )}
-            </div>
+            <FailedDocsPanel
+              docs={failedDocs}
+              onMarkImportance={onMarkImportance}
+            />
           )}
 
-          {/* 视图切换 */}
+          {/* 视图切换。2026-07-28:按处理阶段平铺的「原始视图」已下线 —— 它和 AI 视图、源结构
+              视图信息重复,处理状态在两个视图里都能看到。0.5 会进一步收敛成单一结构视图。 */}
           <div className="flex items-center gap-1 rounded-lg bg-muted/40 p-1 text-xs">
             <ViewTab active={viewMode === "organize"} onClick={() => setViewMode("organize")}>
               AI视图
-            </ViewTab>
-            <ViewTab active={viewMode === "stage"} onClick={() => setViewMode("stage")}>
-              原始视图
             </ViewTab>
             <ViewTab active={viewMode === "folder"} onClick={() => setViewMode("folder")}>
               源结构视图
@@ -304,39 +287,6 @@ export function SourceFilesSection({
             />
           )}
 
-          {viewMode === "stage" && (
-            <>
-              {STAGE_ORDER.map((stage) =>
-                groups[stage].length > 0 ? (
-                  <StageSection
-                    key={stage}
-                    title={stage}
-                    count={groups[stage].length}
-                    docs={groups[stage]}
-                    marks={marks}
-                    onOpenDoc={onOpenDoc}
-                    onRevealDoc={onRevealDoc}
-                    onReextract={onReextract}
-                    onReextractDewatermark={onReextractDewatermark}
-                  />
-                ) : null,
-              )}
-              {groups.其他.length > 0 && (
-                <StageSection
-                  title="其他"
-                  count={groups.其他.length}
-                  docs={groups.其他}
-                  dim
-                  marks={marks}
-                  onOpenDoc={onOpenDoc}
-                  onRevealDoc={onRevealDoc}
-                  onReextract={onReextract}
-                  onReextractDewatermark={onReextractDewatermark}
-                />
-              )}
-            </>
-          )}
-
           {viewMode === "organize" && (
             <OrganizeView
               docs={sourceDocs}
@@ -350,6 +300,22 @@ export function SourceFilesSection({
       )}
     </section>
   );
+}
+
+/**
+ * AI 摘要卡片副标题:历史 chip 产物的 category 存的是英文任务 slug(如 find_similar_cases),
+ * 展示层翻译成中文;save_artifact 文书的中文 doc_type 原样透传(2026-07-27 真机反馈)。
+ */
+function displayDocCategory(category: string): string {
+  const TASK_LABELS: Record<string, string> = {
+    compile_legal_basis: "法律依据",
+    find_similar_cases: "类案检索",
+    verify_my_draft: "草稿核校",
+    simulate_opposition: "模拟对抗",
+    requested_report: "AI报告",
+    free_chat: "AI助手",
+  };
+  return TASK_LABELS[category] ?? category;
 }
 
 function StageSection({
@@ -445,6 +411,87 @@ function ViewTab({
     >
       {children}
     </button>
+  );
+}
+
+/**
+ * 失败材料面板(2026-07-28)。
+ *
+ * 此前是把全部失败项平铺,34 份失败就长期占满整屏、还没法收起。改成:默认折叠成一行摘要,
+ * 展开后**按错误原因分组**(同一类错误折成一条,列出文件名),并给一个「全部标为忽略」——
+ * 因为真实场景里绝大多数反复失败的是解析器切出的图片碎片一类根本不该处理的东西,
+ * 标忽略后它们就不再 OCR、也不进 AI 上下文。
+ */
+function FailedDocsPanel({
+  docs,
+  onMarkImportance,
+}: {
+  docs: Document[];
+  onMarkImportance: (docIds: string[], value: Importance | null) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  // 同类错误折成一组。原始错误里带具体字数("太短(7 字)")会把同类拆散,先归一。
+  const groups = useMemo(() => {
+    const m = new Map<string, Document[]>();
+    for (const doc of docs) {
+      const raw = doc.last_error?.trim() || "OCR 或字段识别失败，未返回具体原因";
+      const key = raw.replace(/\d+\s*字/g, "N 字").slice(0, 160);
+      const list = m.get(key);
+      if (list) list.push(doc);
+      else m.set(key, [doc]);
+    }
+    return [...m.entries()].sort((a, b) => b[1].length - a[1].length);
+  }, [docs]);
+
+  return (
+    <div
+      role="alert"
+      className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-950"
+    >
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="flex flex-1 items-center gap-1.5 text-left font-medium hover:underline"
+        >
+          <ChevronDown className={cn("size-3.5 transition-transform", !open && "-rotate-90")} />
+          {docs.length} 份材料处理失败 · {groups.length} 类原因
+          <span className="font-normal text-amber-800">
+            {open ? "(点击收起)" : "(点击展开)"}
+          </span>
+        </button>
+        <button
+          type="button"
+          onClick={() => onMarkImportance(docs.map((d) => d.id), "忽略")}
+          title="把这些失败材料全部标为忽略:不再识别、不进 AI 上下文。常见于解析器切出的图片碎片等非案件材料。"
+          className="shrink-0 rounded border border-amber-400 px-2 py-0.5 text-amber-900 transition-colors hover:bg-amber-100"
+        >
+          全部标为忽略
+        </button>
+      </div>
+      {open && (
+        <ul className="mt-2 space-y-2">
+          {groups.map(([reason, list]) => (
+            <li key={reason}>
+              <div className="flex items-start gap-2">
+                <span className="flex-1 text-amber-800">{reason}</span>
+                <button
+                  type="button"
+                  onClick={() => onMarkImportance(list.map((d) => d.id), "忽略")}
+                  className="shrink-0 rounded border border-amber-400 px-1.5 text-[11px] text-amber-900 hover:bg-amber-100"
+                >
+                  忽略这 {list.length} 份
+                </button>
+              </div>
+              <p className="mt-0.5 break-all text-[11px] text-amber-700">
+                {list.slice(0, 6).map((d) => docDisplayName(d)).join("、")}
+                {list.length > 6 && ` …等 ${list.length} 份`}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -664,6 +711,16 @@ function FolderTreeView({
           onSubmissionStage={(v) => marks.onMarkSubmissionStage(menu.docIds, v)}
           onCategory={(v) => marks.onMarkCategory(menu.docIds, v)}
           onRename={menu.doc ? () => setRenaming(menu.doc!) : undefined}
+          onReextract={
+            menu.doc && marks.onReextract
+              ? () => marks.onReextract!(menu.doc!)
+              : undefined
+          }
+          onReextractDewatermark={
+            menu.doc && marks.onReextractDewatermark
+              ? () => marks.onReextractDewatermark!(menu.doc!)
+              : undefined
+          }
           onClose={() => setMenu(null)}
         />
       )}
@@ -849,7 +906,9 @@ function DocRow({
             {docDisplayName(doc)}
           </p>
           {doc.category && (
-            <p className="mt-0.5 text-xs text-muted-foreground">{doc.category}</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {displayDocCategory(doc.category)}
+            </p>
           )}
         </div>
       </button>
@@ -936,6 +995,7 @@ function OrganizeView({
   const [renaming, setRenaming] = useState<Document | null>(null);
   const [filters, setFilters] = useState<OrganizeFilters>({
     importance: new Set(),
+    hideIgnored: false,
     categories: new Set(),
     parties: new Set(),
     attitudes: new Set(),
@@ -1084,10 +1144,11 @@ function OrganizeView({
   );
 }
 
-type ImportanceFilter = Importance | "普通";
+type ImportanceFilter = Exclude<Importance, "忽略"> | "普通";
 
 interface OrganizeFilters {
   importance: Set<ImportanceFilter>;
+  hideIgnored: boolean;
   categories: Set<string>;
   parties: Set<string>;
   attitudes: Set<EvidenceAttitude>;
@@ -1099,6 +1160,7 @@ interface OrganizeFilters {
 function emptyOrganizeFilters(): OrganizeFilters {
   return {
     importance: new Set(),
+    hideIgnored: false,
     categories: new Set(),
     parties: new Set(),
     attitudes: new Set(),
@@ -1111,6 +1173,7 @@ function emptyOrganizeFilters(): OrganizeFilters {
 function hasActiveOrganizeFilters(filters: OrganizeFilters): boolean {
   return (
     filters.aiOnly ||
+    filters.hideIgnored ||
     filters.importance.size > 0 ||
     filters.categories.size > 0 ||
     filters.parties.size > 0 ||
@@ -1138,8 +1201,10 @@ function matchesOrganizeFilters(
   const mark = markMap.get(doc.id) ?? EMPTY_MARK;
   if (!documentMatchesSearch(doc, mark, filters.query)) return false;
   if (filters.aiOnly && !docHasAiSuggestion(doc, mark)) return false;
+  if (filters.hideIgnored && mark.importance === "忽略") return false;
   if (filters.importance.size > 0) {
-    const importance = mark.importance ?? "普通";
+    if (mark.importance === "忽略") return false;
+    const importance: ImportanceFilter = mark.importance ?? "普通";
     if (!filters.importance.has(importance)) return false;
   }
   if (filters.categories.size > 0) {
@@ -1198,8 +1263,11 @@ function OrganizeFilterBar({
         <FilterChip active={filters.categories.has("参考材料")} onClick={() => setCategory("参考材料")}>
           参考
         </FilterChip>
-        <FilterChip active={filters.importance.has("忽略")} onClick={() => setImportance("忽略")}>
-          忽略
+        <FilterChip
+          active={filters.hideIgnored}
+          onClick={() => onChange({ ...filters, hideIgnored: !filters.hideIgnored })}
+        >
+          隐藏已忽略
         </FilterChip>
         <FilterChip active={filters.importance.has("普通")} onClick={() => setImportance("普通")}>
           普通
@@ -1328,6 +1396,8 @@ function MarkContextMenu({
   onEvidenceAttitude,
   onSubmissionStage,
   onRename,
+  onReextract,
+  onReextractDewatermark,
   onClose,
 }: {
   x: number;
@@ -1343,6 +1413,9 @@ function MarkContextMenu({
   onCategory?: (v: string | null) => void;
   /** 仅单文件提供 → 显示「重命名」(打开重命名弹窗) */
   onRename?: () => void;
+  /** 仅单文件提供 → 重新抽取 / 去水印重识别(「原始视图」下线后的落点) */
+  onReextract?: () => void;
+  onReextractDewatermark?: () => void;
   onClose: () => void;
 }) {
   const menuRef = useRef<HTMLDivElement>(null);
@@ -1412,6 +1485,37 @@ function MarkContextMenu({
             <Pencil className="size-3 text-sky-600" />
             重命名
           </button>
+          <div className="my-1 border-t border-border" />
+        </>
+      )}
+      {(onReextract || onReextractDewatermark) && (
+        <>
+          {onReextract && (
+            <button
+              type="button"
+              className={item}
+              onClick={() => {
+                onReextract();
+                onClose();
+              }}
+            >
+              <RefreshCw className="size-3 text-sky-600" />
+              重新抽取
+            </button>
+          )}
+          {onReextractDewatermark && (
+            <button
+              type="button"
+              className={item}
+              onClick={() => {
+                onReextractDewatermark();
+                onClose();
+              }}
+            >
+              <RefreshCw className="size-3 text-violet-600" />
+              去水印重识别
+            </button>
+          )}
           <div className="my-1 border-t border-border" />
         </>
       )}

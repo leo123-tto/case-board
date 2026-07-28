@@ -15,4 +15,5 @@ pub mod ocr_throttle;
 pub mod paddle_vl_http;
 pub mod pipeline;
 pub mod ppocrv6_http;
+pub mod sanitize;
 pub mod scanner;

@@ -36,6 +36,22 @@ const ROUND_CONCURRENCY: [usize; 3] = [8, 4, 1];
 /// 每轮之间的缓冲 sleep(秒),给服务端限流计数器恢复
 const INTER_ROUND_SLEEP_SEC: u64 = 3;
 
+/// 用户手工标「忽略」的材料被排除时,`last_error` 的**稳定前缀**。
+///
+/// ⚠️ 取消忽略时靠这个前缀把材料还原回 `pending`,所以它是**数据契约,不是文案**。
+/// 后面那句人话可以随便改,这 6 个字改了会让所有已排除材料永久无法还原(而且是静默的),
+/// 有 `user_excluded_reason_keeps_stable_prefix` 测试钉住。
+pub(crate) const USER_EXCLUDED_SKIP_PREFIX: &str = "用户标为忽略";
+
+/// 用户手工标「忽略」的材料被排除时写进 `last_error` 的完整说明(前缀 + 人话)。
+///
+/// 2026-07-28:此前 `document_tags` 的 `忽略` 只被 AI 助手工具和 prompt 消费,抽取管线和全案
+/// 语料从不查这张表 —— 用户标了忽略照样 OCR、照样计费、照样进上下文。现在它是**硬边界**。
+/// 落成 `skipped` 而不是留在 `pending`,否则每次重扫都会重新排队;取消忽略时按前缀还原回
+/// `pending`(见 `lib.rs::set_document_importance`)。
+pub(crate) const USER_EXCLUDED_SKIP_REASON: &str =
+    "用户标为忽略,已排除(不 OCR、不进 AI 上下文;取消忽略后自动重新排队)";
+
 /// 全应用同一时间只跑一个案件级抽取管线。案内仍按 8→4→1 并发，所以百份材料不会退化成
 /// 单文件串行；这里防止用户在多个案件连续点击刷新/重试后形成 N×8 并发、进度事件互相覆盖。
 static EXTRACTION_PIPELINE_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
@@ -444,11 +460,54 @@ async fn run_extraction(
     // 2026-05-23 晚十:重扫不重抽 — 只处理 pending 状态的文档(done / skipped / failed 跳过)
     // 如果用户想强制重抽某文档,可以手工 UPDATE extraction_status='pending'(V0.X 加按钮)
     // 2026-05-24 g · 并发改造:收成 owned Vec<Document>,这样 buffer_unordered 的 closure 可以 move
-    let pending: Vec<Document> = scoped_documents
+    let mut pending: Vec<Document> = scoped_documents
         .iter()
         .filter(|d| d.extraction_status == "pending" && d.deleted_at.is_none())
         .cloned()
         .collect();
+
+    // 2026-07-28:用户标「忽略」= 硬边界。在任何计费调用之前就摘掉,不 OCR、不调 LLM。
+    // 读表失败不能默默把材料放进去烧钱,也不能整批中断办案 —— 落日志并按"未排除"继续,
+    // 与既有"错误透传、不静默"的口径一致。
+    let excluded: std::collections::HashSet<String> =
+        match crate::db::document_tags::list_user_excluded_doc_ids(pool, case_id).await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(error) => {
+                crate::dlog!(
+                    "[pipeline] case={} 读用户忽略清单失败,本轮不做排除: {}",
+                    case_id,
+                    error
+                );
+                std::collections::HashSet::new()
+            }
+        };
+    if !excluded.is_empty() {
+        let before = pending.len();
+        pending.retain(|d| !excluded.contains(&d.id));
+        let removed = before - pending.len();
+        if removed > 0 {
+            for document in scoped_documents
+                .iter()
+                .filter(|d| excluded.contains(&d.id) && d.extraction_status == "pending")
+            {
+                if let Err(error) = sqlx::query(
+                    "UPDATE documents SET extraction_status = 'skipped', last_error = ?1 WHERE id = ?2",
+                )
+                .bind(USER_EXCLUDED_SKIP_REASON)
+                .bind(&document.id)
+                .execute(pool)
+                .await
+                {
+                    crate::dlog!("[pipeline] 标记忽略材料为已排除失败: {}", error);
+                }
+            }
+            crate::dlog!(
+                "[pipeline] case={} 按用户「忽略」排除 {} 份,不 OCR 不计费",
+                case_id,
+                removed
+            );
+        }
+    }
 
     let total = pending.len();
     let total_scanned = scoped_documents.len();

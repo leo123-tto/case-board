@@ -286,16 +286,19 @@ async fn sanitize_and_activate(
 ) -> Result<(), BridgeError> {
     let manifest_path = broker.paths().sanitization_manifest_path();
     if let Some(manifest) = read_sanitization_manifest(manifest_path)? {
+        let reconciled_entries =
+            reconcile_active_manifest_entries(broker, &manifest.entries).await?;
         if current_settings_sha256(app_data_root)? == manifest.sanitized_settings_sha256 {
-            authenticate_manifest_entries(broker, &manifest.entries).await?;
+            authenticate_manifest_entries(broker, &reconciled_entries).await?;
             let journal = MigrationJournal::new(broker.metadata_pool());
-            report.activated_count = journal.activate_authenticated(&manifest.entries).await?;
-            if manifest.stage != SanitizationStage::Active {
+            report.activated_count = journal.activate_authenticated(&reconciled_entries).await?;
+            if manifest.stage != SanitizationStage::Active || reconciled_entries != manifest.entries
+            {
                 write_sanitization_manifest(
                     manifest_path,
                     SanitizationStage::Active,
                     &manifest.sanitized_settings_sha256,
-                    &manifest.entries,
+                    &reconciled_entries,
                 )?;
             }
             maybe_crash(
@@ -310,7 +313,7 @@ async fn sanitize_and_activate(
             let current_entries =
                 authenticate_current_settings_candidates(broker, &prepared.candidates).await?;
             for current in current_entries {
-                let still_same_inventory_revision = manifest.entries.iter().any(|active| {
+                let still_same_inventory_revision = reconciled_entries.iter().any(|active| {
                     active.stable_inventory_id == current.stable_inventory_id
                         && active.handle == current.handle
                         && active.provider_or_connector_id == current.provider_or_connector_id
@@ -323,23 +326,23 @@ async fn sanitize_and_activate(
                     )));
                 }
             }
-            authenticate_manifest_entries(broker, &manifest.entries).await?;
+            authenticate_manifest_entries(broker, &reconciled_entries).await?;
             let mut temp = prepared.write_temp()?;
             temp.sync()?;
             write_sanitization_manifest(
                 manifest_path,
                 SanitizationStage::ReadyToRename,
                 &prepared.sha256,
-                &manifest.entries,
+                &reconciled_entries,
             )?;
             temp.persist()?;
             let journal = MigrationJournal::new(broker.metadata_pool());
-            report.activated_count = journal.activate_authenticated(&manifest.entries).await?;
+            report.activated_count = journal.activate_authenticated(&reconciled_entries).await?;
             write_sanitization_manifest(
                 manifest_path,
                 SanitizationStage::Active,
                 &prepared.sha256,
-                &manifest.entries,
+                &reconciled_entries,
             )?;
             report.sanitized = true;
             return Ok(());
@@ -385,6 +388,79 @@ async fn sanitize_and_activate(
     )?;
     report.sanitized = true;
     Ok(())
+}
+
+async fn reconcile_active_manifest_entries(
+    broker: &CredentialBroker,
+    active_entries: &[SanitizationManifestEntry],
+) -> Result<Vec<SanitizationManifestEntry>, BridgeError> {
+    let journal = MigrationJournal::new(broker.metadata_pool());
+    let mut reconciled = Vec::with_capacity(active_entries.len());
+    for active in active_entries {
+        let current = journal
+            .get(&active.stable_inventory_id)
+            .await?
+            .ok_or_else(|| {
+                BridgeError::CorruptMetadata(format!(
+                    "active sanitization journal mapping missing: {}",
+                    active.stable_inventory_id
+                ))
+            })?;
+        let revision = current.revision.ok_or_else(|| {
+            BridgeError::CorruptMetadata(format!(
+                "active sanitization journal revision missing: {}",
+                active.stable_inventory_id
+            ))
+        })?;
+        if current.handle != active.handle
+            || current.descriptor.provider_or_connector_id != active.provider_or_connector_id
+            || !current.authenticated
+        {
+            return Err(BridgeError::CorruptMetadata(format!(
+                "active sanitization journal identity drift: {}",
+                active.stable_inventory_id
+            )));
+        }
+        if revision < active.revision {
+            return Err(BridgeError::CorruptMetadata(format!(
+                "active sanitization revision rollback rejected: {}",
+                active.stable_inventory_id
+            )));
+        }
+        let metadata = broker
+            .status(current.handle.as_str())
+            .await?
+            .ok_or_else(|| {
+                BridgeError::CorruptMetadata(format!(
+                    "active sanitization credential missing: {}",
+                    active.stable_inventory_id
+                ))
+            })?;
+        if metadata.provider_or_connector_id != current.descriptor.provider_or_connector_id
+            || metadata.kind != current.descriptor.kind
+            || metadata.owner_scope != current.descriptor.owner_scope
+            || metadata.revision != revision
+            || !metadata.secret_present
+            || (revision > active.revision && metadata.state != BridgeCredentialState::Valid)
+            || (revision == active.revision
+                && !matches!(
+                    metadata.state,
+                    BridgeCredentialState::PendingMigration | BridgeCredentialState::Valid
+                ))
+        {
+            return Err(BridgeError::CorruptMetadata(format!(
+                "active sanitization rotated credential is not valid: {}",
+                active.stable_inventory_id
+            )));
+        }
+        reconciled.push(SanitizationManifestEntry {
+            stable_inventory_id: active.stable_inventory_id.clone(),
+            handle: current.handle,
+            provider_or_connector_id: current.descriptor.provider_or_connector_id,
+            revision,
+        });
+    }
+    Ok(reconciled)
 }
 
 async fn authenticate_current_settings_candidates(

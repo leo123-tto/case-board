@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "caseboard"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

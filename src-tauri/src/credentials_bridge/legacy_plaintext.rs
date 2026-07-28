@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::migration_journal::PendingCredentialDescriptor;
+use super::platform_permissions::SecureAtomicFile;
 use super::types::{
     BridgeError, BridgeResult, CredentialKind, CredentialOwnerScope, PendingMigrationSourceError,
 };
@@ -32,9 +33,8 @@ pub(crate) struct PreparedSanitizedSettings {
 }
 
 pub(crate) struct SanitizedSettingsTemp {
-    temp: tempfile::NamedTempFile,
+    temp: SecureAtomicFile,
     path: PathBuf,
-    parent: PathBuf,
     expected_source_sha256: String,
 }
 
@@ -189,13 +189,9 @@ impl PreparedSanitizedSettings {
             path: parent.clone(),
             source,
         })?;
-        let mut temp =
-            tempfile::NamedTempFile::new_in(&parent).map_err(|source| BridgeError::Io {
-                operation: "create sanitized settings candidate",
-                path: self.path.clone(),
-                source,
-            })?;
-        temp.write_all(&self.bytes)
+        let mut temp = SecureAtomicFile::new(&self.path)?;
+        temp.as_file_mut()
+            .write_all(&self.bytes)
             .map_err(|source| BridgeError::Io {
                 operation: "write sanitized settings candidate",
                 path: self.path.clone(),
@@ -204,7 +200,6 @@ impl PreparedSanitizedSettings {
         Ok(SanitizedSettingsTemp {
             temp,
             path: self.path.clone(),
-            parent,
             expected_source_sha256: self.source_sha256.clone(),
         })
     }
@@ -212,14 +207,7 @@ impl PreparedSanitizedSettings {
 
 impl SanitizedSettingsTemp {
     pub(crate) fn sync(&mut self) -> BridgeResult<()> {
-        self.temp
-            .as_file()
-            .sync_all()
-            .map_err(|source| BridgeError::Io {
-                operation: "sync sanitized settings candidate",
-                path: self.path.clone(),
-                source,
-            })
+        self.temp.sync()
     }
 
     pub(crate) fn persist(self) -> BridgeResult<()> {
@@ -237,14 +225,7 @@ impl SanitizedSettingsTemp {
                 "settings changed during sanitization; retry without overwriting".to_owned(),
             ));
         }
-        self.temp
-            .persist(&self.path)
-            .map_err(|error| BridgeError::Io {
-                operation: "atomically replace sanitized settings",
-                path: self.path.clone(),
-                source: error.error,
-            })?;
-        sync_parent(&self.parent)
+        self.temp.persist()
     }
 }
 
@@ -868,39 +849,17 @@ fn atomic_write_json(path: &Path, value: &Value) -> BridgeResult<()> {
         path: parent.to_path_buf(),
         source,
     })?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|source| BridgeError::Io {
-        operation: "create additive settings candidate",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    serde_json::to_writer_pretty(&mut temp, value)
+    let mut temp = SecureAtomicFile::new(path)?;
+    serde_json::to_writer_pretty(temp.as_file_mut(), value)
         .map_err(|_| BridgeError::InvalidInput("settings serialization"))?;
-    temp.write_all(b"\n")
-        .and_then(|_| temp.as_file().sync_all())
+    temp.as_file_mut()
+        .write_all(b"\n")
         .map_err(|source| BridgeError::Io {
-            operation: "sync additive settings candidate",
+            operation: "write additive settings candidate",
             path: path.to_path_buf(),
             source,
         })?;
-    temp.persist(path).map_err(|error| BridgeError::Io {
-        operation: "atomically add MCP instance_id",
-        path: path.to_path_buf(),
-        source: error.error,
-    })?;
-    sync_parent(parent)
-}
-
-fn sync_parent(parent: &Path) -> BridgeResult<()> {
-    let directory = fs::File::open(parent).map_err(|source| BridgeError::Io {
-        operation: "open settings parent for sync",
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    directory.sync_all().map_err(|source| BridgeError::Io {
-        operation: "sync settings parent",
-        path: parent.to_path_buf(),
-        source,
-    })
+    temp.persist()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1306,7 +1306,10 @@ fn save_settings(payload: settings::Settings) -> Result<(), String> {
         payload.device_sync_enabled = disk.device_sync_enabled;
     }
     payload.clear_bridge_authoritative_plaintext();
-    settings::write_settings(&payload)
+    settings::write_settings(&payload).inspect_err(|error| {
+        // 2026-07-27 真机:保存失败只回传前端且提示不显眼,诊断日志留一份真错。
+        crate::dlog!("[settings] save_settings 写盘失败: {}", error);
+    })
 }
 
 /// 2026-05-26 V0.1.13 · 单独写"首页在办案件"用户拖动后的顺序。
@@ -1477,8 +1480,60 @@ async fn set_document_importance(
     pool: tauri::State<'_, SqlitePool>,
     document_ids: Vec<String>,
     value: Option<String>,
-) -> Result<(), String> {
-    db::document_tags::set_importance_batch(pool.inner(), &document_ids, value.as_deref()).await
+) -> Result<usize, String> {
+    db::document_tags::set_importance_batch(pool.inner(), &document_ids, value.as_deref()).await?;
+
+    // 2026-07-28:`忽略` 是硬边界,标记必须**立刻**生效,不能等下次重扫 —— 标忽略时把还没处理的
+    // 材料直接落成 `skipped`(带固定原因),取消忽略时按**前缀**还原回 `pending` 重新排队。
+    // 用前缀而不是整句相等:说明文案会改,改了不能让已排除材料永久还原不回来。
+    let excluding = value.as_deref() == Some("忽略");
+    let mut requeued = 0usize;
+    for id in &document_ids {
+        let result = if excluding {
+            sqlx::query(
+                "UPDATE documents SET extraction_status = 'skipped', last_error = ?1 \
+                 WHERE id = ?2 AND extraction_status = 'pending'",
+            )
+            .bind(pipeline::USER_EXCLUDED_SKIP_REASON)
+            .bind(id)
+            .execute(pool.inner())
+            .await
+        } else {
+            sqlx::query(
+                "UPDATE documents SET extraction_status = 'pending', last_error = NULL \
+                 WHERE id = ?1 AND extraction_status = 'skipped' \
+                   AND last_error LIKE ?2 || '%'",
+            )
+            .bind(id)
+            .bind(pipeline::USER_EXCLUDED_SKIP_PREFIX)
+            .execute(pool.inner())
+            .await
+        };
+        match result {
+            Ok(done) if !excluding => requeued += done.rows_affected() as usize,
+            Ok(_) => {}
+            Err(error) => dlog!("[document_tags] 同步忽略材料处理状态失败: {}", error),
+        }
+    }
+
+    // 改忽略 = 改全案语料范围,已有分析就过期了。不标 stale 的话,用户忽略掉几百份材料后
+    // 看到的还是旧结论,会以为"标了没用" —— 正是这轮要修的那种困惑。
+    if let Some(first) = document_ids.first() {
+        if let Ok(Some(case_id)) =
+            sqlx::query_scalar::<_, String>("SELECT case_id FROM documents WHERE id = ?1")
+                .bind(first)
+                .fetch_optional(pool.inner())
+                .await
+        {
+            if let Err(error) =
+                db::ai_jobs::mark_case_analysis_stale(pool.inner(), &case_id, "document_importance")
+                    .await
+            {
+                dlog!("[document_tags] 标记案件分析过期失败: {}", error);
+            }
+        }
+    }
+    Ok(requeued)
 }
 
 /// 切换文档当事人侧(可多值):value=原告|被告|第三人,enabled=加/删。多个 document_ids = 整批。
@@ -5043,10 +5098,14 @@ async fn retry_failed_case_documents(
     case_id: String,
 ) -> Result<usize, String> {
     material_llm_settings().await?;
+    // 用户标「忽略」的材料不参与批量重试 —— 否则它们被重置成 pending,再被管线排除回 skipped,
+    // 白白让计数和状态来回跳。
     let res = sqlx::query(
         "UPDATE documents SET extraction_status = 'pending', last_error = NULL \
          WHERE case_id = ? AND extraction_status = 'failed' \
-           AND deleted_at IS NULL AND is_ai_artifact = 0",
+           AND deleted_at IS NULL AND is_ai_artifact = 0 \
+           AND id NOT IN (SELECT t.document_id FROM document_tags t \
+             WHERE t.namespace = 'importance' AND t.value = '忽略' AND t.source = 'user')",
     )
     .bind(&case_id)
     .execute(pool.inner())
@@ -5067,6 +5126,18 @@ async fn retry_failed_case_documents(
         .map_err(db_err)?;
     pipeline::spawn_extraction(app, pool.inner().clone(), case_id, documents, true);
     Ok(reset_count)
+}
+
+/// 停止本案正在跑的材料处理。
+///
+/// 2026-07-28:取消能力(`cancel_case_extraction`)一直存在,但只在删除案件时被调用,界面上没有
+/// 任何入口 —— 用户拖进几百份材料后只能等它跑完或退出 App。现在暴露成命令:已处理完的材料保留,
+/// 正在跑的那一份跑完当前一步后收尾,剩下的不再启动。返回被取消的任务数(0 = 当前没有在跑的)。
+#[tauri::command]
+async fn cancel_case_extraction(case_id: String) -> Result<usize, String> {
+    let cancelled = pipeline::cancel_case_extraction(&case_id);
+    dlog!("[pipeline] 用户停止案件处理,取消 {} 个任务", cancelled);
+    Ok(cancelled)
 }
 
 /// 2026-05-25 V0.1.5 「🔄 刷新源文件」按钮触发。
@@ -7367,6 +7438,7 @@ pub fn run() {
             export_lawyer_insights_markdown,
             recompute_case_extraction,
             retry_failed_case_documents,
+            cancel_case_extraction,
             refresh_case_files,
             relink_case_folder,
             preview_court_sms,

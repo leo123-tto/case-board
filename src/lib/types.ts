@@ -414,6 +414,12 @@ export interface Citation {
    * false → CitationsCard 标 ⚠️
    */
   verified: boolean;
+  /**
+   * 三档校验细分(type=doc 且带 quote 时才有):"exact"=匹配命中;
+   * "paraphrase"=概括转述(关键词与原文吻合,非逐字引述,中性提示);
+   * "missing"=原文找不到(疑似编造,amber 警告)。旧数据无此字段 → 回退只看 verified。
+   */
+  verify_level?: string | null;
   /** 产生该引用的工具调用 ID(可选,前端可据此回到对应 ToolCallTrace 行) */
   tool_call_id?: string | null;
 }

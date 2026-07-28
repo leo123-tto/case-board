@@ -1,13 +1,15 @@
 //! Pi Runtime 的宿主级保险丝。
 //!
 //! Pi 自己负责 Agent turn loop；这里刻意没有轮数、推理 token、重复工具和普通任务
-//! 时长上限，只保留“没有可交付进展”和“极端总时长”两种进程安全边界。
+//! 时长上限，只保留“完全无运行事件”和“极端总时长”两种进程安全边界。
+//! 推理/重试等流式事件都算活性——模拟对抗等深推理任务可能连续数分钟只吐 reasoning,
+//! 只要字节还在流动就不是挂死,不得误杀(2026-07-27 真机反馈)。
 
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-pub const PI_IDLE_TIMEOUT_SECS: u64 = 300;
+pub const PI_IDLE_TIMEOUT_SECS: u64 = 900;
 pub const PI_EXTREME_DURATION_SECS: u64 = 7_200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +49,7 @@ impl PiSafetyPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PiSafetyViolation {
-    #[error("Pi Runtime 连续 {idle_secs}s 没有可交付进展（正文、工具调用或工具结果），已停止本轮")]
+    #[error("Pi Runtime 连续 {idle_secs}s 没有任何运行事件（正文、推理、工具调用与重试均无），进程疑似挂死，已停止本轮")]
     Idle { idle_secs: u64 },
     #[error("Pi Runtime 已达到宿主极端运行时长 {limit_secs}s")]
     ExtremeDuration { limit_secs: u64 },

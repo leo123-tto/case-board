@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -10,6 +10,12 @@ import {
   type SpreadsheetPreviewUtils,
 } from "@/lib/spreadsheetPreview";
 import { cn } from "@/lib/utils";
+
+import {
+  cleanDerivedMarkdown,
+  parseDerivedTable,
+  splitDerivedSegments,
+} from "./derivedText";
 
 import type {
   DocumentViewerAccess,
@@ -123,18 +129,7 @@ export function DocumentViewer({
           ) : text === null ? (
             <ViewerLoading />
           ) : (
-            <div className={cn(
-              "px-6 py-5 text-sm leading-relaxed text-foreground",
-              "[&_h1]:mb-3 [&_h1]:mt-5 [&_h1]:text-xl [&_h1]:font-semibold",
-              "[&_h2]:mb-2 [&_h2]:mt-4 [&_h2]:text-base [&_h2]:font-semibold",
-              "[&_p]:my-2 [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-6",
-              "[&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-6",
-              "[&_table]:my-3 [&_table]:w-full [&_table]:border-collapse [&_table]:text-xs",
-              "[&_th]:border [&_th]:border-border [&_th]:bg-muted/50 [&_th]:px-2 [&_th]:py-1.5",
-              "[&_td]:border [&_td]:border-border [&_td]:px-2 [&_td]:py-1.5",
-            )}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
-            </div>
+            <DerivedTextContent text={text} />
           )
         ) : renderOriginal ? (
           renderOriginal({ document, assetUrl, assetError, access })
@@ -142,6 +137,67 @@ export function DocumentViewer({
           <GenericOriginalView document={document} access={access} assetUrl={assetUrl} assetError={assetError} />
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * 「处理后文本」渲染:OCR 输出里的 HTML 表格渲染成真表格(保留跨行跨列),
+ * LaTeX 下划线/上标标记解开取正文;落盘抽取文本不变,只影响预览(2026-07-27 真机反馈)。
+ */
+function DerivedTextContent({ text }: { text: string }) {
+  const segments = useMemo(() => splitDerivedSegments(text), [text]);
+  return (
+    <div className={cn(
+      "px-6 py-5 text-sm leading-relaxed text-foreground",
+      "[&_h1]:mb-3 [&_h1]:mt-5 [&_h1]:text-xl [&_h1]:font-semibold",
+      "[&_h2]:mb-2 [&_h2]:mt-4 [&_h2]:text-base [&_h2]:font-semibold",
+      "[&_p]:my-2 [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-6",
+      "[&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-6",
+      "[&_table]:my-3 [&_table]:w-full [&_table]:border-collapse [&_table]:text-xs",
+      "[&_th]:border [&_th]:border-border [&_th]:bg-muted/50 [&_th]:px-2 [&_th]:py-1.5",
+      "[&_td]:border [&_td]:border-border [&_td]:px-2 [&_td]:py-1.5",
+    )}>
+      {segments.map((segment, index) =>
+        segment.kind === "table" ? (
+          <DerivedTableView key={index} html={segment.html} />
+        ) : (
+          <ReactMarkdown key={index} remarkPlugins={[remarkGfm]}>
+            {cleanDerivedMarkdown(segment.text)}
+          </ReactMarkdown>
+        ),
+      )}
+    </div>
+  );
+}
+
+function DerivedTableView({ html }: { html: string }) {
+  const rows = useMemo(() => parseDerivedTable(html), [html]);
+  if (!rows) {
+    // 解析失败兜底:按原文显示,不吞内容。
+    return <pre className="my-3 whitespace-pre-wrap break-all text-xs text-muted-foreground">{html}</pre>;
+  }
+  return (
+    <div className="overflow-x-auto">
+      <table>
+        <tbody>
+          {rows.map((row, rowIndex) => (
+            <tr key={rowIndex}>
+              {row.map((cell, cellIndex) =>
+                cell.th ? (
+                  <th key={cellIndex} colSpan={cell.colSpan} rowSpan={cell.rowSpan}>
+                    {cell.text}
+                  </th>
+                ) : (
+                  <td key={cellIndex} colSpan={cell.colSpan} rowSpan={cell.rowSpan}>
+                    {cell.text}
+                  </td>
+                ),
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

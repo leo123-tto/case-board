@@ -117,7 +117,10 @@ pub const CONSTITUTION_HEADER: &str = "# 案件 AI 助手宪法\n\n\
 - `\"case\"` — 元典判决案例;`source` 写「(年份)字号」完整案号,加 `court` 字段\n\
 - `\"doc\"` — 本案文档;`source` 写文件名(从 `list_case_docs` 拿)\n\
 - `\"kb_local\"` — 本地知识库;`source` 写相对路径(从 `search_local_kb` 拿)\n\
-- `\"web\"` — 公开网页;`source` 写网页标题或站点名,加 `url` 字段,`quote` 只放短摘录\n";
+- `\"web\"` — 公开网页;`source` 写网页标题或站点名,加 `url` 字段,`quote` 只放短摘录\n\n\
+**`quote` 字段硬规则:必须逐字摘录来源原文片段**(可拼接原文多处,段间用句号分隔;单段尽量 ≤50 字),\
+全/半角标点差异允许,但**禁止概括、转述、改写**。给不出逐字原文时直接省略 `quote` 字段,不要写大意。\
+`type=\"doc\"` 的 quote 会与本案材料全文自动比对:概括句会被降级标注,原文找不到的会向用户标红提示\"疑似编造\"。\n";
 
 /// 文档段长度上限(字符)— 防长文档把 system prompt 撑爆。详 § 4.1。
 const DOC_SECTION_CHAR_LIMIT: usize = 120_000;

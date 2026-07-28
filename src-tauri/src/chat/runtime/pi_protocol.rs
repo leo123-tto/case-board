@@ -2,6 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroize;
 
 use crate::chat::agent_loop::AgentLoopRequest;
 use crate::chat::tools::ToolRegistry;
@@ -54,6 +55,37 @@ pub enum PiCredential {
         #[serde(flatten)]
         extra: std::collections::BTreeMap<String, Value>,
     },
+}
+
+impl PiCredential {
+    pub(crate) fn api_key_material(key: &str) -> Self {
+        Self::ApiKey {
+            key: Some(key.to_owned()),
+            env: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn clear_secret(&mut self) {
+        match self {
+            Self::ApiKey { key, env } => {
+                key.zeroize();
+                for value in env.values_mut() {
+                    value.zeroize();
+                }
+                env.clear();
+            }
+            Self::OAuth {
+                access,
+                refresh,
+                extra,
+                ..
+            } => {
+                access.zeroize();
+                refresh.zeroize();
+                extra.clear();
+            }
+        }
+    }
 }
 
 impl fmt::Debug for PiCredential {
@@ -128,23 +160,27 @@ impl fmt::Debug for PiStartRequest {
 }
 
 impl PiStartRequest {
-    pub fn from_caseboard(
+    pub(crate) fn from_caseboard_with_model(
         request_id: impl Into<String>,
         config: &LlmConfig,
         request: &AgentLoopRequest,
         registry: &ToolRegistry,
         credential: Option<PiCredential>,
+        selected_model: Option<PiModelConfig>,
     ) -> Result<Self, String> {
         let capability = ProviderCapability::from_backend("", &config.endpoint, &config.model);
-        let (credential, auth_header) = match credential {
-            Some(credential) => (credential, true),
-            None => (
-                PiCredential::ApiKey {
-                    key: Some(LOCAL_RUNTIME_KEY.to_string()),
-                    env: std::collections::BTreeMap::new(),
-                },
-                false,
-            ),
+        let custom_auth = match (&selected_model, credential) {
+            (Some(_), _) => None,
+            (None, Some(credential)) => Some((credential, true)),
+            (None, None) if endpoint_is_strictly_local(&config.endpoint) => {
+                Some((PiCredential::api_key_material(LOCAL_RUNTIME_KEY), false))
+            }
+            (None, None) => {
+                return Err(
+                    "远程 caseboard-custom 模型缺少可用凭据；已拒绝发送本机 runtime 哨兵"
+                        .to_owned(),
+                )
+            }
         };
         let reasoning_model = {
             let model = config.model.to_ascii_lowercase();
@@ -208,30 +244,54 @@ impl PiStartRequest {
             system_prompt: request.system_prompt.clone(),
             history,
             user_message: request.user_message.clone(),
-            model: PiModelConfig {
-                provider_id: "caseboard-custom".into(),
-                model_id: config.model.clone(),
-                thinking_level: None,
-                credential: Some(credential),
-                caseboard_custom: Some(PiCustomModelConfig {
-                    base_url,
-                    auth_header,
-                    reasoning: reasoning_model,
-                    context_window: 160_000,
-                    max_tokens: request.max_tokens,
-                    temperature: capability.normalize_temperature(request.temperature),
-                    headers: std::collections::BTreeMap::new(),
-                    compat: serde_json::json!({
-                        "maxTokensField": max_tokens_field,
-                        "supportsUsageInStreaming": capability.supports_stream_usage,
-                        "requiresReasoningContentOnAssistantMessages": capability.requires_reasoning_replay_for_tool_calls,
+            model: selected_model.unwrap_or_else(|| {
+                let (credential, auth_header) =
+                    custom_auth.expect("caseboard-custom auth resolved above");
+                PiModelConfig {
+                    provider_id: "caseboard-custom".into(),
+                    model_id: config.model.clone(),
+                    thinking_level: None,
+                    credential: Some(credential),
+                    caseboard_custom: Some(PiCustomModelConfig {
+                        base_url,
+                        auth_header,
+                        reasoning: reasoning_model,
+                        context_window: 160_000,
+                        max_tokens: request.max_tokens,
+                        temperature: capability.normalize_temperature(request.temperature),
+                        headers: std::collections::BTreeMap::new(),
+                        compat: serde_json::json!({
+                            "maxTokensField": max_tokens_field,
+                            "supportsUsageInStreaming": capability.supports_stream_usage,
+                            "requiresReasoningContentOnAssistantMessages": capability.requires_reasoning_replay_for_tool_calls,
+                        }),
                     }),
-                }),
-            },
+                }
+            }),
             tools,
             skills,
         })
     }
+
+    pub(crate) fn clear_runtime_credential(&mut self) {
+        if let Some(credential) = self.model.credential.as_mut() {
+            credential.clear_secret();
+        }
+        self.model.credential = None;
+    }
+}
+
+fn endpoint_is_strictly_local(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn completions_base_url(endpoint: &str) -> String {

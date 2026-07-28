@@ -218,8 +218,36 @@ pub async fn complete_non_stream_chat(
             continue;
         }
 
-        let value = response.json::<Value>().await.map_err(|e| {
-            LlmGatewayError::new(LlmGatewayErrorKind::ResponseFormat, e.to_string())
+        // 2026-07-28:此前这里直接 `response.json()`,失败只吐 reqwest 的 "error decoding response
+        // body" —— 真实原因(请求过大被切断、网关返回 HTML 错误页、限流提示)全被吞掉,违反"错误
+        // 必须透传真错"。改成先取文本再解析,把状态码和响应体开头(脱敏后)带出来。
+        let body_text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                return Err(LlmGatewayError::new(
+                    LlmGatewayErrorKind::ResponseFormat,
+                    format!(
+                    "HTTP {} 但响应体读取中断:{}(常见原因:输入过大或耗时过长,被服务端/网关切断)",
+                    status.as_u16(),
+                    e
+                ),
+                ))
+            }
+        };
+        let value = serde_json::from_str::<Value>(&body_text).map_err(|e| {
+            let safe_body = credential
+                .as_ref()
+                .map_or_else(|| body_text.clone(), |value| value.redact(&body_text));
+            let snippet: String = safe_body.chars().take(500).collect();
+            LlmGatewayError::new(
+                LlmGatewayErrorKind::ResponseFormat,
+                format!(
+                    "HTTP {} 响应不是 JSON:{};服务端原文前 500 字:{}",
+                    status.as_u16(),
+                    e,
+                    snippet
+                ),
+            )
         })?;
         let mut output = parse_non_stream_chat_response(value).map_err(|mut error| {
             if let Some(credential) = credential.as_ref() {

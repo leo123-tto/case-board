@@ -31,6 +31,11 @@ pub struct TeamIdentity {
     pub team_id: String,
     pub team_name: String,
     /// 全队共享鉴权密钥(64 hex)。跟 API key 同级:只存本机。
+    ///
+    /// `serde(default)`:0.4.17 起前端设置副本被脱敏(不持有该字段),save_settings 回传的
+    /// payload 会缺失它;后端保存时 team 整体以磁盘现值覆盖,空串不会被使用或落盘。
+    /// 缺了 default 会让入过团队的用户所有设置保存直接反序列化失败(2026-07-27 真机)。
+    #[serde(default)]
     pub team_secret: String,
     pub member_id: String,
     pub my_name: String,

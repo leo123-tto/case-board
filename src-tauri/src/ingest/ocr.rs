@@ -269,7 +269,7 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
             .await
             {
                 Ok(text) => OcrResult::Ok {
-                    text,
+                    text: crate::ingest::sanitize::sanitize_ocr_markup(&text),
                     backend: "ppocrv6",
                     elapsed_ms: started.elapsed().as_millis(),
                 },
@@ -383,7 +383,7 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
             match result {
                 Ok(text) => {
                     return OcrResult::Ok {
-                        text,
+                        text: crate::ingest::sanitize::sanitize_ocr_markup(&text),
                         backend,
                         elapsed_ms: started.elapsed().as_millis(),
                     }
@@ -420,7 +420,7 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
         };
         match result {
             Ok(text) => OcrResult::Ok {
-                text,
+                text: crate::ingest::sanitize::sanitize_ocr_markup(&text),
                 backend: "local-vision",
                 elapsed_ms: started.elapsed().as_millis(),
             },

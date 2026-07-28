@@ -20,6 +20,10 @@ pub struct DeviceSyncIdentity {
     pub group_id: String,
     pub group_name: String,
     /// 64 hex；只存本机 settings.json，不通过普通设置表单覆写。
+    ///
+    /// `serde(default)`:前端设置副本已脱敏(不持有该字段),save_settings 回传缺失属正常;
+    /// 后端保存时 device_sync 整体以磁盘现值覆盖,空串不会被使用或落盘(2026-07-27 真机)。
+    #[serde(default)]
     pub group_secret: String,
     pub device_id: String,
     pub device_name: String,

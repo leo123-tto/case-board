@@ -40,6 +40,11 @@ pub struct Citation {
     /// false=找不到(LLM 可能编造)。其他 type 默认 true(无法本地校验)。
     #[serde(default = "default_verified")]
     pub verified: bool,
+    /// 三档校验细分(type=doc 且带 quote 时才写):
+    /// `"exact"`=逐字/宽松匹配命中;`"paraphrase"`=概括转述,关键词与原文吻合但非逐字引述;
+    /// `"missing"`=原文找不到对应内容(疑似编造)。旧数据无此字段 → None,前端回退只看 verified。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_level: Option<String>,
     /// 工具调用 ID(如果该 citation 是工具返回的)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -88,10 +93,12 @@ pub fn parse_with_doc_filenames(content: &str, case_docs: &[(String, String)]) -
         // quote 用宽松匹配:精确子串 → 去空白+归一化标点 → 拆段全中。**避免把"原文一字不差"
         // 当唯一标准**(AI 常拼接原文多处/全半角标点不同),真机已暴露好引用被误标"可能编造"。
         let doc = case_docs.iter().find(|(fname, _)| fname == &c.source);
-        c.verified = match doc {
-            Some((_, full)) => doc_quote_matches(full, q_trim),
-            None => false, // 文档名都对不上 → LLM 编的
+        let (verified, level) = match doc {
+            Some((_, full)) => classify_doc_quote(full, q_trim),
+            None => (false, "missing"), // 文档名都对不上 → LLM 编的
         };
+        c.verified = verified;
+        c.verify_level = Some(level.into());
     }
     ParsedCitations {
         content_cleaned: cleaned,
@@ -128,14 +135,18 @@ pub fn parse_with_doc_paths(content: &str, case_docs: &[(String, String)]) -> Pa
             .find(|(filename, _)| filename == &citation.source)
         else {
             citation.verified = false;
+            citation.verify_level = Some("missing".into());
             continue;
         };
         let full = loaded
             .entry(path.clone())
             .or_insert_with(|| std::fs::read_to_string(path).ok());
-        citation.verified = full
-            .as_deref()
-            .is_some_and(|content| doc_quote_matches(content, quote));
+        let (verified, level) = match full.as_deref() {
+            Some(content) => classify_doc_quote(content, quote),
+            None => (false, "missing"),
+        };
+        citation.verified = verified;
+        citation.verify_level = Some(level.into());
     }
     ParsedCitations {
         content_cleaned: cleaned,
@@ -159,6 +170,38 @@ fn normalize_for_match(s: &str) -> String {
             _ => c,
         })
         .collect()
+}
+
+/// 三档分级:宽松匹配命中 → `("exact", verified)`;不中但关键词与原文大量吻合 →
+/// `("paraphrase", 未核验)`;两者都不是 → `("missing", 未核验)`。
+///
+/// 背景(2026-07-27 真机):LLM 常把多处原文要点浓缩成一句概括(如"两份合同列明厚度公差,
+/// 备注实际按过磅重量结算"),内容忠实但非逐字引述;旧逻辑一律标"可能编造",四条引用全员
+/// 报警变噪音。分级只影响前端提示措辞,概括句绝不会被标成"已核验"。
+fn classify_doc_quote(full: &str, quote: &str) -> (bool, &'static str) {
+    if doc_quote_matches(full, quote) {
+        return (true, "exact");
+    }
+    if quote_is_paraphrase_of(full, quote) {
+        return (false, "paraphrase");
+    }
+    (false, "missing")
+}
+
+/// 概括句粗判:归一化后按字符 bigram 计算 quote 在原文中的覆盖率,≥ 0.4 视为概括转述。
+/// 短 quote(<10 字)信息量不足,不给概括豁免,仍按"未找到"处理。
+fn quote_is_paraphrase_of(full: &str, quote: &str) -> bool {
+    let nf = normalize_for_match(full);
+    let nq = normalize_for_match(quote);
+    let chars: Vec<char> = nq.chars().collect();
+    if chars.len() < 10 {
+        return false;
+    }
+    let hits = chars
+        .windows(2)
+        .filter(|pair| nf.contains(&pair.iter().collect::<String>()))
+        .count();
+    hits as f64 / (chars.len() - 1) as f64 >= 0.4
 }
 
 /// 文档 quote 宽松校验:`full` = 文档抽取文本,`quote` = LLM 引用。

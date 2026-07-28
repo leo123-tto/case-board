@@ -63,6 +63,25 @@ fn valid(namespace: &str, value: &str) -> bool {
     }
 }
 
+/// 用户手工标为「忽略」的文档 id(**只认 `source='user'`**)。
+///
+/// 2026-07-28:`忽略` 从"排序沉底 + 给模型的软提示"升级为**硬边界** —— 抽取管线与全案语料都
+/// 按这份清单排除。**AI 建议的忽略(`ai_suggest`)不在此列**:模型误判会让办案材料被静默丢掉,
+/// AI 建议只做筛选与待确认,必须用户确认后才成为硬排除。
+pub async fn list_user_excluded_doc_ids(
+    pool: &SqlitePool,
+    case_id: &str,
+) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT t.document_id FROM document_tags t JOIN documents d ON d.id = t.document_id \
+         WHERE d.case_id = ?1 AND t.namespace = ?2 AND t.value = '忽略' AND t.source = 'user'",
+    )
+    .bind(case_id)
+    .bind(NS_IMPORTANCE)
+    .fetch_all(pool)
+    .await
+}
+
 /// 列出某案件下全部文档的标记(join documents 按 case 过滤;含已软删的文档行,前端自行决定显隐)。
 pub async fn list_by_case(pool: &SqlitePool, case_id: &str) -> sqlx::Result<Vec<DocumentTag>> {
     sqlx::query_as::<_, DocumentTag>(

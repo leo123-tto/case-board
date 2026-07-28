@@ -114,11 +114,16 @@ pub async fn run_global_extract(
         String,
         Option<String>,
     );
+    // 2026-07-28:用户手工标「忽略」的材料**不进语料**。此前这里只按 case + 状态取,
+    // `document_tags` 根本没被查过 —— 用户标了几百份忽略,照样被拼进 prompt 打爆上下文。
+    // 只排除 `source='user'`;AI 建议的忽略不硬排除,防止模型误判把办案材料静默丢掉。
     let rows: Vec<DocRow> = match sqlx::query_as(
         "SELECT id, filename, category, stage, extracted_text_path, source_path, extracted_text_hash \
          FROM documents \
          WHERE case_id = ? AND deleted_at IS NULL AND extracted_text_path IS NOT NULL \
            AND (extraction_status = 'done' OR extraction_status = 'failed') \
+           AND id NOT IN (SELECT t.document_id FROM document_tags t \
+             WHERE t.namespace = 'importance' AND t.value = '忽略' AND t.source = 'user') \
          ORDER BY filename",
     )
     .bind(case_id)
@@ -157,11 +162,14 @@ pub async fn run_global_extract(
     // 数组字段(当事人/日期/费用)可能比完整抽取更短;COALESCE 只防"整列被空值抹除",
     // **防不了"变短覆盖"**(P1 残留:完整性 gate 待定)。这里落 dlog 让 partial-shrink 可观测,不再静默。
     let mut warning = None;
+    // 用户主动排除的材料是**有意不纳入**,不算"语料缺口",否则每次分析都挂一条假警告。
     if let Ok(not_done) = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM documents \
          WHERE case_id = ? AND deleted_at IS NULL \
            AND NOT (extracted_text_path IS NOT NULL \
-             AND (extraction_status = 'done' OR extraction_status = 'failed'))",
+             AND (extraction_status = 'done' OR extraction_status = 'failed')) \
+           AND id NOT IN (SELECT t.document_id FROM document_tags t \
+             WHERE t.namespace = 'importance' AND t.value = '忽略' AND t.source = 'user')",
     )
     .bind(case_id)
     .fetch_one(pool)

@@ -31,6 +31,8 @@ export function ProgressBanner({
   minimized,
   onToggleMinimize,
   onClose,
+  onStop,
+  stopping,
 }: {
   progress: ProgressEvent;
   /** 2026-06-14:当前文档云端 OCR 轮询子状态(独立于主进度,不影响百分比) */
@@ -38,6 +40,12 @@ export function ProgressBanner({
   minimized: boolean;
   onToggleMinimize: () => void;
   onClose: () => void;
+  /**
+   * 2026-07-28:停止本案材料处理。此前后端的取消能力只在删除案件时被调用,界面没有入口 ——
+   * 用户拖进几百份材料后只能等它跑完或退出 App。已处理完的保留,剩下的不再启动。
+   */
+  onStop: (caseId: string) => void;
+  stopping: boolean;
 }) {
   let percent = 0;
   let label = "";
@@ -187,8 +195,22 @@ export function ProgressBanner({
               {percent}%
             </span>
           )}
-          {/* 最小化 / 关闭按钮 */}
+          {/* 停止 / 最小化 / 关闭按钮 */}
           <div className="ml-1 flex shrink-0 items-center gap-0.5">
+            {!errored && !done && progress.stage !== "analyzing" && (
+              <button
+                type="button"
+                onClick={() => onStop(progress.case_id)}
+                disabled={stopping}
+                title="停止处理剩余材料(已处理完的保留)。适合先停下来,把不需要识别的材料标为忽略再继续。"
+                className={cn(
+                  "mr-1 rounded border border-border bg-background px-1.5 py-0.5 text-caption text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
+                  stopping && "cursor-wait opacity-60",
+                )}
+              >
+                {stopping ? "停止中…" : "停止"}
+              </button>
+            )}
             {!errored && !done && (
               <button
                 type="button"

@@ -37,6 +37,7 @@ import { useFeatureFlag } from "@/lib/featureFlags";
 import {
   checkForUpdate,
   deleteCase,
+  cancelCaseExtraction,
   getCaseWithDocs,
   getSettings,
   generateClosingMaterials,
@@ -192,6 +193,28 @@ function MainApp() {
   const justImportedCaseRef = useRef<string | null>(null);
   /** 进度条最小化状态(作者 2026-05-23 晚十:文件多时不挡其他东西) */
   const [progressMinimized, setProgressMinimized] = useState(false);
+  /** 2026-07-28:「停止」按钮的 in-flight 状态,防连点。 */
+  const [stoppingExtraction, setStoppingExtraction] = useState(false);
+  /**
+   * 停止本案材料处理。已处理完的材料保留,剩下的不再启动 ——
+   * 典型用法:材料太多先停下来,在源结构视图里把不需要识别的标为忽略,再点「刷新源文件」继续。
+   */
+  const handleStopExtraction = useCallback(async (caseId: string) => {
+    setStoppingExtraction(true);
+    try {
+      const cancelled = await cancelCaseExtraction(caseId);
+      toast(
+        cancelled > 0
+          ? "已停止处理剩余材料。已完成的保留;标掉不需要的材料后点「刷新源文件」可继续。"
+          : "当前没有正在跑的处理任务。",
+        cancelled > 0 ? "success" : "info",
+      );
+    } catch (e) {
+      toast(`停止失败:${e}`, "error");
+    } finally {
+      setStoppingExtraction(false);
+    }
+  }, []);
   /**
    * Onboarding 向导是否打开。
    * 首次启动检测 settings.json 里 cloud_enabled 是否决定过(用是否有 token / endpoint 之类的字段判定),
@@ -471,10 +494,23 @@ function MainApp() {
   // V0.3:本地模型已隐藏 → 只走云端,这里恒按云端校验(与后端 effective_*=cloud 一致,
   // 同时消化老用户 ocr/llm_provider="local" 残留,避免前端漏检→后端却走云端而失败的错位)。
   const validateImportKeys = useCallback(async (): Promise<boolean> => {
-    const [s, credentials] = await Promise.all([
-      getSettings(),
-      listCredentialMetadata(),
-    ]);
+    let s: Awaited<ReturnType<typeof getSettings>>;
+    let credentials: CredentialMetadata[];
+    try {
+      [s, credentials] = await Promise.all([
+        getSettings(),
+        listCredentialMetadata(),
+      ]);
+    } catch {
+      // 后端 ACL / 凭据桥错误可能携带本机 AppData 路径，不回显原始异常。
+      toast(
+        "无法检查导入所需凭据，已停止导入。请重启案件看板后重试；如仍失败，请在「设置 → 大脑」重新保存并验证凭据，或提交反馈。",
+        "error",
+        9000,
+      );
+      openSettingsTab("brain");
+      return false;
+    }
 
     type Issue = { label: string; reason: "missing" | "unverified" };
     const issues: Issue[] = [];
@@ -1497,6 +1533,8 @@ function MainApp() {
               setProgress(null);
               setOcrSub(null);
             }}
+            onStop={handleStopExtraction}
+            stopping={stoppingExtraction}
           />
         )}
       <OnboardingWizard

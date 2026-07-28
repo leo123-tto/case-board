@@ -1640,6 +1640,16 @@ export function retryFailedCaseDocuments(caseId: string): Promise<number> {
 }
 
 /**
+ * 停止本案正在跑的材料处理(2026-07-28)。
+ *
+ * 已处理完的材料保留,剩下的不再启动 —— 用于"材料太多先停下来,标掉不需要识别的再继续"。
+ * @returns 被取消的任务数(0 = 当前没有在跑的)
+ */
+export function cancelCaseExtraction(caseId: string): Promise<number> {
+  return invoke<number>("cancel_case_extraction", { caseId });
+}
+
+/**
  * 刷新案件源文件(增量同步)。
  *
  * 用户在案件文件夹里手工加/改/删文件后,点「🔄 刷新源文件」触发。
@@ -1962,6 +1972,12 @@ export interface CaseChatInput {
    * 非空时后端注入 system prompt,让模型知道「要改的是这份」→ 局部 edit_artifact。
    */
   editing_doc_id?: string | null;
+  /**
+   * 本条消息是不是 `AskUserCard` 回灌的选项答案(点「提交回答」/ 直接点选项时置 true)。
+   * 后端据此判可视化任务阶段与写入授权——**不要靠消息文本前缀判断**:回灌文本以模型自己
+   * 写的 question 开头,措辞不可控(0.4.17 可视化无限追问就是这么来的)。
+   */
+  ask_user_reply?: boolean;
 }
 
 /**

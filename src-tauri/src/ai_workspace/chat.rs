@@ -803,7 +803,8 @@ pub async fn ai_workspace_chat_impl(
             ) {
                 let app_data_root = crate::db::app_data_dir()
                     .map_err(|error| format!("无法定位工作区目录: {error}"))?;
-                let title = format!("AI报告_{}", chrono::Local::now().format("%Y-%m-%d_%H%M%S"));
+                // 兜底标题保持可读:「AI报告 07-27 20:05」,不再拖完整日期_时分秒(2026-07-27 命名简化)。
+                let title = format!("AI报告 {}", chrono::Local::now().format("%m-%d %H:%M"));
                 match super::commands::create_ai_workspace_artifact_from_message_impl(
                     pool,
                     &app_data_root,

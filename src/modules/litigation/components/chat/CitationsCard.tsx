@@ -87,7 +87,10 @@ export function CitationsCard({
 
   if (citations.length === 0) return null;
 
-  const unverifiedCount = citations.filter((c) => !c.verified).length;
+  // "paraphrase" 是概括转述(内容与原文吻合但非逐字引述),只给中性提示,不计入"待核实"。
+  const unverifiedCount = citations.filter(
+    (c) => !c.verified && c.verify_level !== "paraphrase",
+  ).length;
 
   const handleCopy = async (c: Citation) => {
     try {
@@ -213,12 +216,15 @@ function CitationRow({ citation: c, copied, onCopy, onOpenPath, onOpenUrl }: Row
   // doc / kb_local 才有"开原文"按钮(source 是绝对路径)
   const canOpenPath = c.type === "doc" || c.type === "kb_local";
   const canOpenUrl = c.type === "web" && Boolean(c.url || c.source.startsWith("http"));
+  // 三档:paraphrase=概括转述(中性灰提示);其余 unverified=原文找不到(amber 警告)。
+  const isParaphrase = !c.verified && c.verify_level === "paraphrase";
+  const isSuspect = !c.verified && !isParaphrase;
 
   return (
     <li
       className={cn(
         "rounded border border-border/40 bg-background/60 px-2 py-1.5",
-        !c.verified && "border-amber-500/40 bg-amber-500/5",
+        isSuspect && "border-amber-500/40 bg-amber-500/5",
       )}
     >
       <div className="flex items-start gap-2">
@@ -238,10 +244,15 @@ function CitationRow({ citation: c, copied, onCopy, onOpenPath, onOpenUrl }: Row
               "{c.quote}"
             </blockquote>
           )}
-          {!c.verified && (
+          {isParaphrase && (
+            <div className="mt-1 text-caption text-muted-foreground">
+              此句为 AI 概括性转述(要点与原文吻合,非逐字引述),请以原文为准
+            </div>
+          )}
+          {isSuspect && (
             <div className="mt-1 flex items-center gap-1 text-caption text-amber-700 dark:text-amber-300">
               <AlertTriangle className="size-3" />
-              <span>原文中未找到引述句,可能为 LLM 编造,请核实</span>
+              <span>原文中未找到引述句,可能为 AI 编造,请核实</span>
             </div>
           )}
         </div>

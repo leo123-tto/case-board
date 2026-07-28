@@ -333,8 +333,21 @@ const GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS: u32 = 12_288;
 const MINIMAX_GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS: u32 = 32_768;
 const EXPERIENCE_DISTILL_MAX_OUTPUT_TOKENS: u32 = 4_096;
 
-const DEEPSEEK_GLOBAL_EXTRACT_MAX_INPUT_CHARS: usize = 900_000;
-const MINIMAX_GLOBAL_EXTRACT_MAX_INPUT_CHARS: usize = 900_000;
+// 2026-07-28 · 输入预算重定标。
+//
+// 旧值 900_000 来自本文件开头"1M 上下文容易装下"的假设 —— DeepSeek 不是 1M 上下文,这个预算
+// 比真实窗口大得多,等于没设。真机实测(作者本机日志,同一案件同一 provider):
+//   · 367,666 字符语料 → 调用正常返回;
+//   · 883,698 字符语料 → 服务端在返回途中切断,报错还被包成"不是预期 JSON 格式"。
+// 因此把 DeepSeek 档定在**实测通过点以下留余量**的 300_000 字符,而不是再猜一个模型窗口值 ——
+// 猜错窗口正是上一版的错误来源。预算收紧只会让超大案件更早走裁剪/分层,不会让正常案件退化。
+//
+// ⚠️ 这仍是 0.4 的止血值。0.5 要求输入预算由 Provider/Model 的真实 capability snapshot 推导
+// (窗口 − 输出预算 − prompt 开销 − 安全余量),并按分层阅读降级而不是一次性巨型请求,
+// 见 `docs/superpowers/specs/2026-07-24-material-ingestion-and-case-analysis-design.md` §25.5。
+const DEEPSEEK_GLOBAL_EXTRACT_MAX_INPUT_CHARS: usize = 300_000;
+/// MiniMax 长上下文档位比 DeepSeek 宽,但同样没有 900k 字符的余量,按同口径保守下调。
+const MINIMAX_GLOBAL_EXTRACT_MAX_INPUT_CHARS: usize = 400_000;
 const LARGE_COMPAT_GLOBAL_EXTRACT_MAX_INPUT_CHARS: usize = 220_000;
 const LOCAL_GLOBAL_EXTRACT_MAX_INPUT_CHARS: usize = 90_000;
 

@@ -59,11 +59,16 @@ export function listDocumentTags(caseId: string): Promise<DocumentTag[]> {
   return invoke("list_document_tags", { caseId });
 }
 
-/** 设文档重要度(单值):value="重要"|"忽略" 或 null(清空)。documentIds 多个=整批。 */
+/**
+ * 设文档重要度(单值):value="重要"|"忽略" 或 null(清空)。documentIds 多个=整批。
+ *
+ * 2026-07-28:「忽略」是硬边界 —— 后端会把还没处理的材料直接排除(不 OCR、不进 AI 上下文),
+ * 取消忽略时把它们重新排队。返回值 = 本次重新排队的份数(标忽略时恒为 0)。
+ */
 export function setDocumentImportance(
   documentIds: string[],
   value: string | null,
-): Promise<void> {
+): Promise<number> {
   return invoke("set_document_importance", { documentIds, value });
 }
 

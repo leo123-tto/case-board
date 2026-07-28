@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::platform_permissions::verify_secure_file;
+use super::platform_permissions::{verify_secure_file, SecureAtomicFile};
 use super::types::{BridgeError, BridgeResult, CredentialHandle, PendingMigrationEntry};
 
 #[derive(Debug, Serialize)]
@@ -53,34 +53,22 @@ pub(crate) fn write_pending_manifest(
     path: &Path,
     entries: &[PendingMigrationEntry],
 ) -> BridgeResult<()> {
-    let parent = path
-        .parent()
-        .ok_or(BridgeError::InvalidInput("pending manifest parent"))?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|source| BridgeError::Io {
-        operation: "create pending migration manifest",
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut temp = SecureAtomicFile::new(path)?;
     let manifest = PendingMigrationManifest {
         schema: "caseboard-credential-pending-migration/v1",
         generated_at_ms: chrono::Utc::now().timestamp_millis(),
         entries,
     };
-    serde_json::to_writer_pretty(&mut temp, &manifest)
+    serde_json::to_writer_pretty(temp.as_file_mut(), &manifest)
         .map_err(|error| BridgeError::InvalidManifest(error.to_string()))?;
-    temp.write_all(b"\n")
-        .and_then(|_| temp.as_file().sync_all())
+    temp.as_file_mut()
+        .write_all(b"\n")
         .map_err(|source| BridgeError::Io {
-            operation: "sync pending migration manifest",
+            operation: "write pending migration manifest",
             path: path.to_path_buf(),
             source,
         })?;
-    temp.persist(path).map_err(|error| BridgeError::Io {
-        operation: "replace pending migration manifest",
-        path: path.to_path_buf(),
-        source: error.error,
-    })?;
-    verify_secure_file(path)
+    temp.persist()
 }
 
 pub(crate) fn read_sanitization_manifest(
@@ -126,36 +114,23 @@ pub(crate) fn write_sanitization_manifest(
             "invalid sanitization manifest input".to_owned(),
         ));
     }
-    let parent = path
-        .parent()
-        .ok_or(BridgeError::InvalidInput("sanitization manifest parent"))?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|source| BridgeError::Io {
-        operation: "create sanitization manifest",
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut temp = SecureAtomicFile::new(path)?;
     let manifest = SanitizationManifest {
         schema: "caseboard-credential-sanitization/v1".to_owned(),
         stage,
         sanitized_settings_sha256: sanitized_settings_sha256.to_owned(),
         entries: entries.to_vec(),
     };
-    serde_json::to_writer_pretty(&mut temp, &manifest)
+    serde_json::to_writer_pretty(temp.as_file_mut(), &manifest)
         .map_err(|error| BridgeError::InvalidManifest(error.to_string()))?;
-    temp.write_all(b"\n")
-        .and_then(|_| temp.as_file().sync_all())
+    temp.as_file_mut()
+        .write_all(b"\n")
         .map_err(|source| BridgeError::Io {
-            operation: "sync sanitization manifest",
+            operation: "write sanitization manifest",
             path: path.to_path_buf(),
             source,
         })?;
-    temp.persist(path).map_err(|error| BridgeError::Io {
-        operation: "replace sanitization manifest",
-        path: path.to_path_buf(),
-        source: error.error,
-    })?;
-    verify_secure_file(path)?;
-    sync_parent(parent, "sync sanitization manifest parent")
+    temp.persist()
 }
 
 fn sanitization_contract_is_valid(
@@ -180,19 +155,6 @@ fn sanitization_contract_is_valid(
             && !entry.handle.as_str().chars().any(char::is_control)
             && inventory_ids.insert(entry.stable_inventory_id.as_str())
             && handles.insert(entry.handle.as_str())
-    })
-}
-
-fn sync_parent(parent: &Path, operation: &'static str) -> BridgeResult<()> {
-    let directory = fs::File::open(parent).map_err(|source| BridgeError::Io {
-        operation,
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    directory.sync_all().map_err(|source| BridgeError::Io {
-        operation,
-        path: parent.to_path_buf(),
-        source,
     })
 }
 

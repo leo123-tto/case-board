@@ -32,7 +32,7 @@ use crate::chat::citations::{parse_with_doc_paths, Citation};
 use crate::chat::constitution::build_system_prompt_with_memory;
 use crate::chat::context::TaskType;
 use crate::chat::model_router::route_model_with_context;
-use crate::chat::prompts::task_user_prompt;
+use crate::chat::prompts::task_user_prompt_for;
 use crate::chat::quality_gate::{
     evaluate_task_quality, format_quality_gate_note, task_output_incomplete, QualityGateInput,
 };
@@ -212,23 +212,42 @@ pub struct CaseChatInput {
     /// 非空时注入 system prompt,让模型知道「要改的是这份」→ 用 `edit_artifact` 局部改。
     #[serde(default)]
     pub editing_doc_id: Option<String>,
+    /// 本条用户消息是不是 `AskUserCard` 回灌的选项答案(前端点「提交回答」时置 true)。
+    /// 宿主据此判可视化任务的阶段,**不再靠模型写的 question 措辞去 match 前缀**(见坑:0.4.17
+    /// 可视化无限追问)。老前端/旧 payload 不带此字段时默认 false,行为同首轮。
+    #[serde(default)]
+    pub ask_user_reply: bool,
+}
+
+/// 写入可视化工作台的授权判定。
+///
+/// `ask_user_reply=true`(前端 `AskUserCard` 回灌的选项答案)本身就是用户的明确授权,不必再从
+/// 措辞里猜关键词——模型写的 question 措辞不可控,靠关键词猜会漏授权。用户选「暂不生成」等
+/// 拒绝项时仍然判为未授权。
+fn visualization_consent_from_answer(message: &str, ask_user_reply: bool) -> bool {
+    if ask_user_reply {
+        return !contains_visualization_refusal(message);
+    }
+    visualization_consent_from_message(message)
+}
+
+fn contains_visualization_refusal(message: &str) -> bool {
+    [
+        "暂不生成",
+        "不要画",
+        "不用画",
+        "不需要图",
+        "无需生成",
+        "先不生成",
+        "先别画",
+    ]
+    .iter()
+    .any(|word| message.contains(word))
 }
 
 fn visualization_consent_from_message(message: &str) -> bool {
     let text = message.trim();
-    if text.is_empty()
-        || [
-            "暂不生成",
-            "不要画",
-            "不用画",
-            "不需要图",
-            "无需生成",
-            "先不生成",
-            "先别画",
-        ]
-        .iter()
-        .any(|word| text.contains(word))
-    {
+    if text.is_empty() || contains_visualization_refusal(text) {
         return false;
     }
     let mentions_visual = [
@@ -379,7 +398,7 @@ pub async fn case_chat_impl(
     constitution_prompt.push_str(&task_contract_prompt(task));
     constitution_prompt.push_str(artifact_intent.prompt_contract());
 
-    let mut user_message_final = match task_user_prompt(task) {
+    let mut user_message_final = match task_user_prompt_for(task, input.ask_user_reply) {
         Some(template) if input.user_message.trim().is_empty() => template.to_string(),
         Some(template) => format!(
             "{}\n\n[用户附加要求]\n{}",
@@ -550,7 +569,10 @@ pub async fn case_chat_impl(
         // reextract_document 工具需要 AppHandle 触发后台抽取并 emit 进度事件
         app: Some(app.clone()),
         message_id: Some(&input.message_id),
-        visualization_consent: visualization_consent_from_message(&input.user_message),
+        visualization_consent: visualization_consent_from_answer(
+            &input.user_message,
+            input.ask_user_reply,
+        ),
     };
     // V0.2 D6.5 · 给 citations.parse_with_doc_filenames 用,校验 type=doc 的 quote 是否在文档里
     let mut case_doc_paths_for_citation_check: Vec<(String, String)> = Vec::new();
@@ -1202,11 +1224,11 @@ async fn write_chat_artifact(
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("建目录 {} 失败: {}", dir.display(), e))?;
-    // 可读文件名:「法律依据_2026-05-29_092234.md」(到秒,LLM 任务不会同秒重出 → 不冲突)
-    let filename = format!(
-        "{}_{}.md",
+    // 简洁文件名:「类案检索.md」,重名自动「类案检索 2.md」(2026-07-27 老板反馈:
+    // 旧式「类案检索_2026-07-27_200542.md」太繁琐;时间在列表和 created_at 里都有)。
+    let filename = crate::chat::tools::artifact::unique_artifact_filename(
+        &dir,
         artifact_display_name(task_type),
-        chrono::Local::now().format("%Y-%m-%d_%H%M%S")
     );
     let path = dir.join(&filename);
     // V0.3 · 不再写 `<!-- chat artifact · task=.. -->` 注释头:元数据在 DB(category=task_type +

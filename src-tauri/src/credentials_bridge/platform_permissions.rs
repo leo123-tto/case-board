@@ -1,11 +1,158 @@
 use std::fs::{self, File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::paths::BridgePaths;
 use super::types::{BridgeError, BridgeResult};
 
 const OWNER_DIRECTORY_MODE: u32 = 0o700;
 const OWNER_FILE_MODE: u32 = 0o600;
+
+pub(crate) struct SecureAtomicFile {
+    temp: tempfile::NamedTempFile,
+    destination: PathBuf,
+    parent: PathBuf,
+}
+
+impl SecureAtomicFile {
+    pub(crate) fn new(destination: &Path) -> BridgeResult<Self> {
+        let parent = destination
+            .parent()
+            .ok_or(BridgeError::InvalidInput("secure atomic file parent"))?
+            .to_path_buf();
+        let temp = tempfile::NamedTempFile::new_in(&parent).map_err(|source| BridgeError::Io {
+            operation: "create secure atomic file",
+            path: destination.to_path_buf(),
+            source,
+        })?;
+        let metadata = fs::symlink_metadata(temp.path()).map_err(|source| BridgeError::Io {
+            operation: "inspect secure atomic file",
+            path: destination.to_path_buf(),
+            source,
+        })?;
+        reject_link_or_reparse(temp.path(), &metadata)?;
+        if !metadata.is_file() {
+            return Err(BridgeError::NonRegularFile {
+                path: temp.path().to_path_buf(),
+            });
+        }
+        // Windows tempfile files inherit their parent DACL. Harden the still-empty
+        // candidate before any settings or manifest bytes are written.
+        ensure_owner_only(temp.path(), &metadata, OWNER_FILE_MODE)?;
+        Ok(Self {
+            temp,
+            destination: destination.to_path_buf(),
+            parent,
+        })
+    }
+
+    pub(crate) fn as_file_mut(&mut self) -> &mut File {
+        self.temp.as_file_mut()
+    }
+
+    pub(crate) fn sync(&mut self) -> BridgeResult<()> {
+        self.temp
+            .as_file()
+            .sync_all()
+            .map_err(|source| BridgeError::Io {
+                operation: "sync secure atomic file",
+                path: self.destination.clone(),
+                source,
+            })
+    }
+
+    pub(crate) fn persist(mut self) -> BridgeResult<()> {
+        self.sync()?;
+        let destination = self.destination;
+        let parent = self.parent;
+        persist_secure_atomic(self.temp, &destination)?;
+        verify_secure_file(&destination)?;
+        sync_parent_directory(&parent)
+    }
+}
+
+#[cfg(not(windows))]
+fn persist_secure_atomic(temp: tempfile::NamedTempFile, destination: &Path) -> BridgeResult<()> {
+    temp.persist(destination)
+        .map_err(|error| BridgeError::Io {
+            operation: "persist secure atomic file",
+            path: destination.to_path_buf(),
+            source: error.error,
+        })
+        .map(drop)
+}
+
+#[cfg(windows)]
+fn persist_secure_atomic(temp: tempfile::NamedTempFile, destination: &Path) -> BridgeResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, SetFileAttributesW, FILE_ATTRIBUTE_NORMAL, MOVEFILE_REPLACE_EXISTING,
+        MOVEFILE_WRITE_THROUGH,
+    };
+
+    let old_path = temp
+        .path()
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let new_path = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // tempfile marks the candidate temporary on Windows. Normalize it before
+    // persistence, then make the same-volume replacement wait for metadata I/O.
+    if unsafe { SetFileAttributesW(old_path.as_ptr(), FILE_ATTRIBUTE_NORMAL) } == 0 {
+        return Err(BridgeError::Io {
+            operation: "normalize secure atomic file",
+            path: destination.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    if unsafe {
+        MoveFileExW(
+            old_path.as_ptr(),
+            new_path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(BridgeError::Io {
+            operation: "persist secure atomic file",
+            path: destination.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    drop(temp);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> BridgeResult<()> {
+    let directory = fs::File::open(parent).map_err(|source| BridgeError::Io {
+        operation: "open secure atomic file parent",
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    directory.sync_all().map_err(|source| BridgeError::Io {
+        operation: "sync secure atomic file parent",
+        path: parent.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_parent: &Path) -> BridgeResult<()> {
+    // `persist_secure_atomic` uses MOVEFILE_WRITE_THROUGH. Opening a directory
+    // with std::fs::File is not portable to Windows and can return AccessDenied.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_directory(_parent: &Path) -> BridgeResult<()> {
+    Ok(())
+}
 
 pub(crate) fn ensure_bridge_directories(paths: &BridgePaths) -> BridgeResult<()> {
     ensure_safe_app_data_root(paths.app_data_root())?;
@@ -79,7 +226,7 @@ pub(crate) fn ensure_secure_directory(path: &Path) -> BridgeResult<()> {
                     path: path.to_path_buf(),
                 });
             }
-            verify_owner_only(path, &metadata, OWNER_DIRECTORY_MODE)
+            ensure_owner_only(path, &metadata, OWNER_DIRECTORY_MODE)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             create_owner_only_directory(path)?;
@@ -89,7 +236,7 @@ pub(crate) fn ensure_secure_directory(path: &Path) -> BridgeResult<()> {
                 source,
             })?;
             reject_link_or_reparse(path, &metadata)?;
-            verify_owner_only(path, &metadata, OWNER_DIRECTORY_MODE)
+            ensure_owner_only(path, &metadata, OWNER_DIRECTORY_MODE)
         }
         Err(source) => Err(BridgeError::Io {
             operation: "inspect directory",
@@ -109,13 +256,6 @@ pub(crate) fn create_secure_file(path: &Path) -> BridgeResult<File> {
         source,
     })?;
 
-    #[cfg(windows)]
-    if let Err(error) = windows_acl::apply_current_user_only_acl(path) {
-        drop(file);
-        let _ = fs::remove_file(path);
-        return Err(error);
-    }
-
     let metadata = fs::symlink_metadata(path).map_err(|source| BridgeError::Io {
         operation: "verify created file",
         path: path.to_path_buf(),
@@ -127,7 +267,11 @@ pub(crate) fn create_secure_file(path: &Path) -> BridgeResult<File> {
             path: path.to_path_buf(),
         });
     }
-    verify_owner_only(path, &metadata, OWNER_FILE_MODE)?;
+    if let Err(error) = ensure_owner_only(path, &metadata, OWNER_FILE_MODE) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
     Ok(file)
 }
 
@@ -166,7 +310,7 @@ pub(crate) fn verify_secure_file(path: &Path) -> BridgeResult<()> {
             path: path.to_path_buf(),
         });
     }
-    verify_owner_only(path, &metadata, OWNER_FILE_MODE)
+    ensure_owner_only(path, &metadata, OWNER_FILE_MODE)
 }
 
 fn reject_link_or_reparse(path: &Path, metadata: &fs::Metadata) -> BridgeResult<()> {
@@ -235,7 +379,7 @@ fn configure_owner_only_file_mode(options: &mut OpenOptions) {
 fn configure_owner_only_file_mode(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
-fn verify_owner_only(path: &Path, metadata: &fs::Metadata, expected_mode: u32) -> BridgeResult<()> {
+fn ensure_owner_only(path: &Path, metadata: &fs::Metadata, expected_mode: u32) -> BridgeResult<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let actual_mode = metadata.permissions().mode() & 0o777;
@@ -284,16 +428,21 @@ fn current_effective_uid() -> u32 {
 }
 
 #[cfg(windows)]
-fn verify_owner_only(
+fn ensure_owner_only(
     path: &Path,
     _metadata: &fs::Metadata,
     _expected_mode: u32,
 ) -> BridgeResult<()> {
-    windows_acl::verify_current_user_only_acl(path)
+    ensure_current_user_only_acl(path)
+}
+
+#[cfg(windows)]
+fn ensure_current_user_only_acl(path: &Path) -> BridgeResult<()> {
+    windows_acl::apply_current_user_only_acl(path)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn verify_owner_only(
+fn ensure_owner_only(
     _path: &Path,
     _metadata: &fs::Metadata,
     _expected_mode: u32,
@@ -438,8 +587,10 @@ mod windows_acl {
             SetNamedSecurityInfoW(
                 wide.as_mut_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                null_mut(),
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                current.sid(),
                 null_mut(),
                 acl,
                 null(),

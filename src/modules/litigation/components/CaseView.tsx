@@ -39,7 +39,6 @@ import { markOrganizeStarted, useOrganizing } from "../lib/organizeStatus";
 import { formatRelativeTime, shortenPath } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
-import { groupByStage } from "../lib/groupByStage";
 import { CaseChatPanel } from "./chat/CaseChatPanel";
 import { CaseSnapshotView } from "./snapshot/CaseSnapshotView";
 import { CaseSwitcher } from "./CaseSwitcher";
@@ -119,7 +118,6 @@ export function CaseView({
    */
   domain?: "civil" | "criminal";
 }) {
-  const groups = groupByStage(documents);
   const aiArtifacts = documents.filter((d) => d.is_ai_artifact);
   const chatDataVersion = useMemo(
     () =>
@@ -170,13 +168,29 @@ export function CaseView({
   const onMarkImportance = useCallback(
     async (docIds: string[], value: Importance | null) => {
       try {
-        await setDocumentImportance(docIds, value);
+        // 2026-07-28:「忽略」是硬边界 —— 标了就不再 OCR、不再进 AI 上下文。取消忽略时后端会把
+        // 之前排除掉的材料重新排队,这里告诉用户去点「刷新源文件」才会真正开始处理。
+        const requeued = await setDocumentImportance(docIds, value);
         await reloadTags();
+        // 忽略会改材料的 extraction_status(pending ⇄ skipped),要重读 DB 才能看到状态变化。
+        onReloadCase();
+        if (value === "忽略") {
+          toast(`已忽略 ${docIds.length} 份材料,不再识别、不进 AI 上下文`, "success");
+        } else if (value === null) {
+          // 一定要给反馈:本次改动之前标的忽略不带排除标记,requeued 会是 0,
+          // 那时如果静默就又变成"点了没反应",正是这轮在修的困惑。
+          toast(
+            requeued > 0
+              ? `已取消忽略,${requeued} 份材料重新排队 — 点「刷新源文件」开始处理`
+              : "已取消忽略,材料重新纳入 AI 分析范围 — 需要重新识别的可点「刷新源文件」",
+            "info",
+          );
+        }
       } catch (e) {
         toast(`标记失败:${e}`, "error");
       }
     },
-    [reloadTags],
+    [reloadTags, onReloadCase],
   );
   const onMarkPartySide = useCallback(
     async (docIds: string[], value: string, enabled: boolean) => {
@@ -657,7 +671,6 @@ export function CaseView({
                   <SourceFilesSection
                     total={documents.length}
                     aiArtifacts={aiArtifacts}
-                    groups={groups}
                     documents={documents}
                     sourceFolder={selectedCase?.source_folder ?? ""}
                     markMap={markMap}

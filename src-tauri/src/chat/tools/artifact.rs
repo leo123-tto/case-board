@@ -39,6 +39,59 @@ fn safe_stem(s: &str) -> String {
     cleaned.trim().chars().take(40).collect::<String>()
 }
 
+/// 生成简洁且不冲突的文书文件名:「标题.md」,重名时「标题 2.md」「标题 3.md」…(Finder 风格)。
+///
+/// 2026-07-27 老板反馈:旧式「标题_日期_时分秒_哈希.md」太繁琐,列表根本抓不住重点。
+/// 时间在文件列表和 DB `created_at` 里都有,不进文件名;唯一性由序号兜底。
+/// Windows 三防(坑#21):保留设备名前置「文书_」;尾部点/空格剥掉。
+pub(crate) fn unique_artifact_filename(dir: &std::path::Path, stem: &str) -> String {
+    let mut stem = safe_stem(stem).trim_end_matches(['.', ' ']).to_string();
+    if stem.is_empty() {
+        stem = "AI文书".to_string();
+    }
+    let upper = stem.to_ascii_uppercase();
+    let reserved = matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if reserved {
+        stem = format!("文书_{stem}");
+    }
+    for i in 1..=200u32 {
+        let candidate = if i == 1 {
+            format!("{stem}.md")
+        } else {
+            format!("{stem} {i}.md")
+        };
+        if !dir.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+    // 200 个同名兜底(现实中到不了):退回 uuid 短后缀保证不覆盖。
+    format!("{stem}_{}.md", &uuid::Uuid::new_v4().to_string()[..8])
+}
+
 /// 写进 HTML comment 元信息头前的单行清洗。
 /// HTML comment 不能包含 `--`;换行也会破坏导出时的 filing header 解析。
 fn safe_filing_metadata(s: &str) -> String {
@@ -130,9 +183,7 @@ pub(crate) async fn persist_filing(
         .map_err(|e| format!("建目录失败:{}", e))?;
 
     let doc_id = uuid::Uuid::new_v4().to_string();
-    let short = &doc_id[..8];
-    let ts = chrono::Local::now().format("%Y-%m-%d_%H%M%S").to_string();
-    let filename = format!("{}_{}_{}.md", safe_stem(title), ts, short);
+    let filename = unique_artifact_filename(&dir, title);
     let path = dir.join(&filename);
 
     let body = format!(

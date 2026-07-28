@@ -9,10 +9,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::pi_credentials::{
-    resolve_caseboard_custom_credential, resolve_pi_credential, OsPiCredentialVault,
-    PiCredentialVault,
-};
+use zeroize::Zeroizing;
+
+use super::pi_credentials::{resolve_pi_credential, OsPiCredentialVault, PiCredentialVault};
 use super::pi_locator::resolve_pi_runtime_binary;
 use super::pi_protocol::{
     PiHostMessage, PiModelConfig, PiRuntimeCapabilities, PiSidecarMessage, PiStartRequest,
@@ -69,7 +68,7 @@ struct PiTraceSession {
     retry_count: u32,
     text_chars: u64,
     reasoning_chars: u64,
-    secrets: Vec<String>,
+    secrets: Zeroizing<Vec<String>>,
 }
 
 impl PiTraceSession {
@@ -286,8 +285,8 @@ fn extract_http_status(value: &str) -> Option<u16> {
         })
 }
 
-fn pi_model_secret_values(model: &PiModelConfig) -> Vec<String> {
-    match model.credential.as_ref() {
+fn pi_model_secret_values(model: &PiModelConfig) -> Zeroizing<Vec<String>> {
+    Zeroizing::new(match model.credential.as_ref() {
         Some(super::pi_protocol::PiCredential::ApiKey { key, env }) => key
             .iter()
             .chain(env.values())
@@ -298,7 +297,7 @@ fn pi_model_secret_values(model: &PiModelConfig) -> Vec<String> {
             access, refresh, ..
         }) => vec![access.clone(), refresh.clone()],
         None => Vec::new(),
-    }
+    })
 }
 
 fn sanitize_pi_diagnostic_line(line: &str, secrets: &[String]) -> String {
@@ -525,20 +524,21 @@ pub async fn run_pi_chat(
                 "{error}。请前往「设置 → 大脑 → Pi Provider」重新选择并完成配置。"
             ))
         })?;
-    let (selected_model, caseboard_custom_credential, credential_type, credential_source) =
+    let (selected_model, caseboard_custom_material, credential_type, credential_source) =
         if selection.provider_id == "caseboard-custom" {
-            let credential =
-                resolve_caseboard_custom_credential(ctx.settings, &OsPiCredentialVault)
-                    .map(|resolved| resolved.credential);
-            let credential_type = credential
+            let material = config
+                .issue_pi_credential_material()
+                .await
+                .map_err(AgentLoopError::RuntimeUnavailable)?;
+            let credential_type = material
                 .as_ref()
                 .map(|_| "api_key".to_string())
                 .or_else(|| Some("local_runtime".to_string()));
             (
                 None,
-                credential,
+                material,
                 credential_type,
-                Some("caseboard_custom".to_string()),
+                Some("credential_bridge".to_string()),
             )
         } else {
             let resolved_credential =
@@ -569,7 +569,7 @@ pub async fn run_pi_chat(
         PiChatProcess {
             process: PiProcessCommand::new(resolved.binary),
             selected_model,
-            caseboard_custom_credential,
+            caseboard_custom_material,
             credential_type,
             credential_source,
             trace_sink: PiTraceSink::AppData,
@@ -597,14 +597,14 @@ pub async fn run_pi_chat(
 struct PiChatProcess {
     process: PiProcessCommand,
     selected_model: Option<PiModelConfig>,
-    caseboard_custom_credential: Option<crate::chat::runtime::pi_protocol::PiCredential>,
+    caseboard_custom_material: Option<crate::llm::LlmCredentialMaterial>,
     credential_type: Option<String>,
     credential_source: Option<String>,
     trace_sink: PiTraceSink,
 }
 
 async fn run_pi_chat_with_command_selected(
-    invocation: PiChatProcess,
+    mut invocation: PiChatProcess,
     config: &LlmConfig,
     request: AgentLoopRequest,
     registry: &ToolRegistry,
@@ -631,17 +631,19 @@ async fn run_pi_chat_with_command_selected(
         },
     });
     let request_id = uuid::Uuid::new_v4().to_string();
-    let mut start = PiStartRequest::from_caseboard(
+    let caseboard_custom_credential = invocation
+        .caseboard_custom_material
+        .as_ref()
+        .map(|material| material.with_secret(super::pi_protocol::PiCredential::api_key_material));
+    let mut start = PiStartRequest::from_caseboard_with_model(
         &request_id,
         config,
         &request,
         registry,
-        invocation.caseboard_custom_credential,
+        caseboard_custom_credential,
+        invocation.selected_model.take(),
     )
     .map_err(AgentLoopError::RuntimeUnavailable)?;
-    if let Some(model) = invocation.selected_model {
-        start.model = model;
-    }
     let expected_provider_id = start.model.provider_id.clone();
     let expected_model_id = start.model.model_id.clone();
     let mut trace = PiTraceSession::new(
@@ -654,9 +656,10 @@ async fn run_pi_chat_with_command_selected(
     let tool_schemas = registry.to_function_schemas();
     let prefix = PrefixFingerprint::compute(&request.system_prompt, &tool_schemas);
     // Pi SDK owns the ordinary agent loop. CaseBoard does not impose native iteration,
-    // reasoning or duplicate-call caps, but it does reuse the surface-specific idle window.
-    // Internal reasoning/retry events deliberately do not reset that window: only visible
-    //正文、真实工具调用/结果等可交付进展可以让长任务继续运行。
+    // reasoning or duplicate-call caps. The idle fuse only catches a truly silent process:
+    // reasoning deltas and SDK retries also reset the window — 模拟对抗等深推理任务可能
+    // 连续数分钟只吐 reasoning,字节仍在流动就不是挂死(2026-07-27 真机误杀反馈)。
+    // 失控的无限思考由 PI_EXTREME_DURATION_SECS 极端总时长兜底。
     let mut guard = PiSafetyGuard::with_idle_timeout(
         request.loop_guard_config.map(|config| config.idle_timeout),
     );
@@ -700,7 +703,10 @@ async fn run_pi_chat_with_command_selected(
     let mut stderr_task = child.stderr.take().map(|stderr| {
         tokio::spawn(async move { collect_pi_stderr_tail(stderr, stderr_secrets).await })
     });
-    if let Err(error) = write_json_line(&mut stdin, &start).await {
+    let start_write = write_json_line(&mut stdin, &start).await;
+    start.clear_runtime_credential();
+    drop(invocation.caseboard_custom_material.take());
+    if let Err(error) = start_write {
         trace.finish_error("process_io", &error.to_string(), "error", Vec::new());
         return Err(error);
     }
@@ -868,6 +874,7 @@ async fn run_pi_chat_with_command_selected(
                 }
             }
             PiSidecarMessage::Reasoning { content, .. } => {
+                guard.note_progress();
                 trace.reasoning_chars = trace
                     .reasoning_chars
                     .saturating_add(content.chars().count() as u64);
@@ -880,6 +887,7 @@ async fn run_pi_chat_with_command_selected(
                 error_message,
                 ..
             } => {
+                guard.note_progress();
                 trace.note_retry_started(attempt, max_attempts, delay_ms, &error_message);
             }
             PiSidecarMessage::RetryFinished {
@@ -888,6 +896,7 @@ async fn run_pi_chat_with_command_selected(
                 error_message,
                 ..
             } => {
+                guard.note_progress();
                 trace.note_retry_finished(attempt, success, error_message.as_deref());
             }
             PiSidecarMessage::ToolRequest {
@@ -1237,8 +1246,10 @@ async fn write_json_line(
     stdin: &mut ChildStdin,
     message: &impl Serialize,
 ) -> Result<(), AgentLoopError> {
-    let mut encoded = serde_json::to_vec(message)
-        .map_err(|_| AgentLoopError::Parse("Pi Sidecar 请求序列化失败".into()))?;
+    let mut encoded = Zeroizing::new(
+        serde_json::to_vec(message)
+            .map_err(|_| AgentLoopError::Parse("Pi Sidecar 请求序列化失败".into()))?,
+    );
     encoded.push(b'\n');
     stdin
         .write_all(&encoded)
@@ -1252,7 +1263,7 @@ async fn write_json_line(
 
 async fn collect_pi_stderr_tail(
     stderr: tokio::process::ChildStderr,
-    secrets: Vec<String>,
+    secrets: Zeroizing<Vec<String>>,
 ) -> Vec<String> {
     const MAX_LINES: usize = 32;
     const MAX_LINE_CHARS: usize = 1_000;

@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { X, Loader2, ExternalLink, Sparkles, FileDown, FileText as FileTextIcon, Pencil } from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
 
 import { Button } from "@/components/ui/button";
+import { stripFilingHeader } from "@/lib/filing";
 import { formatYuan } from "@/lib/format";
 import {
   exportFilingDocx,
@@ -136,6 +137,16 @@ export function MarkdownModal({ path, filename, badge, onClose, exportCase, expo
   //   markdown → react-markdown
   const renderMode = extractor.kind;
 
+  // 预览只显示正文:剥掉 `<!-- filing · doc_type=.. -->` 元信息头和结尾 <CITATIONS> 协议块
+  // (跟编辑器同一套 stripFilingHeader,免得用户在预览里看到这些内部标记)。
+  const markdownBody = useMemo(
+    () =>
+      renderMode === "markdown" && content !== null
+        ? stripFilingHeader(content).body
+        : "",
+    [renderMode, content],
+  );
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-foreground/20 px-4 py-8 backdrop-blur-sm animate-in fade-in-0 duration-200"
@@ -242,7 +253,7 @@ export function MarkdownModal({ path, filename, badge, onClose, exportCase, expo
                   )}
                 >
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {content}
+                    {markdownBody}
                   </ReactMarkdown>
                 </div>
               )}

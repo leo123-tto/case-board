@@ -314,6 +314,30 @@ export function CaseSnapshotView({
     ? snap.defendants.slice(0, 3).join("、") + (snap.defendants.length > 3 ? `等${snap.defendants.length}人` : "")
     : null;
 
+  // 基本信息卡的「委托人 / 对方当事人」必须跟随代理立场:精确委托人名单最优先,
+  // 其次案件级立场对应阵营;立场未识别时不臆断(显示 —,提示用户先确认立场)。
+  // 修 2026-07-27 真机 bug:此前写死 委托人=原告[0]、对方=被告[0],代理被告方时整体反转。
+  const formatPartyNames = (names: string[]) =>
+    names.length
+      ? names.slice(0, 3).join("、") + (names.length > 3 ? `等${names.length}人` : "")
+      : null;
+  const basicInfoSide: RepresentationSide | null =
+    representationSide ?? (isRepresentationSide(snap.our_side) ? snap.our_side : null);
+  const partiesOfSide = (side: RepresentationSide) =>
+    side === "原告方" ? snap.plaintiffs : side === "被告方" ? snap.defendants : snap.third_parties;
+  const clientNames = representation
+    ? representation.parties.map((p) => p.name)
+    : basicInfoSide
+      ? partiesOfSide(basicInfoSide)
+      : [];
+  const opponentNames = !basicInfoSide
+    ? []
+    : basicInfoSide === "原告方"
+      ? snap.defendants
+      : basicInfoSide === "被告方"
+        ? snap.plaintiffs
+        : [...snap.plaintiffs, ...snap.defendants];
+
   // 行级删除过滤 + rowKey 计算用 rawSnap(advisor 警告:rowKey 必须 stable,
   // 不能用 applyOverrides 后的 snap 算 — 否则用户改 name 后 rowKey 也变,
   // 同行其他 overrides 全部变孤儿)。
@@ -469,10 +493,12 @@ export function CaseSnapshotView({
               value={snap.cause}
               {...edit("agg_cause")}
             />
-            <FactRow label="委托人" value={snap.plaintiffs[0] || null} />
+            <FactRow label="委托人" value={formatPartyNames(clientNames)} />
             <FactRow
               label={isCriminal ? "被告人 / 对方" : "对方当事人"}
-              value={snap.defendants[0] || null}
+              value={
+                isCriminal ? snap.defendants[0] || null : formatPartyNames(opponentNames)
+              }
             />
             <FactRow label="立案日期" value={snap.filed_at} mono {...edit("agg_filed_at")} />
             <FactRow

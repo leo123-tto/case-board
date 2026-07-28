@@ -460,6 +460,10 @@ impl LlmCredentialMaterial {
         Self(Zeroizing::new(secret))
     }
 
+    pub(crate) fn with_secret<T>(&self, consume: impl FnOnce(&str) -> T) -> T {
+        consume(self.0.as_str())
+    }
+
     fn expose(&self) -> &str {
         self.0.as_str()
     }
@@ -663,6 +667,19 @@ impl LlmConfig {
         match &self.credential {
             Some(source) => source.is_ready().await,
             None => Ok(false),
+        }
+    }
+
+    /// 为当前一次 Pi caseboard-custom 启动签发材料模型凭据。
+    ///
+    /// 返回值是 drop 时清零的短期 material；不会回读已净化的 Settings 明文字段，
+    /// 也不会把 secret 放进环境变量。
+    pub(crate) async fn issue_pi_credential_material(
+        &self,
+    ) -> Result<Option<LlmCredentialMaterial>, String> {
+        match &self.credential {
+            Some(source) => source.issue_material().await.map(Some),
+            None => Ok(None),
         }
     }
 

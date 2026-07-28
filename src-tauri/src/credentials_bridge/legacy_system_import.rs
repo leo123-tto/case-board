@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::platform_permissions::verify_secure_file;
+use super::platform_permissions::{verify_secure_file, SecureAtomicFile};
 use super::{
     acquire_pending_migration_lock, BridgeCredentialState, BridgeError, BridgePaths,
     CredentialBroker, CredentialConsumer, CredentialHandle, CredentialKind, CredentialOwnerScope,
@@ -678,45 +678,23 @@ fn write_manifest(
     path: &Path,
     status: &LegacyCredentialMigrationStatus,
 ) -> Result<(), BridgeError> {
-    let parent = path
-        .parent()
-        .ok_or(BridgeError::InvalidInput("legacy import manifest parent"))?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|source| BridgeError::Io {
-        operation: "create legacy system import manifest",
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut temp = SecureAtomicFile::new(path)?;
     serde_json::to_writer_pretty(
-        &mut temp,
+        temp.as_file_mut(),
         &LegacySystemImportManifest {
             schema: IMPORT_MANIFEST_SCHEMA.to_owned(),
             status: status.clone(),
         },
     )
     .map_err(|error| BridgeError::InvalidManifest(error.to_string()))?;
-    temp.write_all(b"\n")
-        .and_then(|_| temp.as_file().sync_all())
+    temp.as_file_mut()
+        .write_all(b"\n")
         .map_err(|source| BridgeError::Io {
-            operation: "sync legacy system import manifest",
+            operation: "write legacy system import manifest",
             path: path.to_path_buf(),
             source,
         })?;
-    temp.persist(path).map_err(|error| BridgeError::Io {
-        operation: "replace legacy system import manifest",
-        path: path.to_path_buf(),
-        source: error.error,
-    })?;
-    verify_secure_file(path)?;
-    let directory = fs::File::open(parent).map_err(|source| BridgeError::Io {
-        operation: "open legacy import manifest parent",
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    directory.sync_all().map_err(|source| BridgeError::Io {
-        operation: "sync legacy import manifest parent",
-        path: parent.to_path_buf(),
-        source,
-    })
+    temp.persist()
 }
 
 fn validate_manifest(manifest: &LegacySystemImportManifest) -> Result<(), BridgeError> {

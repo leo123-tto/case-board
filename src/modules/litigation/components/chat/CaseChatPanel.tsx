@@ -672,6 +672,8 @@ export function CaseChatPanel({
     text: string,
     taskType: CaseChatTaskType | null,
     skillName: string | null = null,
+    // 由 AskUserCard 回灌选项答案时置 true;后端据此判可视化阶段与写入授权。
+    askUserReply = false,
   ) {
     if (!caseId || !currentConversationId) return;
     const trimmed = text.trim();
@@ -744,6 +746,7 @@ export function CaseChatPanel({
         message_id: messageId,
         attached_doc_ids: attachedSnapshot,
         editing_doc_id: editingDocId ?? null,
+        ask_user_reply: askUserReply,
       });
       finishRun(caseId);
       // 拿最新历史(后端已经 INSERT 完两条);registry 的 done 订阅也会刷,这里立即刷一次
@@ -1181,7 +1184,7 @@ export function CaseChatPanel({
           <AskUserCard
             questions={pendingAsk}
             disabled={!caseId}
-            onSubmit={(text) => send(text, pendingAskTaskType)}
+            onSubmit={(text) => send(text, pendingAskTaskType, null, true)}
           />
         )}
       </div>
